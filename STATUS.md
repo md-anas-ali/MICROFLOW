@@ -1,18 +1,47 @@
 # MicroFlow backend — STATUS (read this first)
 
-## Environment reality (unchanged from the first draft)
+## Environment reality (changed this pass — now actually verified)
 
-Still true: this sandbox has **no Go toolchain and no network access**
-(re-verified before this pass: `go: not found`, `curl`/`apt-get` → 403
-`host_not_allowed`). Nothing in `backend/` has been compiled, run, or
-tested here. Treat this as a thoroughly-written but **uncompiled**
-second draft, not a verified one. What changed since the first draft is
-scope, not verification status.
+Earlier drafts of this file said the sandbox had no Go toolchain and no
+network access, so nothing here had ever been compiled. That was true at
+the time, but it's no longer the whole picture: `apt-get install
+golang-go` works in this sandbox, and while `proxy.golang.org` and
+`gopkg.in` are blocked by the network allowlist, `github.com` and
+`codeload.github.com` are not. That's enough to actually build this
+module:
 
-Since I can't run `go build`, I did a manual cross-file review instead
-(grep for stale references after each rewrite, checked every changed
-function signature against its callers by hand). That catches obvious
-mismatches; it does not catch everything a real compiler would.
+```
+go build ./...        # clean
+go vet ./...           # clean
+go test ./... -race    # all packages pass, race detector clean
+gofmt -l .              # clean (was not, before this pass — see below)
+```
+
+**One real bug was found and fixed doing this**: `go.mod` had four
+`replace` directives pointing at `/home/claude/work/vendor/...` — an
+absolute path from a *different* sandbox session that was never included
+in this archive. That's not a style nit; it made `go mod tidy`/`go
+build` fail outright with "no such file or directory" the moment anyone
+who wasn't the original session tried to build this. Fixed by vendoring
+the four affected modules (`gopkg.in/yaml.v2`, `yaml.v3`, `check.v1`,
+`errgo.v2` — transitive test-only deps of `goja`, not something the
+workflow engine itself uses) into `backend/third_party/` as real,
+version-pinned upstream source fetched from their GitHub mirrors, and
+pointing the replace directives at that relative, portable path instead.
+This only matters in network-restricted environments like this one — on
+a normal machine `go mod tidy` would resolve the same modules from the
+real proxy without needing `third_party/` at all — but it's harmless
+there and makes the build reproducible here too.
+
+Also fixed: five source files (`model/workflow.go`, `nodes/control.go`,
+`parser/export.go`, `parser/n8n.go`, `webhook/webhook.go`) had struct/const
+blocks whose alignment had drifted out of `gofmt` compliance — cosmetic,
+but `gofmt -l` now reports clean across the whole module (excluding the
+vendored `third_party/` trees, which are left as upstream ships them).
+
+No other bugs turned up — no failing tests, no vet warnings, no stray
+TODOs/stubs in the actual engine code beyond the ones already listed
+below as intentional gaps.
 
 ## What closed since the first draft
 
@@ -158,13 +187,20 @@ adversarial security testing, webhook path-matching edge case), plus:
 
 ## Before you rely on this for anything real
 
-Same steps as draft 1/2:
+The build/vet/test/gofmt sequence above has now actually been run and is
+clean. What's still unverified is everything that needs real
+infrastructure this sandbox doesn't have:
 
 ```
-go mod tidy
+# On your machine, with real Postgres + real credentials:
 go build ./...
-go test ./internal/parser/... ./internal/expr/... ./internal/engine/...
-# then: real Postgres + your own section-25 checklist
+go test ./...
+# then: your own section-25 checklist against real Postgres, real
+# YouTube/AI/TTS/Gmail/Sheets credentials, and the 1/10/50/100-run
+# RAM leak test (MemGuard's 220MB default is still just a starting point).
 ```
 
-Nothing about that sequence changed.
+Note: this archive (`microflow_backend_optimized_tar.gz`) is backend-only.
+STATUS.md references `frontend/STATUS.md` and frontend UI changes that
+aren't part of this tarball — that's expected if the frontend was
+delivered separately, just flagging it in case it wasn't.
