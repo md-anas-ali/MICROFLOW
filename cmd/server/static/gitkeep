@@ -1,0 +1,1 @@
+Placeholder. `npm run build` in /frontend outputs here (see frontend/README.md) so the Go binary can embed and serve the compiled UI as a single static bundle.
