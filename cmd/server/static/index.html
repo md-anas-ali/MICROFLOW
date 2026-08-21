@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>MicroFlow</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <button id="navToggle" class="icon-btn" aria-label="Toggle menu">&#9776;</button>
+    <div class="brand">
+      <span class="brand-mark">M</span>
+      <span class="brand-name">MicroFlow</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <span id="connStatus" class="conn-status conn-unknown">connecting&hellip;</span>
+  </header>
+
+  <div class="shell">
+    <nav id="sidebar" class="sidebar">
+      <a href="#/dashboard" class="nav-link" data-route="dashboard">Dashboard</a>
+      <a href="#/workflows" class="nav-link" data-route="workflows">Workflows</a>
+      <a href="#/import" class="nav-link" data-route="import">Import</a>
+    </nav>
+    <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+
+    <main id="view" class="view">
+      <!-- rendered by app.js -->
+    </main>
+  </div>
+</div>
+
+<template id="tpl-toast">
+  <div class="toast"></div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
