@@ -204,3 +204,62 @@ Note: this archive (`microflow_backend_optimized_tar.gz`) is backend-only.
 STATUS.md references `frontend/STATUS.md` and frontend UI changes that
 aren't part of this tarball — that's expected if the frontend was
 delivered separately, just flagging it in case it wasn't.
+
+## Added this pass: `internal/edgetts` + `cmd/edgetts` (pure-Go TTS)
+
+A workflow's "TTS (Edge->Silent)" executeCommand step shells out to a
+logical `edge-tts` binary. That binary was never part of this repo --
+main.go just expects an external, separately-installed `edge-tts` (the
+Python package, which pulls in `aiohttp` + 7 more packages) at
+`MICROFLOW_EDGE_TTS_PATH`.
+
+`internal/edgetts` is a pure-Go, zero-new-dependency reimplementation
+of the same unofficial Microsoft Edge "read aloud" protocol that Python
+`edge-tts` wraps (hand-rolled RFC6455 WebSocket client in
+`internal/edgetts/ws.go`, since adding gorilla/websocket or
+golang.org/x/net/websocket would be exactly the kind of new dependency
+this pass was asked to avoid). `cmd/edgetts` wraps it in a CLI that
+accepts the same flags MicroFlow's workflow shell script actually
+passes (`--rate`, `--voice`, `--file`, `--write-media`), so it's a
+drop-in replacement: point `MICROFLOW_EDGE_TTS_PATH` at the built
+`edgetts` binary (or just install it *as* `/usr/local/bin/edge-tts`,
+the existing default, and change nothing else) and no python3/pip/
+aiohttp stack is needed in the deployment image just for TTS. Compiles
+to a single ~4MB stripped binary.
+
+**UNVERIFIED against the real endpoint** -- `speech.platform.bing.com`
+is outside this sandbox's network allowlist, so `edgetts.Synthesize`
+has never actually been round-tripped against Microsoft's live service,
+only unit-tested against fakes. What IS verified (`go test
+./internal/edgetts/...`, all passing):
+
+- `wsAcceptKey` against RFC 6455's own worked example (section 1.3) --
+  not a Microsoft-specific vector, an authoritative one.
+- Frame write/read round-trip over an in-memory `net.Pipe()` across the
+  7-bit/16-bit/64-bit length encodings (0, 5, 125, 126, 500, 70000
+  byte payloads), confirming client-side masking and length framing are
+  self-consistent.
+- `collectAudio`'s binary-frame header-length parsing and multi-frame
+  audio concatenation, and that it stops exactly at `Path:turn.end`,
+  against a fake in-process server sending the same message shapes the
+  real protocol is documented (via edge-tts's own reverse engineering)
+  to use.
+- `collectAudio` treats "turn ended with zero audio bytes" as an error
+  rather than silently returning an empty MP3.
+- `secMSGEC` (the anti-abuse token Microsoft added in 2024) produces
+  the right shape (64 uppercase hex chars) -- correctness of the
+  Windows-epoch/5-minute-rounding math itself is NOT independently
+  verified against a known-good value, since there's no public test
+  vector for it the way there is for the WebSocket handshake.
+
+None of that reaches the actual `wss://speech.platform.bing.com`
+handshake, SSML acceptance, or whether Microsoft's anti-abuse checks
+(the Sec-MS-GEC token, User-Agent/Origin sniffing) still match what's
+implemented here -- that protocol is unofficial and Microsoft has
+changed it before. **Test this against the real endpoint on a machine
+with normal internet access before relying on it.** If it's wrong or
+breaks later, the failure mode is safe: the workflow's own
+"TTS (Edge->Silent)" step already treats a failing/empty edge-tts run
+as expected and falls back to generating a silent clip with `ffmpeg`
+(see its `EDGE_FAILED_SILENT` branch) -- so a protocol mismatch here
+degrades the pipeline to silent voiceover, it doesn't break it.
