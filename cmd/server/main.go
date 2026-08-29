@@ -93,9 +93,25 @@ func main() {
 		"python3":  envOr("MICROFLOW_PYTHON_PATH", "/usr/bin/python3"),
 	}
 
+	// Env vars the workflow's Code nodes are allowed to read via $env
+	// (security rule 11/22: never expose the whole process environment,
+	// only names an operator has explicitly opted in). These five are
+	// what the sample workflow's Code nodes actually reference (AI
+	// provider keys for the multi-model fallback chain, the YouTube
+	// Data API key, the app's referer URL for API calls that require
+	// one, and the failure-notification webhook).
+	codeEnvAllowlist := []string{
+		"OPENROUTER_API_KEY",
+		"GEMINI_API_KEY",
+		"YOUTUBE_DATA_API_KEY",
+		"APP_REFERER_URL",
+		"NOTIFY_WEBHOOK_URL",
+	}
+
 	registry := nodes.DefaultRegistry(nodes.Deps{
 		HTTPClient:         &http.Client{Timeout: 60 * time.Second},
 		AllowedBinaries:    allowedBinaries,
+		EnvAllowlist:       codeEnvAllowlist,
 		ScratchRoot:        scratchRoot,
 		CredentialResolver: creds,
 	})
