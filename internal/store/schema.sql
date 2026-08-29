@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS credentials (
     PRIMARY KEY (workflow_id, logical_name)
 );
 
+-- The single central Google account credential, shared automatically by
+-- every Google node (googleSheets/youTube/gmail) across every workflow
+-- (see internal/vault/central.go). Deliberately its own table with no
+-- workflow_id/FK: this is one account-scoped secret, not a per-workflow
+-- one, so it must not disappear if a workflow is ever deleted (unlike
+-- `credentials` above, which cascades with its owning workflow). In
+-- practice there is exactly one row (account='google') today.
+CREATE TABLE IF NOT EXISTS google_account_credentials (
+    account       TEXT PRIMARY KEY,
+    ciphertext    BYTEA NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id           TEXT PRIMARY KEY,
     workflow_id  TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,

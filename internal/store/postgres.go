@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"microflow/internal/model"
@@ -199,6 +200,52 @@ func (s *Store) PutEncrypted(ctx context.Context, workflowID, logicalName string
 		ON CONFLICT (workflow_id, logical_name) DO UPDATE SET ciphertext=$3, updated_at=now()
 	`, workflowID, logicalName, ciphertext)
 	return err
+}
+
+// --- central Google account credential (vault.AccountStore) ---
+//
+// Deliberately separate from the per-workflow `credentials` table/
+// methods above: this is the single, workflow-independent Google
+// account credential every Google node falls back to (see
+// internal/vault/central.go). Same encryption path (same *vault.Vault
+// AEAD/master key), different table, no workflow_id/FK -- it must
+// survive workflows being deleted.
+
+func (s *Store) GetEncryptedAccount(ctx context.Context, account string) ([]byte, error) {
+	var ct []byte
+	err := s.pool.QueryRow(ctx, `SELECT ciphertext FROM google_account_credentials WHERE account=$1`, account).Scan(&ct)
+	return ct, err
+}
+
+func (s *Store) PutEncryptedAccount(ctx context.Context, account string, ciphertext []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO google_account_credentials (account, ciphertext, updated_at)
+		VALUES ($1,$2, now())
+		ON CONFLICT (account) DO UPDATE SET ciphertext=$2, updated_at=now()
+	`, account, ciphertext)
+	return err
+}
+
+func (s *Store) DeleteEncryptedAccount(ctx context.Context, account string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM google_account_credentials WHERE account=$1`, account)
+	return err
+}
+
+// AccountCredentialMeta never returns a "not found" error -- an absent
+// row just means "not configured yet" (exists=false), which is a normal
+// state for the frontend's status badge to render, not a failure. Any
+// other query error is still surfaced as exists=false/err!=nil so a
+// transient DB problem doesn't get reported as "not configured".
+func (s *Store) AccountCredentialMeta(ctx context.Context, account string) (time.Time, bool, error) {
+	var t time.Time
+	err := s.pool.QueryRow(ctx, `SELECT updated_at FROM google_account_credentials WHERE account=$1`, account).Scan(&t)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	return t, true, nil
 }
 
 // CredentialInfo is a credential's metadata with no secret material --
