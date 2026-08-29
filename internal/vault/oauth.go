@@ -32,23 +32,57 @@ import (
 //	  "tokenType":    "Bearer"
 //	}
 type OAuthResolver struct {
-	vault      *Vault
-	httpClient *http.Client
-	// refreshMu prevents two concurrent node executions for the same
-	// credential from both refreshing at once and racing to write the
-	// vault (the underlying Postgres write is last-writer-wins; this
-	// keeps it to one in-process writer at a time per logical name).
-	refreshMu sync.Map // map[string]*sync.Mutex, key = workflowID+"/"+logicalName
+	vault *Vault
+	eng   *refreshEngine
 }
 
 func NewOAuthResolver(v *Vault) *OAuthResolver {
-	return &OAuthResolver{vault: v, httpClient: &http.Client{Timeout: 15 * time.Second}}
+	return &OAuthResolver{vault: v, eng: newRefreshEngine()}
 }
 
 const tokenExpiryLeeway = 2 * time.Minute // refresh a bit before actual expiry to avoid a request landing right on the boundary
 
 func (r *OAuthResolver) Resolve(ctx context.Context, workflowID, logicalName string) (map[string]string, error) {
-	secrets, err := r.vault.Resolve(ctx, workflowID, logicalName)
+	lockKey := workflowID + "/" + logicalName
+	return r.eng.resolve(ctx, lockKey,
+		func(ctx context.Context) (map[string]string, error) {
+			return r.vault.Resolve(ctx, workflowID, logicalName)
+		},
+		func(ctx context.Context, secrets map[string]string) error {
+			return r.vault.Put(ctx, workflowID, logicalName, secrets)
+		},
+	)
+}
+
+// refreshEngine is the storage-agnostic "read secrets, refresh the
+// access token if it's near/at expiry, write the refreshed secrets
+// back" algorithm. It knows nothing about *how* secrets are persisted
+// (that's the get/put closures its caller supplies) so both
+// OAuthResolver (per-workflow/node credentials, keyed by
+// workflowID+"/"+logicalName) and AccountResolver (the single central
+// Google account credential, see central.go) share exactly one
+// implementation of the refresh logic and its concurrency guard,
+// instead of two copies that could drift apart.
+type refreshEngine struct {
+	httpClient *http.Client
+	// refreshMu prevents two concurrent node executions for the same
+	// credential from both refreshing at once and racing to write the
+	// vault (the underlying Postgres write is last-writer-wins; this
+	// keeps it to one in-process writer at a time per lock key).
+	refreshMu sync.Map // map[string]*sync.Mutex
+}
+
+func newRefreshEngine() *refreshEngine {
+	return &refreshEngine{httpClient: &http.Client{Timeout: 15 * time.Second}}
+}
+
+func (e *refreshEngine) resolve(
+	ctx context.Context,
+	lockKey string,
+	get func(ctx context.Context) (map[string]string, error),
+	put func(ctx context.Context, secrets map[string]string) error,
+) (map[string]string, error) {
+	secrets, err := get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -64,15 +98,14 @@ func (r *OAuthResolver) Resolve(ctx context.Context, workflowID, logicalName str
 		return secrets, nil
 	}
 
-	lockKey := workflowID + "/" + logicalName
-	muAny, _ := r.refreshMu.LoadOrStore(lockKey, &sync.Mutex{})
+	muAny, _ := e.refreshMu.LoadOrStore(lockKey, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Re-check after acquiring the lock: another goroutine may have
 	// already refreshed while we were waiting.
-	secrets, err = r.vault.Resolve(ctx, workflowID, logicalName)
+	secrets, err = get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -80,14 +113,14 @@ func (r *OAuthResolver) Resolve(ctx context.Context, workflowID, logicalName str
 		return secrets, nil
 	}
 
-	newAccess, newExpiresAt, err := r.refresh(ctx, secrets["clientId"], secrets["clientSecret"], refreshToken)
+	newAccess, newExpiresAt, err := e.refresh(ctx, secrets["clientId"], secrets["clientSecret"], refreshToken)
 	if err != nil {
-		return nil, fmt.Errorf("oauth: refresh failed for %q/%q: %w", workflowID, logicalName, err)
+		return nil, fmt.Errorf("oauth: refresh failed for %q: %w", lockKey, err)
 	}
 
 	secrets["accessToken"] = newAccess
 	secrets["expiresAt"] = strconv.FormatInt(newExpiresAt.Unix(), 10)
-	if err := r.vault.Put(ctx, workflowID, logicalName, secrets); err != nil {
+	if err := put(ctx, secrets); err != nil {
 		// Non-fatal: we still have a valid in-memory token for this call,
 		// even though persisting the refreshed token failed. Log-worthy
 		// but the caller should proceed with the token it has.
@@ -111,7 +144,7 @@ func needsRefresh(expiresAtStr string) bool {
 // net/url only -- no golang.org/x/oauth2 dependency, since this was
 // written where fetching an extra module wasn't possible; feel free to
 // swap in x/oauth2 locally if you prefer it).
-func (r *OAuthResolver) refresh(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, expiresAt time.Time, err error) {
+func (e *refreshEngine) refresh(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, expiresAt time.Time, err error) {
 	if clientID == "" || clientSecret == "" {
 		return "", time.Time{}, fmt.Errorf("missing clientId/clientSecret on stored credential")
 	}
@@ -127,7 +160,7 @@ func (r *OAuthResolver) refresh(ctx context.Context, clientID, clientSecret, ref
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
