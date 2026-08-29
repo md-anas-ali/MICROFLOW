@@ -96,6 +96,26 @@ func (v *Vault) Resolve(ctx context.Context, workflowID, logicalName string) (ma
 	return unmarshalSecrets(plaintext)
 }
 
+// GoogleOAuthSecrets builds the secrets map for a Google OAuth2
+// credential in the exact shape OAuthResolver expects (see oauth.go's
+// doc comment) and Put() will encrypt. This is the single place that
+// shape is assembled, so cmd/setcred's CLI path and the HTTP
+// credentials API (internal/api) can never drift into writing two
+// different secret shapes for the same node type.
+//
+// expiresAt/accessToken are intentionally omitted: OAuthResolver
+// treats a missing/unparseable expiresAt as "needs refresh", so the
+// first Resolve() call refreshes and obtains a real accessToken itself
+// -- no need for either caller to talk to Google just to seed one.
+func GoogleOAuthSecrets(clientID, clientSecret, refreshToken string) map[string]string {
+	return map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"refreshToken": refreshToken,
+		"tokenType":    "Bearer",
+	}
+}
+
 // masterKeyFromEnv is a convenience the API server calls at startup.
 func MasterKeyFromEnv() (string, error) {
 	k := os.Getenv("MICROFLOW_MASTER_KEY")
