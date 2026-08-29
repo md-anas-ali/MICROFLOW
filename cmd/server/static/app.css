@@ -312,11 +312,16 @@ textarea.json-paste {
 .side-panel h3 { margin: 0 0 10px; font-size: 14px; }
 .side-panel .field { margin-bottom: 12px; }
 .side-panel label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
-.side-panel input[type=text] { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); }
+.side-panel input[type=text], .side-panel input[type=password] { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); }
 .side-panel textarea.params-json { width: 100%; min-height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); resize: vertical; }
 .side-panel .row-checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .field-error { color: var(--error); font-size: 12px; margin-top: 4px; }
 .side-panel-empty { color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px 8px; }
+
+.cred-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.cred-status { margin-bottom: 12px; font-size: 12px; }
+.cred-status-time { color: var(--text-dim); }
+.cred-status-err { color: var(--error); }
 
 /* ---------- execution panel ---------- */
 

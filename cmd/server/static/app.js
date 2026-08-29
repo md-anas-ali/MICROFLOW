@@ -6,9 +6,20 @@
 //   GET  /api/workflows/{id}
 //   GET  /api/workflows/{id}/export
 //   POST /api/workflows/{id}/execute?startNode=...
+//   GET  /api/workflows/{id}/credentials
+//   POST /api/workflows/{id}/credentials
 // No other endpoints exist server-side, so execution results are only
 // ever what the most recent POST .../execute call returned — there is
 // no execution-history endpoint to page through.
+//
+// Credentials: the /credentials endpoints save/list Google OAuth
+// credentials for a single (workflowID, nodeName) pair, exactly what
+// vault.Put/cmd/setcred already write -- there is no separate "account"
+// concept, so the UI always asks for a specific Google/YouTube/Gmail
+// node (see the side panel in the editor below) rather than a name.
+// GET .../credentials never returns clientSecret/refreshToken, only
+// nodeName/nodeType/updatedAt -- so the UI never has secret bytes to
+// accidentally render.
 
 (function () {
   "use strict";
@@ -379,6 +390,96 @@
     return html;
   }
 
+  // ---------------- google credentials (per node, editor side panel) ----------------
+
+  // Exactly the node types internal/nodes/google.go calls
+  // Creds.Resolve(workflowID, node.Name) for -- the same set
+  // cmd/setcred and internal/api/server.go's isGoogleCredentialNodeType
+  // accept. Keep these three lists in sync if a Google node type is
+  // ever added.
+  const GOOGLE_CREDENTIAL_NODE_TYPES = ["googleSheets", "youTube", "gmail"];
+  function isGoogleCredentialNode(type) {
+    return GOOGLE_CREDENTIAL_NODE_TYPES.indexOf(type) !== -1;
+  }
+
+  function renderCredentialSection() {
+    return (
+      '<div class="cred-section">' +
+      "<h3>Google Credentials</h3>" +
+      '<div id="credStatus" class="cred-status">' + loadingRow("Checking saved credential\u2026") + "</div>" +
+      '<div class="field"><label>Client ID</label><input type="text" id="credClientId" autocomplete="off"></div>' +
+      '<div class="field"><label>Client Secret</label><input type="password" id="credClientSecret" autocomplete="off"></div>' +
+      '<div class="field"><label>Refresh Token</label><input type="password" id="credRefreshToken" autocomplete="off"></div>' +
+      '<button id="saveCredBtn" class="btn btn-primary btn-sm">Save Account</button>' +
+      '<div id="credError" class="field-error"></div>' +
+      "</div>"
+    );
+  }
+
+  // Re-fetches this workflow's saved-credential list and updates just
+  // the status line -- never touches the input fields, so it's safe to
+  // call again right after a save without disturbing anything else.
+  async function refreshCredentialStatus(workflowId, nodeName) {
+    const statusEl = document.getElementById("credStatus");
+    if (!statusEl) return; // side panel moved on to a different node
+    try {
+      const creds = await apiJSON("/api/workflows/" + encodeURIComponent(workflowId) + "/credentials");
+      const existing = (creds || []).find((c) => c.nodeName === nodeName);
+      statusEl.innerHTML = existing
+        ? '<span class="badge badge-active">saved</span> <span class="cred-status-time">last updated ' +
+          escapeHtml(fmtDate(existing.updatedAt)) + "</span>"
+        : '<span class="badge badge-inactive">not saved</span>';
+    } catch (e) {
+      statusEl.innerHTML = '<span class="cred-status-err">Could not check saved status: ' + escapeHtml(e.message) + "</span>";
+    }
+  }
+
+  function wireCredentialSection(nodeName) {
+    const workflowId = editorState.workflow.id;
+    refreshCredentialStatus(workflowId, nodeName);
+
+    const errEl = document.getElementById("credError");
+    document.getElementById("saveCredBtn").addEventListener("click", async () => {
+      const btn = document.getElementById("saveCredBtn");
+      errEl.textContent = "";
+
+      const clientId = document.getElementById("credClientId").value.trim();
+      const clientSecret = document.getElementById("credClientSecret").value.trim();
+      const refreshToken = document.getElementById("credRefreshToken").value.trim();
+      if (!clientId || !clientSecret || !refreshToken) {
+        errEl.textContent = "Client ID, Client Secret, and Refresh Token are all required.";
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Saving\u2026";
+      try {
+        await apiJSON("/api/workflows/" + encodeURIComponent(workflowId) + "/credentials", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            nodeName: nodeName,
+            clientId: clientId,
+            clientSecret: clientSecret,
+            refreshToken: refreshToken,
+          }),
+        });
+        toast("Account saved successfully", "success");
+        // Clear the secret fields after a successful save -- nothing
+        // secret should linger in the DOM/inputs longer than it has to.
+        document.getElementById("credClientSecret").value = "";
+        document.getElementById("credRefreshToken").value = "";
+        refreshCredentialStatus(workflowId, nodeName);
+      } catch (e) {
+        errEl.textContent = e.message;
+        toast("Save failed: " + e.message, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Save Account";
+      }
+    });
+  }
+
   // ---------------- editor ----------------
 
   let editorState = null; // { workflow, selectedNodeName, lastExecution }
@@ -526,7 +627,8 @@
       '<textarea id="nodeParams" class="params-json">' + escapeHtml(paramsStr) + "</textarea>" +
       '<div id="paramsError" class="field-error"></div></div>' +
       '<button id="applyNodeBtn" class="btn btn-primary btn-sm">Apply to workflow</button>' +
-      '<div style="color:var(--text-dim);font-size:11px;margin-top:8px;">Applies in-memory \u2014 click Save (top toolbar) to persist.</div>'
+      '<div style="color:var(--text-dim);font-size:11px;margin-top:8px;">Applies in-memory \u2014 click Save (top toolbar) to persist.</div>' +
+      (isGoogleCredentialNode(node.type) ? renderCredentialSection() : "")
     );
   }
 
@@ -546,6 +648,11 @@
       toast("Applied \u2014 remember to Save", "success");
       drawCanvas();
     });
+
+    const node = editorState.workflow.nodes[nodeName];
+    if (node && isGoogleCredentialNode(node.type)) {
+      wireCredentialSection(nodeName);
+    }
   }
 
   function wireEditorToolbar() {
