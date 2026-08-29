@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"microflow/internal/model"
 	"microflow/internal/runner"
@@ -88,6 +89,43 @@ func (f *fakeVaultStore) ListCredentials(ctx context.Context, workflowID string)
 	return out, nil
 }
 
+// fakeAccountStore implements vault.AccountStore, the storage interface
+// backing the central (account-scoped, not per-workflow) Google
+// credential -- see internal/vault/central.go.
+type fakeAccountStore struct {
+	rows      map[string][]byte
+	updatedAt map[string]time.Time
+}
+
+func newFakeAccountStore() *fakeAccountStore {
+	return &fakeAccountStore{rows: map[string][]byte{}, updatedAt: map[string]time.Time{}}
+}
+
+func (f *fakeAccountStore) GetEncryptedAccount(ctx context.Context, account string) ([]byte, error) {
+	ct, ok := f.rows[account]
+	if !ok {
+		return nil, errNotFound
+	}
+	return ct, nil
+}
+
+func (f *fakeAccountStore) PutEncryptedAccount(ctx context.Context, account string, ciphertext []byte) error {
+	f.rows[account] = ciphertext
+	f.updatedAt[account] = time.Now()
+	return nil
+}
+
+func (f *fakeAccountStore) DeleteEncryptedAccount(ctx context.Context, account string) error {
+	delete(f.rows, account)
+	delete(f.updatedAt, account)
+	return nil
+}
+
+func (f *fakeAccountStore) AccountCredentialMeta(ctx context.Context, account string) (time.Time, bool, error) {
+	t, ok := f.updatedAt[account]
+	return t, ok, nil
+}
+
 const testMasterKey = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=" // 32 raw bytes, base64 -- test-only key
 
 func newTestServer(t *testing.T) (*Server, *fakeWorkflowStore, *fakeVaultStore) {
@@ -98,10 +136,11 @@ func newTestServer(t *testing.T) (*Server, *fakeWorkflowStore, *fakeVaultStore) 
 	if err != nil {
 		t.Fatalf("vault.New: %v", err)
 	}
+	accounts := v.NewAccountVault(newFakeAccountStore())
 	// run is unused by the credentials endpoints, but Server requires
 	// one; a nil runner is fine as long as tests never call /execute.
 	var run *runner.Runner
-	s := New(wfStore, run, vStore, v)
+	s := New(wfStore, run, vStore, v, accounts)
 	return s, wfStore, vStore
 }
 
@@ -208,6 +247,106 @@ func TestSaveCredentialRejectsMissingFields(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing clientSecret, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCentralCredentialNotConfiguredByDefault(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/credentials/google", nil)
+	rec := httptest.NewRecorder()
+	s.handleGetCentralCredential(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var status centralCredentialStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if status.Configured {
+		t.Fatalf("expected not configured, got %#v", status)
+	}
+}
+
+func TestCentralCredentialSaveThenStatus(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	saveBody := `{"clientId":"cid","clientSecret":"csecret","refreshToken":"rtoken"}`
+	saveReq := httptest.NewRequest(http.MethodPost, "/api/credentials/google", bytes.NewBufferString(saveBody))
+	saveRec := httptest.NewRecorder()
+	s.handleSaveCentralCredential(saveRec, saveReq)
+
+	if saveRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", saveRec.Code, saveRec.Body.String())
+	}
+	if bytes.Contains(saveRec.Body.Bytes(), []byte("csecret")) || bytes.Contains(saveRec.Body.Bytes(), []byte("rtoken")) {
+		t.Fatalf("save response leaked a secret: %s", saveRec.Body.String())
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/credentials/google", nil)
+	statusRec := httptest.NewRecorder()
+	s.handleGetCentralCredential(statusRec, statusReq)
+
+	var status centralCredentialStatus
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !status.Configured || status.UpdatedAt == "" {
+		t.Fatalf("expected configured with a timestamp, got %#v", status)
+	}
+
+	// Confirm this actually went through the same accounts.Resolve path
+	// CentralFallbackResolver falls back to at execution time.
+	secrets, err := s.accounts.Resolve(context.Background(), "google")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if secrets["clientId"] != "cid" || secrets["clientSecret"] != "csecret" || secrets["refreshToken"] != "rtoken" {
+		t.Fatalf("resolved secrets don't match what was saved: %#v", secrets)
+	}
+}
+
+func TestCentralCredentialSaveRejectsMissingFields(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	body := `{"clientId":"cid","clientSecret":"","refreshToken":"rt"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/credentials/google", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	s.handleSaveCentralCredential(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing clientSecret, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCentralCredentialDelete(t *testing.T) {
+	s, _, _ := newTestServer(t)
+
+	saveBody := `{"clientId":"cid","clientSecret":"csecret","refreshToken":"rtoken"}`
+	saveReq := httptest.NewRequest(http.MethodPost, "/api/credentials/google", bytes.NewBufferString(saveBody))
+	saveRec := httptest.NewRecorder()
+	s.handleSaveCentralCredential(saveRec, saveReq)
+	if saveRec.Code != http.StatusOK {
+		t.Fatalf("setup save failed: %d %s", saveRec.Code, saveRec.Body.String())
+	}
+
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/credentials/google", nil)
+	delRec := httptest.NewRecorder()
+	s.handleDeleteCentralCredential(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", delRec.Code, delRec.Body.String())
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/credentials/google", nil)
+	statusRec := httptest.NewRecorder()
+	s.handleGetCentralCredential(statusRec, statusReq)
+	var status centralCredentialStatus
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if status.Configured {
+		t.Fatalf("expected not configured after delete, got %#v", status)
 	}
 }
 

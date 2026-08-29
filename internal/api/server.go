@@ -40,14 +40,21 @@ type Server struct {
 	credentials CredentialStore
 	run         *runner.Runner
 	vault       *vault.Vault
+	// accounts is nil-safe by design: every handler that touches it
+	// checks for nil first and returns a clear 500 rather than a panic,
+	// so a server wired up without central-credential storage (e.g. an
+	// older test helper) still serves every other endpoint normally.
+	accounts *vault.AccountVault
 }
 
 // New wires the API to the shared runner/store/vault -- the exact same
 // *vault.Vault instance cmd/server hands the OAuthResolver, so this
 // package writes credentials through the identical encryption/storage
-// path as cmd/setcred, never a parallel one.
-func New(workflows WorkflowStore, run *runner.Runner, credentials CredentialStore, v *vault.Vault) *Server {
-	s := &Server{mux: http.NewServeMux(), workflows: workflows, run: run, credentials: credentials, vault: v}
+// path as cmd/setcred, never a parallel one. accounts is the central
+// (account-scoped, not per-workflow) Google credential store backing
+// the /api/credentials/google endpoints -- see internal/vault/central.go.
+func New(workflows WorkflowStore, run *runner.Runner, credentials CredentialStore, v *vault.Vault, accounts *vault.AccountVault) *Server {
+	s := &Server{mux: http.NewServeMux(), workflows: workflows, run: run, credentials: credentials, vault: v, accounts: accounts}
 	s.routes()
 	return s
 }
@@ -63,6 +70,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/workflows/{id}/execute", s.handleExecute)
 	s.mux.HandleFunc("GET /api/workflows/{id}/credentials", s.handleListCredentials)
 	s.mux.HandleFunc("POST /api/workflows/{id}/credentials", s.handleSaveCredential)
+
+	// Central Google credential: one saved account, shared automatically
+	// by every googleSheets/youTube/gmail node in every workflow (see
+	// internal/vault/central.go's CentralFallbackResolver). Deliberately
+	// not scoped under /api/workflows/{id} -- it isn't a per-workflow
+	// resource.
+	s.mux.HandleFunc("GET /api/credentials/google", s.handleGetCentralCredential)
+	s.mux.HandleFunc("POST /api/credentials/google", s.handleSaveCentralCredential)
+	s.mux.HandleFunc("DELETE /api/credentials/google", s.handleDeleteCentralCredential)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -291,6 +307,80 @@ func (s *Server) handleSaveCredential(w http.ResponseWriter, r *http.Request) {
 		"status":   "ok",
 		"nodeName": req.NodeName,
 	})
+}
+
+// centralCredentialStatus is what GET /api/credentials/google returns --
+// whether an account is configured and when it was last saved, never
+// secret material (rule 11/12), matching credentialView's shape above.
+type centralCredentialStatus struct {
+	Configured bool   `json:"configured"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+}
+
+func (s *Server) handleGetCentralCredential(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("central credential storage is not configured on this server"))
+		return
+	}
+	updatedAt, ok, err := s.accounts.Status(r.Context(), vault.CentralGoogleAccount)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to check central credential status"))
+		return
+	}
+	out := centralCredentialStatus{Configured: ok}
+	if ok {
+		out.UpdatedAt = updatedAt.Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleSaveCentralCredential is the "log in once" endpoint: saves the
+// single Google account credential every googleSheets/youTube/gmail
+// node across every workflow will automatically use from now on (see
+// CentralFallbackResolver). Same request shape, same field validation,
+// and the same vault.GoogleOAuthSecrets encoding as the per-node
+// handleSaveCredential above -- only the storage scope differs.
+func (s *Server) handleSaveCentralCredential(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("central credential storage is not configured on this server"))
+		return
+	}
+
+	var req saveCredentialRequest
+	limited := io.LimitReader(r.Body, maxCredentialSaveBytes+1)
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.ClientSecret = strings.TrimSpace(req.ClientSecret)
+	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
+
+	if req.ClientID == "" || req.ClientSecret == "" || req.RefreshToken == "" {
+		// Deliberately doesn't echo back which field's value was given --
+		// nothing from req is ever reflected into a response (rule 11/12).
+		writeErr(w, http.StatusBadRequest, errors.New("clientId, clientSecret, and refreshToken are all required"))
+		return
+	}
+
+	secrets := vault.GoogleOAuthSecrets(req.ClientID, req.ClientSecret, req.RefreshToken)
+	if err := s.accounts.Put(r.Context(), vault.CentralGoogleAccount, secrets); err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to save credential"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDeleteCentralCredential(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("central credential storage is not configured on this server"))
+		return
+	}
+	if err := s.accounts.Delete(r.Context(), vault.CentralGoogleAccount); err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to delete credential"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func readBody(r *http.Request, max int64) ([]byte, error) {
