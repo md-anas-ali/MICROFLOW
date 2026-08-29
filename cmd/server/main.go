@@ -113,7 +113,11 @@ func main() {
 	defer close(stopGuard)
 
 	run := runner.New(st, st, eng, st, creds, scratchRoot).WithMemGuard(memGuard)
-	apiServer := api.New(st, run)
+	// st also satisfies api.CredentialStore (ListCredentials); baseVault
+	// (not the OAuthResolver) is passed so credential writes go through
+	// the same Put path cmd/setcred uses -- no token refresh needed just
+	// to save a credential.
+	apiServer := api.New(st, run, st, baseVault)
 
 	whServer := webhook.NewServer()
 	webhookToken := envOr("MICROFLOW_WEBHOOK_TOKEN", "")
