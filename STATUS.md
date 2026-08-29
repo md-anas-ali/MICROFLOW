@@ -1,4 +1,117 @@
-# MicroFlow backend — STATUS (read this first)
+# MicroFlow — STATUS (read this first)
+
+## This pass: central Google credential + real workflow editor
+
+Two features requested on top of the previous draft, both now implemented,
+built, vetted, tested, and (for the frontend) smoke-tested:
+
+### 1. Central Google credential ("log in once")
+
+Previously the only way to give a googleSheets/youTube/gmail node
+credentials was per-node, per-workflow (`cmd/setcred` or the editor's
+side-panel "Google Credentials" section). That still works unchanged,
+but now there's also a single central account:
+
+- `internal/vault/central.go` (new): `AccountVault` (encrypts with the
+  *same* AEAD/master key as the existing per-node `Vault` — one
+  `MICROFLOW_MASTER_KEY` covers both), `AccountResolver` (refreshes the
+  central account's OAuth token exactly like per-node credentials do),
+  and `CentralFallbackResolver`, which implements
+  `engine.CredentialResolver` and is what actually gets wired into the
+  engine: it tries a per-node override first, then falls back to the
+  central account. **`internal/nodes/google.go` did not change at all**
+  — the fallback happens entirely by swapping which resolver
+  `cmd/server/main.go` hands to the runner.
+- `internal/vault/oauth.go` was refactored (not behaviorally changed)
+  to extract a shared `refreshEngine` so per-node and central resolvers
+  share one implementation of the refresh/retry/mutex logic instead of
+  two copies.
+- New table `google_account_credentials` (`internal/store/schema.sql`),
+  deliberately with no FK to `workflows` — it's account-scoped, not
+  workflow-scoped, and must survive a workflow being deleted. New
+  `internal/store/postgres.go` methods implement `vault.AccountStore`.
+- New endpoints (`internal/api/server.go`): `GET/POST/DELETE
+  /api/credentials/google` — status/save/clear, never returns secret
+  bytes. Covered by new tests in `internal/api/credentials_test.go`
+  (`TestCentralCredential*`), all passing.
+- Frontend: a new "Google Credentials" page (`#/credentials`, linked
+  from the sidebar) with masked Client Secret/Refresh Token fields, a
+  configured/not-configured status badge, Save/Update and Clear. The
+  old per-node section in a node's side panel is kept for backward
+  compatibility, relabeled "(override)" with a note pointing at the
+  central page — most workflows will never need it.
+
+### 2. Real workflow editor
+
+The canvas previously only supported click-to-select + a raw JSON
+textarea for parameters. It now supports everything the person asked
+for, all in `cmd/server/static/app.js` (still plain JS, no build step,
+no new dependencies):
+
+- **Drag to move**: mousedown-drag on a node box updates its position
+  live (direct DOM style + a targeted redraw of just that node's
+  connection lines, not a full canvas re-render, so it stays smooth);
+  a full `drawCanvas()` runs once on mouseup to resync the canvas
+  bounding box.
+- **Add node**: a type dropdown + "+ Add node" button in the toolbar,
+  covering every `model.NodeType` the Go engine can execute. New nodes
+  get a generated id and empty `originalType` — `internal/parser/
+  export.go`'s existing `reverseTypeMap` fallback already handles that
+  correctly on export, so no parser change was needed.
+- **Connect**: drag from a node's right-edge output dot to another
+  node's left-edge input dot (visible connector handles on every node,
+  temp dashed line follows the cursor while dragging). Duplicate
+  connections are rejected with a toast.
+- **Delete node**: a "Delete node" button in the side panel, or
+  Delete/Backspace when a node is selected (guarded against firing
+  while typing in a text field). Removes the node's own outgoing
+  connections and any incoming connections pointing at it.
+- **Delete connection**: click a connection line (a wide invisible hit
+  path makes thin lines easy to click) → confirm → removed.
+- **Position/workflow save + reload persistence**: unchanged mechanism
+  — all of the above only mutates `editorState.workflow` in memory
+  (same as the existing "Apply to workflow" pattern for params); the
+  existing Save button POSTs the whole workflow to `.../save` exactly
+  as before, and GET on reload returns exactly what was last saved.
+  No backend changes were needed for this part at all.
+
+**Verified this pass:**
+
+```
+go build ./...        # clean
+go vet ./...           # clean
+gofmt -l .              # clean (excluding vendored third_party/)
+go test ./... -race    # all packages pass, race detector clean
+```
+
+Plus a real (not just syntax-checked) frontend smoke test:
+`test/frontend/smoketest.js` loads the actual `index.html`/`app.js`
+into jsdom, mocks the fetch calls to the real API endpoints, and drives
+the DOM through: select → add node → delete node → drag node → delete
+connection → connect via drag → save → reload in a fresh DOM instance
+(proving persistence, not just in-memory state) → central credentials
+page save. Run it yourself with:
+
+```
+cd test/frontend && npm install && node smoketest.js
+```
+All 18 assertions pass. This is not a substitute for opening a real
+browser, but it does exercise the actual shipped JS against a DOM and
+would catch wiring bugs (bad selectors, undefined ids, exceptions in
+handlers) that a syntax check alone would miss.
+
+**Still not built** (unchanged from before this pass — see "what's
+still explicitly a gap" below): the initial OAuth consent flow (getting
+the *first* Client ID/Secret/Refresh Token — the central credentials
+page and per-node section both assume you already have these three
+values from Google Cloud Console, same as before). `cmd/setcred` was
+left untouched; it still only writes per-node credentials, not the
+central one — use the frontend's Google Credentials page for that, or
+call `POST /api/credentials/google` directly.
+
+---
+
+# Original backend — STATUS (below is from the previous pass)
 
 ## Environment reality (changed this pass — now actually verified)
 
