@@ -14,6 +14,7 @@ import (
 type Deps struct {
 	HTTPClient         *http.Client
 	AllowedBinaries    map[string]string // logical name -> absolute path, allowlist for ExecuteCommand (security rule 22)
+	EnvAllowlist       []string          // env var names exposed to Code node's $env (security rule 11/22) -- see CodeExecutor.envAllowlist
 	ScratchRoot        string
 	CredentialResolver engine.CredentialResolver
 }

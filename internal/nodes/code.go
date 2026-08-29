@@ -3,6 +3,7 @@ package nodes
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -23,9 +24,16 @@ import (
 // provides natively). We do not expose `require`, so npm-style module
 // loading is impossible from inside a Code node. A wall-clock timeout
 // aborts runaway scripts (rule 22: infinite loops).
-type CodeExecutor struct{}
+type CodeExecutor struct {
+	// EnvAllowlist holds the env var *names* an operator has opted in to
+	// exposing to Code node scripts via $env (populated from server
+	// config, see cmd/server/main.go and Deps.EnvAllowlist). Nil/empty
+	// means no env vars are exposed -- same fail-closed default as
+	// ExecuteCommandExecutor.AllowedBinaries.
+	EnvAllowlist []string
+}
 
-func (CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
+func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
 	src := node.ParamString("jsCode", node.ParamString("code", ""))
 	mode := node.ParamString("mode", "runOnceForAllItems")
 	items := flatten(input)
@@ -75,7 +83,7 @@ func (CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *mo
 			}
 			mustSet(vm, "$node", nodeGetterProxy(nodeGetter))
 
-			mustSet(vm, "$env", envAllowlist())
+			mustSet(vm, "$env", e.envAllowlist())
 			mustSet(vm, "$execution", map[string]any{"id": rc.Execution.ID, "mode": rc.Execution.Mode})
 			mustSet(vm, "$workflow", map[string]any{"id": rc.Workflow.ID, "name": rc.Workflow.Name})
 
@@ -177,12 +185,21 @@ func mustSet(vm *goja.Runtime, name string, v any) {
 
 // envAllowlist exposes only explicitly-approved env vars to Code nodes,
 // never the whole process environment (credential leakage prevention,
-// rule 11/22).
-func envAllowlist() map[string]string {
-	// Populated at server startup from a configured allowlist; empty by
-	// default so Code nodes cannot read secrets unless an operator opts
-	// a specific variable in.
-	return map[string]string{}
+// rule 11/22). The set of *names* an operator opted in to comes from
+// e.EnvAllowlist (wired at server startup, see cmd/server/main.go); this
+// reads the actual values from the process environment fresh on every
+// call so a value change (e.g. a rotated API key) takes effect without a
+// restart. A name in the allowlist with no matching process env var is
+// simply omitted, not exposed as an empty string, so scripts can use
+// `if ($env.X)` to detect it's unset.
+func (e CodeExecutor) envAllowlist() map[string]string {
+	out := make(map[string]string, len(e.EnvAllowlist))
+	for _, name := range e.EnvAllowlist {
+		if v, ok := os.LookupEnv(name); ok {
+			out[name] = v
+		}
+	}
+	return out
 }
 
 func nodeGetterProxy(get func(string) map[string]any) func(string) map[string]any {
