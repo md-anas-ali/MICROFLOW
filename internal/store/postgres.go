@@ -200,3 +200,38 @@ func (s *Store) PutEncrypted(ctx context.Context, workflowID, logicalName string
 	`, workflowID, logicalName, ciphertext)
 	return err
 }
+
+// CredentialInfo is a credential's metadata with no secret material --
+// safe to return from an HTTP endpoint (rule 11/12). NodeName is the
+// vault's logical_name (== the node's Name in the workflow).
+type CredentialInfo struct {
+	NodeName  string    `json:"nodeName"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// ListCredentials returns which nodes in a workflow have a stored
+// credential and when it was last written -- deliberately selects only
+// logical_name/updated_at, never the ciphertext column, so this query
+// can never become an accidental secret-leak path no matter how its
+// result gets serialized upstream.
+func (s *Store) ListCredentials(ctx context.Context, workflowID string) ([]CredentialInfo, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT logical_name, updated_at FROM credentials
+		WHERE workflow_id = $1
+		ORDER BY logical_name
+	`, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CredentialInfo
+	for rows.Next() {
+		var ci CredentialInfo
+		if err := rows.Scan(&ci.NodeName, &ci.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, ci)
+	}
+	return out, rows.Err()
+}
