@@ -79,10 +79,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// OAuthResolver wraps the vault so every node executor gets an
-	// already-refreshed accessToken transparently (Google Sheets/
-	// YouTube/Gmail); plain API-key credentials pass through unchanged.
-	creds := vault.NewOAuthResolver(baseVault)
+	// accountVault stores the single central Google account credential
+	// (shared AEAD/master key with baseVault, separate table -- see
+	// internal/vault/central.go); st satisfies vault.AccountStore the
+	// same way it already satisfies vault.Store.
+	accountVault := baseVault.NewAccountVault(st)
+
+	// creds is what every node executor actually calls: it tries a
+	// per-node/per-workflow override first (OAuthResolver, unchanged
+	// behavior/storage from before this feature), then falls back to
+	// the central Google account (AccountResolver) so a single saved
+	// account "just works" for every googleSheets/youTube/gmail node
+	// across every workflow without per-node setup. Both legs
+	// transparently refresh an expiring accessToken before handing it
+	// to the node; plain API-key credentials (no refreshToken) pass
+	// through unchanged.
+	perNodeCreds := vault.NewOAuthResolver(baseVault)
+	accountCreds := vault.NewAccountResolver(accountVault)
+	creds := vault.NewCentralFallbackResolver(perNodeCreds, accountCreds)
 
 	scratchRoot := envOr("MICROFLOW_SCRATCH_DIR", "/tmp/microflow")
 	_ = os.MkdirAll(scratchRoot, 0o700)
@@ -130,10 +144,11 @@ func main() {
 
 	run := runner.New(st, st, eng, st, creds, scratchRoot).WithMemGuard(memGuard)
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
-	// (not the OAuthResolver) is passed so credential writes go through
-	// the same Put path cmd/setcred uses -- no token refresh needed just
-	// to save a credential.
-	apiServer := api.New(st, run, st, baseVault)
+	// (not the OAuthResolver) is passed so per-node credential writes go
+	// through the same Put path cmd/setcred uses -- no token refresh
+	// needed just to save a credential. accountVault is the central
+	// Google account store backing /api/credentials/google.
+	apiServer := api.New(st, run, st, baseVault, accountVault)
 
 	whServer := webhook.NewServer()
 	webhookToken := envOr("MICROFLOW_WEBHOOK_TOKEN", "")
