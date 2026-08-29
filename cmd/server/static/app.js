@@ -1,25 +1,34 @@
 // MicroFlow UI — plain JS, no build step, no external dependencies.
 // Talks only to the existing API surface (internal/api/server.go):
-//   GET  /api/workflows
-//   POST /api/workflows/import
-//   POST /api/workflows/{id}/save
-//   GET  /api/workflows/{id}
-//   GET  /api/workflows/{id}/export
-//   POST /api/workflows/{id}/execute?startNode=...
-//   GET  /api/workflows/{id}/credentials
-//   POST /api/workflows/{id}/credentials
-// No other endpoints exist server-side, so execution results are only
-// ever what the most recent POST .../execute call returned — there is
-// no execution-history endpoint to page through.
+//   GET    /api/workflows
+//   POST   /api/workflows/import
+//   POST   /api/workflows/{id}/save
+//   GET    /api/workflows/{id}
+//   GET    /api/workflows/{id}/export
+//   POST   /api/workflows/{id}/execute?startNode=...
+//   GET    /api/workflows/{id}/credentials
+//   POST   /api/workflows/{id}/credentials
+//   GET    /api/credentials/google
+//   POST   /api/credentials/google
+//   DELETE /api/credentials/google
+// No execution-history endpoint exists server-side, so execution
+// results are only ever what the most recent POST .../execute call
+// returned — there is nothing to page through.
 //
-// Credentials: the /credentials endpoints save/list Google OAuth
-// credentials for a single (workflowID, nodeName) pair, exactly what
-// vault.Put/cmd/setcred already write -- there is no separate "account"
-// concept, so the UI always asks for a specific Google/YouTube/Gmail
-// node (see the side panel in the editor below) rather than a name.
-// GET .../credentials never returns clientSecret/refreshToken, only
-// nodeName/nodeType/updatedAt -- so the UI never has secret bytes to
-// accidentally render.
+// Credentials, two scopes:
+//  - Central (/api/credentials/google): ONE Google account, saved once
+//    on the "Google Credentials" page, used automatically by every
+//    googleSheets/youTube/gmail node in every workflow (see
+//    internal/vault/central.go's CentralFallbackResolver). This is the
+//    normal path — most people never need anything below.
+//  - Per-node override (/api/workflows/{id}/credentials): the original
+//    mechanism, kept for backward compatibility and for the rare case a
+//    specific node needs a *different* Google account than the central
+//    one. Scoped to a single (workflowID, nodeName) pair, exactly what
+//    vault.Put/cmd/setcred already write.
+// Neither GET ever returns clientSecret/refreshToken, only
+// nodeName/nodeType/updatedAt (or configured/updatedAt for the central
+// one) -- so the UI never has secret bytes to accidentally render.
 
 (function () {
   "use strict";
@@ -142,6 +151,9 @@
       } else if (parts[0] === "import") {
         setActiveNav("import");
         renderImport();
+      } else if (parts[0] === "credentials") {
+        setActiveNav("credentials");
+        await renderCentralCredentialsPage();
       } else {
         setActiveNav("");
         viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
@@ -390,7 +402,113 @@
     return html;
   }
 
+  // ---------------- central google credentials page ----------------
+  //
+  // One Google account, saved once here, used automatically by every
+  // googleSheets/youTube/gmail node in every workflow (see
+  // internal/vault/central.go). This is the primary credential flow;
+  // the per-node section further down is only an optional override.
+
+  async function renderCentralCredentialsPage() {
+    viewEl.innerHTML =
+      '<div class="page-head"><div><h1>Google Credentials</h1>' +
+      '<div class="sub">One Google account, used automatically by every Google node (Sheets, YouTube, Gmail) in every workflow \u2014 no per-node setup needed.</div></div></div>' +
+      '<div class="card cred-page-card">' +
+      '<div id="centralCredStatus" class="cred-status">' + loadingRow("Checking saved account\u2026") + "</div>" +
+      '<div class="field"><label>Client ID</label><input type="text" id="centralClientId" autocomplete="off"></div>' +
+      '<div class="field"><label>Client Secret</label><input type="password" id="centralClientSecret" autocomplete="off"></div>' +
+      '<div class="field"><label>Refresh Token</label><input type="password" id="centralRefreshToken" autocomplete="off"></div>' +
+      '<div class="cred-page-actions">' +
+      '<button id="centralSaveBtn" class="btn btn-primary">Save / Update</button>' +
+      '<button id="centralClearBtn" class="btn btn-danger">Clear</button>' +
+      "</div>" +
+      '<div id="centralCredError" class="field-error"></div>' +
+      "</div>";
+
+    wireCentralCredentialsPage();
+    refreshCentralCredentialStatus();
+  }
+
+  // Re-fetches central status and updates just the status line -- never
+  // touches the input fields, so it's safe to call again right after a
+  // save/clear without disturbing anything else the person is typing.
+  async function refreshCentralCredentialStatus() {
+    const statusEl = document.getElementById("centralCredStatus");
+    if (!statusEl) return; // navigated away
+    try {
+      const status = await apiJSON("/api/credentials/google");
+      statusEl.innerHTML = status && status.configured
+        ? '<span class="badge badge-active">configured</span> <span class="cred-status-time">last updated ' +
+          escapeHtml(fmtDate(status.updatedAt)) + "</span>"
+        : '<span class="badge badge-inactive">not configured</span>';
+    } catch (e) {
+      statusEl.innerHTML = '<span class="cred-status-err">Could not check saved status: ' + escapeHtml(e.message) + "</span>";
+    }
+  }
+
+  function wireCentralCredentialsPage() {
+    const errEl = document.getElementById("centralCredError");
+
+    document.getElementById("centralSaveBtn").addEventListener("click", async () => {
+      const btn = document.getElementById("centralSaveBtn");
+      errEl.textContent = "";
+
+      const clientId = document.getElementById("centralClientId").value.trim();
+      const clientSecret = document.getElementById("centralClientSecret").value.trim();
+      const refreshToken = document.getElementById("centralRefreshToken").value.trim();
+      if (!clientId || !clientSecret || !refreshToken) {
+        errEl.textContent = "Client ID, Client Secret, and Refresh Token are all required.";
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Saving\u2026";
+      try {
+        await apiJSON("/api/credentials/google", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientId: clientId, clientSecret: clientSecret, refreshToken: refreshToken }),
+        });
+        toast("Google account saved \u2014 every Google node will use it automatically", "success");
+        // Clear secret fields after a successful save -- nothing secret
+        // should linger in the DOM/inputs longer than it has to.
+        document.getElementById("centralClientSecret").value = "";
+        document.getElementById("centralRefreshToken").value = "";
+        refreshCentralCredentialStatus();
+      } catch (e) {
+        errEl.textContent = e.message;
+        toast("Save failed: " + e.message, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Save / Update";
+      }
+    });
+
+    document.getElementById("centralClearBtn").addEventListener("click", async () => {
+      const btn = document.getElementById("centralClearBtn");
+      errEl.textContent = "";
+      btn.disabled = true;
+      try {
+        await apiJSON("/api/credentials/google", { method: "DELETE" });
+        document.getElementById("centralClientId").value = "";
+        document.getElementById("centralClientSecret").value = "";
+        document.getElementById("centralRefreshToken").value = "";
+        toast("Google account cleared", "success");
+        refreshCentralCredentialStatus();
+      } catch (e) {
+        errEl.textContent = e.message;
+        toast("Clear failed: " + e.message, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
   // ---------------- google credentials (per node, editor side panel) ----------------
+  //
+  // Optional override: only needed if one specific node must use a
+  // *different* Google account than the central one above. Most
+  // workflows never need this section at all.
 
   // Exactly the node types internal/nodes/google.go calls
   // Creds.Resolve(workflowID, node.Name) for -- the same set
@@ -405,12 +523,15 @@
   function renderCredentialSection() {
     return (
       '<div class="cred-section">' +
-      "<h3>Google Credentials</h3>" +
+      "<h3>Google Credentials (override)</h3>" +
+      '<div class="cred-section-note">Usually not needed \u2014 every Google node uses the ' +
+      '<a href="#/credentials">central Google account</a> automatically. Only fill this in if ' +
+      "this specific node should use a different account.</div>" +
       '<div id="credStatus" class="cred-status">' + loadingRow("Checking saved credential\u2026") + "</div>" +
       '<div class="field"><label>Client ID</label><input type="text" id="credClientId" autocomplete="off"></div>' +
       '<div class="field"><label>Client Secret</label><input type="password" id="credClientSecret" autocomplete="off"></div>' +
       '<div class="field"><label>Refresh Token</label><input type="password" id="credRefreshToken" autocomplete="off"></div>' +
-      '<button id="saveCredBtn" class="btn btn-primary btn-sm">Save Account</button>' +
+      '<button id="saveCredBtn" class="btn btn-primary btn-sm">Save Override</button>' +
       '<div id="credError" class="field-error"></div>' +
       "</div>"
     );
@@ -426,9 +547,9 @@
       const creds = await apiJSON("/api/workflows/" + encodeURIComponent(workflowId) + "/credentials");
       const existing = (creds || []).find((c) => c.nodeName === nodeName);
       statusEl.innerHTML = existing
-        ? '<span class="badge badge-active">saved</span> <span class="cred-status-time">last updated ' +
+        ? '<span class="badge badge-active">override saved</span> <span class="cred-status-time">last updated ' +
           escapeHtml(fmtDate(existing.updatedAt)) + "</span>"
-        : '<span class="badge badge-inactive">not saved</span>';
+        : '<span class="badge badge-inactive">no override \u2014 using central account</span>';
     } catch (e) {
       statusEl.innerHTML = '<span class="cred-status-err">Could not check saved status: ' + escapeHtml(e.message) + "</span>";
     }
@@ -464,7 +585,7 @@
             refreshToken: refreshToken,
           }),
         });
-        toast("Account saved successfully", "success");
+        toast("Override saved for this node", "success");
         // Clear the secret fields after a successful save -- nothing
         // secret should linger in the DOM/inputs longer than it has to.
         document.getElementById("credClientSecret").value = "";
@@ -475,14 +596,40 @@
         toast("Save failed: " + e.message, "error");
       } finally {
         btn.disabled = false;
-        btn.textContent = "Save Account";
+        btn.textContent = "Save Override";
       }
     });
   }
 
   // ---------------- editor ----------------
 
-  let editorState = null; // { workflow, selectedNodeName, lastExecution }
+  let editorState = null; // { workflow, selectedNodeName, lastExecution, _layout }
+
+  // Every model.NodeType the Go backend knows how to execute (see
+  // internal/model/workflow.go's NodeType consts) -- what the "+ Add
+  // node" control offers. New nodes leave originalType empty; the n8n
+  // export path (internal/parser/export.go) already falls back to
+  // reverseTypeMap[node.Type] for that case, so exporting a
+  // freshly-added node still produces a valid n8n type string.
+  const NODE_TYPE_OPTIONS = [
+    ["manualTrigger", "Manual Trigger"],
+    ["scheduleTrigger", "Schedule Trigger"],
+    ["webhookTrigger", "Webhook Trigger"],
+    ["errorTrigger", "Error Trigger"],
+    ["code", "Code"],
+    ["if", "IF"],
+    ["wait", "Wait"],
+    ["noOp", "No Op"],
+    ["splitOut", "Split Out"],
+    ["splitInBatches", "Split In Batches"],
+    ["httpRequest", "HTTP Request"],
+    ["executeCommand", "Execute Command"],
+    ["readWriteFile", "Read/Write File"],
+    ["googleSheets", "Google Sheets"],
+    ["youTube", "YouTube"],
+    ["gmail", "Gmail"],
+    ["stickyNote", "Sticky Note"],
+  ];
 
   async function renderEditor(id) {
     viewEl.innerHTML = loadingRow("Loading workflow\u2026");
@@ -493,7 +640,9 @@
       viewEl.innerHTML = emptyState("Couldn't load that workflow", escapeHtml(e.message));
       return;
     }
-    editorState = { workflow: wf, selectedNodeName: null, lastExecution: null };
+    wf.nodes = wf.nodes || {};
+    wf.connections = wf.connections || {};
+    editorState = { workflow: wf, selectedNodeName: null, lastExecution: null, _layout: null };
     paintEditor();
   }
 
@@ -508,6 +657,10 @@
       '<label class="row-checkbox" style="margin-left:4px;"><input type="checkbox" id="wfActive" ' +
       (wf.active ? "checked" : "") + "> Active</label>" +
       '<div class="spacer"></div>' +
+      '<select id="addNodeType" class="btn btn-sm" title="Node type to add">' +
+      NODE_TYPE_OPTIONS.map((o) => '<option value="' + o[0] + '">' + escapeHtml(o[1]) + "</option>").join("") +
+      "</select>" +
+      '<button id="btnAddNode" class="btn btn-sm">+ Add node</button>' +
       '<select id="startNodeSelect" class="btn btn-sm" style="max-width:200px;">' +
       '<option value="">Auto (first trigger)</option>' +
       nodeNames.map((n) => '<option value="' + escapeHtml(n) + '">' + escapeHtml(n) + "</option>").join("") +
@@ -516,6 +669,7 @@
       '<button id="btnExport" class="btn">Export</button>' +
       '<button id="btnSave" class="btn btn-primary">Save</button>' +
       "</div>" +
+      '<div class="editor-hint">Drag a node to move it \u00b7 drag from the right dot to the left dot on another node to connect \u00b7 click a connection line to delete it \u00b7 Delete/Backspace removes the selected node.</div>' +
       '<div class="editor-body">' +
       '<div class="canvas-wrap" id="canvasWrap"></div>' +
       '<div class="side-panel" id="sidePanel">' + renderSidePanelEmpty() + "</div>" +
@@ -531,6 +685,158 @@
     return '<div class="side-panel-empty">Select a node to view or edit its settings.</div>';
   }
 
+  // ---- id/name helpers for newly-added nodes ----
+
+  function generateNodeId() {
+    return "n_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+  }
+
+  function uniqueNodeName(base) {
+    const nodes = editorState.workflow.nodes;
+    if (!nodes[base]) return base;
+    let i = 2;
+    while (nodes[base + " " + i]) i++;
+    return base + " " + i;
+  }
+
+  // ---- add / delete node ----
+
+  function addNode(type) {
+    const wf = editorState.workflow;
+    const label = (NODE_TYPE_OPTIONS.find((o) => o[0] === type) || [type, type])[1];
+    const name = uniqueNodeName(label);
+
+    // Drop the new node near the bottom-left of the current layout so
+    // it's visible without having to scroll, rather than stacking every
+    // new node on top of [0,0].
+    const names = Object.keys(wf.nodes);
+    let x = 40, y = 40;
+    if (names.length) {
+      let maxY = -Infinity, minX = Infinity;
+      names.forEach((n) => {
+        const p = wf.nodes[n].position || [0, 0];
+        maxY = Math.max(maxY, p[1]);
+        minX = Math.min(minX, p[0]);
+      });
+      x = minX; y = maxY + 110;
+    }
+
+    wf.nodes[name] = {
+      id: generateNodeId(),
+      name: name,
+      type: type,
+      originalType: "",
+      typeVersion: 1,
+      parameters: {},
+      credentials: {},
+      position: [x, y],
+      disabled: false,
+      retryOnFail: false,
+      maxTries: 0,
+      waitBetweenTriesMs: 0,
+      continueOnFail: false,
+    };
+    editorState.selectedNodeName = name;
+    drawCanvas();
+    refreshStartNodeOptions();
+    toast("Added \u201c" + name + "\u201d \u2014 remember to Save", "success");
+  }
+
+  // addNode/deleteNode only re-run drawCanvas() (not the whole toolbar,
+  // which would blow away whatever the person is mid-typing in the
+  // workflow-name field) -- so the "Execute from" dropdown needs its
+  // own explicit refresh whenever the node set changes.
+  function refreshStartNodeOptions() {
+    const sel = document.getElementById("startNodeSelect");
+    if (!sel) return;
+    const prev = sel.value;
+    const names = Object.keys(editorState.workflow.nodes);
+    sel.innerHTML =
+      '<option value="">Auto (first trigger)</option>' +
+      names.map((n) => '<option value="' + escapeHtml(n) + '">' + escapeHtml(n) + "</option>").join("");
+    if (names.includes(prev)) sel.value = prev;
+  }
+
+  function deleteNode(name) {
+    const wf = editorState.workflow;
+    if (!wf.nodes[name]) return;
+    delete wf.nodes[name];
+    delete wf.connections[name]; // this node's outgoing connections
+    Object.keys(wf.connections).forEach((src) => {
+      wf.connections[src] = (wf.connections[src] || []).filter((c) => c.targetName !== name);
+    });
+    if (editorState.selectedNodeName === name) editorState.selectedNodeName = null;
+    document.getElementById("sidePanel").innerHTML = renderSidePanelEmpty();
+    drawCanvas();
+    refreshStartNodeOptions();
+    toast("Deleted \u201c" + name + "\u201d \u2014 remember to Save", "success");
+  }
+
+  function deleteConnection(srcName, conn) {
+    const wf = editorState.workflow;
+    const list = wf.connections[srcName] || [];
+    wf.connections[srcName] = list.filter(
+      (c) => !(c.targetName === conn.targetName && c.sourceIndex === conn.sourceIndex && c.targetIndex === conn.targetIndex)
+    );
+    drawCanvas();
+    toast("Connection removed \u2014 remember to Save", "success");
+  }
+
+  // ---- selection ----
+
+  function selectNode(name) {
+    editorState.selectedNodeName = name;
+    const wrap = document.getElementById("canvasWrap");
+    if (wrap) {
+      wrap.querySelectorAll(".node-box").forEach((b) => b.classList.toggle("selected", b.dataset.node === name));
+    }
+    document.getElementById("sidePanel").innerHTML = renderSidePanel(name);
+    wireSidePanel(name);
+  }
+
+  function deselectAll() {
+    editorState.selectedNodeName = null;
+    const wrap = document.getElementById("canvasWrap");
+    if (wrap) wrap.querySelectorAll(".node-box").forEach((b) => b.classList.remove("selected"));
+    document.getElementById("sidePanel").innerHTML = renderSidePanelEmpty();
+  }
+
+  // ---- canvas geometry ----
+
+  function connLineGeometry(srcPos, tgtPos, layout) {
+    const x1 = srcPos.x + layout.BOX_W, y1 = srcPos.y + layout.BOX_H / 2;
+    const x2 = tgtPos.x, y2 = tgtPos.y + layout.BOX_H / 2;
+    const midX = (x1 + x2) / 2;
+    return {
+      d: "M" + x1 + "," + y1 + " C" + midX + "," + y1 + " " + midX + "," + y2 + " " + x2 + "," + y2,
+      arrow: x2 + "," + y2 + " " + (x2 - 7) + "," + (y2 - 4) + " " + (x2 - 7) + "," + (y2 + 4),
+    };
+  }
+
+  // Re-positions only the connection lines touching one node, using the
+  // layout offsets recorded by the last full drawCanvas() -- called on
+  // every drag mousemove so dragging stays smooth without re-rendering
+  // all ~100+ node boxes each frame. A full drawCanvas() still runs once
+  // the drag ends, to correctly resize the canvas if the node moved
+  // outside the previous bounding box.
+  function updateConnectionsForNode(name) {
+    const wrap = document.getElementById("canvasWrap");
+    const layout = editorState._layout;
+    if (!wrap || !layout) return;
+    const nodes = editorState.workflow.nodes;
+    wrap.querySelectorAll(".conn").forEach((g) => {
+      if (g.dataset.src !== name && g.dataset.tgt !== name) return;
+      const srcNode = nodes[g.dataset.src], tgtNode = nodes[g.dataset.tgt];
+      if (!srcNode || !tgtNode) return;
+      const srcPos = { x: (srcNode.position || [0, 0])[0] + layout.offX, y: (srcNode.position || [0, 0])[1] + layout.offY };
+      const tgtPos = { x: (tgtNode.position || [0, 0])[0] + layout.offX, y: (tgtNode.position || [0, 0])[1] + layout.offY };
+      const line = connLineGeometry(srcPos, tgtPos, layout);
+      g.querySelectorAll("path").forEach((p) => p.setAttribute("d", line.d));
+      const poly = g.querySelector("polygon");
+      if (poly) poly.setAttribute("points", line.arrow);
+    });
+  }
+
   function drawCanvas() {
     const wrap = document.getElementById("canvasWrap");
     const wf = editorState.workflow;
@@ -538,7 +844,8 @@
     const names = Object.keys(nodes);
 
     if (!names.length) {
-      wrap.innerHTML = emptyState("This workflow has no nodes", "");
+      wrap.innerHTML = emptyState("This workflow has no nodes", 'Use "+ Add node" above to start building.');
+      editorState._layout = null;
       return;
     }
 
@@ -552,25 +859,31 @@
     const offX = PAD - minX, offY = PAD - minY;
     const canvasW = (maxX - minX) + BOX_W + PAD * 2;
     const canvasH = (maxY - minY) + BOX_H + PAD * 2;
+    editorState._layout = { offX, offY, BOX_W, BOX_H };
 
     const posOf = (n) => {
       const p = nodes[n].position || [0, 0];
       return { x: p[0] + offX, y: p[1] + offY };
     };
 
-    // connection lines (SVG, drawn under the node boxes)
+    // connection lines (SVG, drawn under the node boxes). Each is a <g>
+    // tagged with data-src/data-tgt so drag handlers can find and
+    // reposition just the lines touching a moved node, and a wide
+    // invisible "hit" path so a thin line is still easy to click to
+    // delete.
     let svgLines = "";
     const conns = wf.connections || {};
     Object.keys(conns).forEach((src) => {
       (conns[src] || []).forEach((c) => {
         if (!nodes[src] || !nodes[c.targetName]) return; // stale/dangling ref
-        const a = posOf(src), b = posOf(c.targetName);
-        const x1 = a.x + BOX_W, y1 = a.y + BOX_H / 2;
-        const x2 = b.x, y2 = b.y + BOX_H / 2;
-        const midX = (x1 + x2) / 2;
+        const line = connLineGeometry(posOf(src), posOf(c.targetName), { BOX_W, BOX_H });
         svgLines +=
-          '<path class="conn-line" d="M' + x1 + "," + y1 + " C" + midX + "," + y1 + " " + midX + "," + y2 + " " + x2 + "," + y2 + '"/>' +
-          '<polygon class="conn-arrow" points="' + x2 + "," + y2 + " " + (x2 - 7) + "," + (y2 - 4) + " " + (x2 - 7) + "," + (y2 + 4) + '"/>';
+          '<g class="conn" data-src="' + escapeHtml(src) + '" data-tgt="' + escapeHtml(c.targetName) +
+          '" data-src-idx="' + c.sourceIndex + '" data-tgt-idx="' + c.targetIndex + '">' +
+          '<path class="conn-line" d="' + line.d + '"/>' +
+          '<path class="conn-hit" d="' + line.d + '"/>' +
+          '<polygon class="conn-arrow" points="' + line.arrow + '"/>' +
+          "</g>";
       });
     });
 
@@ -591,6 +904,8 @@
         '<div class="node-box' + statusClass + selClass + disClass + '" data-node="' + escapeHtml(n) +
         '" style="left:' + pos.x + "px;top:" + pos.y + 'px;">' +
         '<div class="node-status-dot"></div>' +
+        '<div class="node-handle node-handle-in" title="Drag a connection here"></div>' +
+        '<div class="node-handle node-handle-out" title="Drag to another node to connect"></div>' +
         '<div class="node-type">' + escapeHtml(node.type || "node") + "</div>" +
         '<div class="node-name">' + escapeHtml(n) + "</div>" +
         "</div>";
@@ -601,16 +916,149 @@
       '<svg width="' + canvasW + '" height="' + canvasH + '" style="position:absolute;top:0;left:0;pointer-events:none;">' +
       svgLines + "</svg>" + boxes + "</div>";
 
+    wireCanvasInteractions(wrap);
+  }
+
+  // Wires node select/drag and output-handle-to-input-handle connecting.
+  // Re-run after every full drawCanvas() since wrap.innerHTML wipes out
+  // any previously-bound listeners along with the old DOM.
+  function wireCanvasInteractions(wrap) {
     wrap.querySelectorAll(".node-box").forEach((box) => {
-      box.addEventListener("click", () => {
-        editorState.selectedNodeName = box.dataset.node;
-        wrap.querySelectorAll(".node-box").forEach((b) => b.classList.remove("selected"));
-        box.classList.add("selected");
-        document.getElementById("sidePanel").innerHTML = renderSidePanel(box.dataset.node);
-        wireSidePanel(box.dataset.node);
+      box.addEventListener("mousedown", (ev) => {
+        if (ev.target.closest(".node-handle")) return; // handled separately below
+        ev.preventDefault();
+        const name = box.dataset.node;
+        selectNode(name);
+        startNodeDrag(box, name, ev);
       });
     });
+
+    wrap.querySelectorAll(".node-handle-out").forEach((handle) => {
+      handle.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const box = handle.closest(".node-box");
+        startConnectionDrag(wrap, box.dataset.node, ev);
+      });
+    });
+
+    wrap.querySelectorAll(".conn-hit").forEach((hit) => {
+      hit.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const g = hit.closest(".conn");
+        const srcName = g.dataset.src;
+        const conn = { targetName: g.dataset.tgt, sourceIndex: Number(g.dataset.srcIdx), targetIndex: Number(g.dataset.tgtIdx) };
+        if (confirm('Delete the connection from "' + srcName + '" to "' + conn.targetName + '"?')) {
+          deleteConnection(srcName, conn);
+        }
+      });
+    });
+
+    // Clicking empty canvas space deselects.
+    wrap.addEventListener("mousedown", (ev) => {
+      if (ev.target === wrap || ev.target.classList.contains("canvas-inner")) {
+        deselectAll();
+      }
+    });
   }
+
+  function startNodeDrag(box, name, downEv) {
+    const node = editorState.workflow.nodes[name];
+    const startX = downEv.clientX, startY = downEv.clientY;
+    const origPos = (node.position || [0, 0]).slice();
+    const layout = editorState._layout;
+    let moved = false;
+
+    function onMove(ev) {
+      const dx = ev.clientX - startX, dy = ev.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+      node.position = [origPos[0] + dx, origPos[1] + dy];
+      if (layout) {
+        box.style.left = (node.position[0] + layout.offX) + "px";
+        box.style.top = (node.position[1] + layout.offY) + "px";
+      }
+      updateConnectionsForNode(name);
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (moved) drawCanvas(); // resync bounding box/canvas size + reselect
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function startConnectionDrag(wrap, fromName, downEv) {
+    const svg = wrap.querySelector("svg");
+    const layout = editorState._layout;
+    if (!svg || !layout) return;
+
+    const fromNode = editorState.workflow.nodes[fromName];
+    const fromPos = { x: (fromNode.position || [0, 0])[0] + layout.offX, y: (fromNode.position || [0, 0])[1] + layout.offY };
+    const x1 = fromPos.x + layout.BOX_W, y1 = fromPos.y + layout.BOX_H / 2;
+
+    const temp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    temp.setAttribute("class", "conn-line conn-line-temp");
+    temp.setAttribute("d", "M" + x1 + "," + y1 + " L" + x1 + "," + y1);
+    svg.appendChild(temp);
+
+    function canvasPoint(clientX, clientY) {
+      const inner = wrap.querySelector(".canvas-inner");
+      const rect = inner.getBoundingClientRect();
+      return { x: clientX - rect.left, y: clientY - rect.top };
+    }
+
+    function onMove(ev) {
+      const p = canvasPoint(ev.clientX, ev.clientY);
+      const midX = (x1 + p.x) / 2;
+      temp.setAttribute("d", "M" + x1 + "," + y1 + " C" + midX + "," + y1 + " " + midX + "," + p.y + " " + p.x + "," + p.y);
+    }
+    function onUp(ev) {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      temp.remove();
+
+      const under = document.elementFromPoint(ev.clientX, ev.clientY);
+      const inHandle = under && under.closest && under.closest(".node-handle-in");
+      if (!inHandle) return;
+      const toBox = inHandle.closest(".node-box");
+      const toName = toBox && toBox.dataset.node;
+      if (!toName || toName === fromName) return;
+
+      const wf = editorState.workflow;
+      const existing = wf.connections[fromName] || [];
+      const dup = existing.some((c) => c.targetName === toName && c.sourceIndex === 0 && c.targetIndex === 0);
+      if (dup) {
+        toast("Already connected", "error");
+        return;
+      }
+      wf.connections[fromName] = existing.concat([{ sourceName: fromName, sourceIndex: 0, targetName: toName, targetIndex: 0 }]);
+      drawCanvas();
+      toast("Connected \u201c" + fromName + "\u201d \u2192 \u201c" + toName + "\u201d \u2014 remember to Save", "success");
+    }
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  // Delete/Backspace removes the selected node, but never while the
+  // person is typing in a text field (params textarea, name inputs,
+  // credential fields, etc.) -- and only while the editor is actually
+  // on screen (checked via canvasWrap's presence rather than a route
+  // flag, so this can't misfire after navigating away without also
+  // tearing the listener down).
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Delete" && ev.key !== "Backspace") return;
+    if (!editorState || !editorState.selectedNodeName) return;
+    if (!document.getElementById("canvasWrap")) return;
+    const tag = (ev.target && ev.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    ev.preventDefault();
+    const name = editorState.selectedNodeName;
+    if (confirm('Delete node "' + name + '"? This also removes its connections.')) {
+      deleteNode(name);
+    }
+  });
 
   function renderSidePanel(nodeName) {
     const node = editorState.workflow.nodes[nodeName];
@@ -626,7 +1074,8 @@
       '<div class="field"><label>Parameters (JSON)</label>' +
       '<textarea id="nodeParams" class="params-json">' + escapeHtml(paramsStr) + "</textarea>" +
       '<div id="paramsError" class="field-error"></div></div>' +
-      '<button id="applyNodeBtn" class="btn btn-primary btn-sm">Apply to workflow</button>' +
+      '<button id="applyNodeBtn" class="btn btn-primary btn-sm">Apply to workflow</button> ' +
+      '<button id="deleteNodeBtn" class="btn btn-danger btn-sm">Delete node</button>' +
       '<div style="color:var(--text-dim);font-size:11px;margin-top:8px;">Applies in-memory \u2014 click Save (top toolbar) to persist.</div>' +
       (isGoogleCredentialNode(node.type) ? renderCredentialSection() : "")
     );
@@ -649,6 +1098,12 @@
       drawCanvas();
     });
 
+    document.getElementById("deleteNodeBtn").addEventListener("click", () => {
+      if (confirm('Delete node "' + nodeName + '"? This also removes its connections.')) {
+        deleteNode(nodeName);
+      }
+    });
+
     const node = editorState.workflow.nodes[nodeName];
     if (node && isGoogleCredentialNode(node.type)) {
       wireCredentialSection(nodeName);
@@ -661,6 +1116,9 @@
     });
     document.getElementById("wfActive").addEventListener("change", (e) => {
       editorState.workflow.active = e.target.checked;
+    });
+    document.getElementById("btnAddNode").addEventListener("click", () => {
+      addNode(document.getElementById("addNodeType").value);
     });
     document.getElementById("btnExport").addEventListener("click", () => exportWorkflow(editorState.workflow.id));
     document.getElementById("btnSave").addEventListener("click", saveCurrentWorkflow);
