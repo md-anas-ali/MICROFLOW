@@ -135,8 +135,16 @@ below as intentional gaps.
    vault) — see #1 above. Not built.
 2. **Frontend**: canvas now supports real drag/connect/add/delete/
    duplicate/rename (see `frontend/STATUS.md`), but there's still no
-   execution-history list, no live/streaming execution progress, and no
-   credential-management UI.
+   execution-history list and no live/streaming execution progress.
+   Credential management now exists in a minimal form: selecting a
+   googleSheets/youTube/gmail node in the editor's side panel shows a
+   "Google Credentials" section (Client ID/Client Secret/Refresh Token
+   + Save Account) that calls the new `POST/GET
+   /api/workflows/{id}/credentials` endpoints -- see
+   `cmd/server/static/app.js`'s "google credentials" section and
+   `internal/api/server.go`'s `handleSaveCredential`/
+   `handleListCredentials`. There's still no bulk/cross-workflow
+   account manager -- one node at a time, same scope as `cmd/setcred`.
 3. **RAM/CPU numbers are still unmeasured** — nothing changed here
    since draft 1; `MemGuard`'s 220MB default is still a starting point,
    not a measurement. Do the 1/10/50/100-run leak test yourself.
