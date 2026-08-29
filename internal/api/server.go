@@ -7,12 +7,18 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"microflow/internal/model"
 	"microflow/internal/parser"
 	"microflow/internal/runner"
+	"microflow/internal/store"
+	"microflow/internal/vault"
 )
 
 type WorkflowStore interface {
@@ -21,14 +27,27 @@ type WorkflowStore interface {
 	ListWorkflows(ctx context.Context) ([]*model.Workflow, error)
 }
 
-type Server struct {
-	mux       *http.ServeMux
-	workflows WorkflowStore
-	run       *runner.Runner
+// CredentialStore is the read side of vault.Store (internal/store's
+// Postgres implementation satisfies it too): metadata only, never
+// ciphertext or plaintext secrets (rule 11/12).
+type CredentialStore interface {
+	ListCredentials(ctx context.Context, workflowID string) ([]store.CredentialInfo, error)
 }
 
-func New(workflows WorkflowStore, run *runner.Runner) *Server {
-	s := &Server{mux: http.NewServeMux(), workflows: workflows, run: run}
+type Server struct {
+	mux         *http.ServeMux
+	workflows   WorkflowStore
+	credentials CredentialStore
+	run         *runner.Runner
+	vault       *vault.Vault
+}
+
+// New wires the API to the shared runner/store/vault -- the exact same
+// *vault.Vault instance cmd/server hands the OAuthResolver, so this
+// package writes credentials through the identical encryption/storage
+// path as cmd/setcred, never a parallel one.
+func New(workflows WorkflowStore, run *runner.Runner, credentials CredentialStore, v *vault.Vault) *Server {
+	s := &Server{mux: http.NewServeMux(), workflows: workflows, run: run, credentials: credentials, vault: v}
 	s.routes()
 	return s
 }
@@ -42,6 +61,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/workflows/{id}", s.handleGet)
 	s.mux.HandleFunc("GET /api/workflows/{id}/export", s.handleExport)
 	s.mux.HandleFunc("POST /api/workflows/{id}/execute", s.handleExecute)
+	s.mux.HandleFunc("GET /api/workflows/{id}/credentials", s.handleListCredentials)
+	s.mux.HandleFunc("POST /api/workflows/{id}/credentials", s.handleSaveCredential)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -151,6 +172,125 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	// the HTTP call itself succeeded (we have a valid `ex` either way,
 	// even on failure), so this always replies 200 with status in the body.
 	writeJSON(w, http.StatusOK, ex)
+}
+
+// credentialNodeTypes are exactly the node types
+// internal/nodes/google.go calls Creds.Resolve(workflowID, node.Name)
+// for at runtime -- the same set cmd/setcred's googleNodeNames()
+// filters on. Anything else is rejected before it ever reaches the vault.
+func isGoogleCredentialNodeType(t model.NodeType) bool {
+	switch t {
+	case model.TypeGoogleSheets, model.TypeYouTube, model.TypeGmail:
+		return true
+	default:
+		return false
+	}
+}
+
+// credentialView is CredentialStore's result reshaped for the response:
+// adds the node's type for display, still never touches secret bytes.
+type credentialView struct {
+	NodeName  string `json:"nodeName"`
+	NodeType  string `json:"nodeType,omitempty"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+// handleListCredentials lists which nodes in a workflow already have a
+// Google credential saved, for a "saved accounts" list -- node name and
+// last-updated time only, never client secret/refresh token (rule 11/12).
+func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	wfID := r.PathValue("id")
+	wf, err := s.workflows.LoadWorkflow(r.Context(), wfID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
+		return
+	}
+	creds, err := s.credentials.ListCredentials(r.Context(), wfID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to list credentials"))
+		return
+	}
+	out := make([]credentialView, 0, len(creds))
+	for _, c := range creds {
+		view := credentialView{NodeName: c.NodeName, UpdatedAt: c.UpdatedAt.Format(time.RFC3339)}
+		if n, ok := wf.Nodes[c.NodeName]; ok {
+			view.NodeType = string(n.Type)
+		}
+		out = append(out, view)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// maxCredentialSaveBytes caps the request body for handleSaveCredential.
+// OAuth client secrets/refresh tokens are short strings, so this is
+// generous headroom, not an attempt to fit real-world data exactly.
+const maxCredentialSaveBytes = 8 * 1024
+
+type saveCredentialRequest struct {
+	NodeName     string `json:"nodeName"`
+	ClientID     string `json:"clientId"`
+	ClientSecret string `json:"clientSecret"`
+	RefreshToken string `json:"refreshToken"`
+}
+
+// handleSaveCredential is the HTTP equivalent of cmd/setcred, scoped to
+// one already-existing Google node in one workflow (chosen from a
+// dropdown by the frontend, per the "target one specific node" design):
+// it validates the node, builds the same secret shape setcred does via
+// vault.GoogleOAuthSecrets, and calls the identical *vault.Vault.Put the
+// CLI and the server's OAuthResolver both use -- no parallel storage,
+// no new encryption, no CLI spawned.
+func (s *Server) handleSaveCredential(w http.ResponseWriter, r *http.Request) {
+	wfID := r.PathValue("id")
+
+	var req saveCredentialRequest
+	limited := io.LimitReader(r.Body, maxCredentialSaveBytes+1)
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	req.NodeName = strings.TrimSpace(req.NodeName)
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.ClientSecret = strings.TrimSpace(req.ClientSecret)
+	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
+
+	if req.NodeName == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("nodeName is required"))
+		return
+	}
+	if req.ClientID == "" || req.ClientSecret == "" || req.RefreshToken == "" {
+		// Deliberately doesn't echo back which field's value was given --
+		// nothing from req is ever reflected into a response (rule 11/12).
+		writeErr(w, http.StatusBadRequest, errors.New("clientId, clientSecret, and refreshToken are all required"))
+		return
+	}
+
+	wf, err := s.workflows.LoadWorkflow(r.Context(), wfID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
+		return
+	}
+	node, ok := wf.Nodes[req.NodeName]
+	if !ok {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("no node named %q in this workflow", req.NodeName))
+		return
+	}
+	if !isGoogleCredentialNodeType(node.Type) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("node %q is a %q node -- credentials can only be attached to googleSheets/youTube/gmail nodes", req.NodeName, node.Type))
+		return
+	}
+
+	secrets := vault.GoogleOAuthSecrets(req.ClientID, req.ClientSecret, req.RefreshToken)
+	if err := s.vault.Put(r.Context(), wfID, req.NodeName, secrets); err != nil {
+		// Generic on purpose: never echo vault/cipher internals (rule 11/12).
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to save credential"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":   "ok",
+		"nodeName": req.NodeName,
+	})
 }
 
 func readBody(r *http.Request, max int64) ([]byte, error) {
