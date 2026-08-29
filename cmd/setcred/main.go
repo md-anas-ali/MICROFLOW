@@ -137,16 +137,10 @@ func run() error {
 		return fmt.Errorf("opening vault: %w", err)
 	}
 
-	// expiresAt left unset (""): OAuthResolver treats a missing/unparseable
-	// expiresAt as "needs refresh", so the very first Resolve() call will
-	// immediately refresh and obtain a real accessToken/expiresAt -- no
-	// need for this CLI to call Google itself just to seed one.
-	secrets := map[string]string{
-		"clientId":     *clientID,
-		"clientSecret": *clientSecret,
-		"refreshToken": *refreshToken,
-		"tokenType":    "Bearer",
-	}
+	// Same secret shape the HTTP credentials API (internal/api) writes --
+	// see vault.GoogleOAuthSecrets's doc comment for why expiresAt/
+	// accessToken are left for OAuthResolver's first Resolve() call to fill in.
+	secrets := vault.GoogleOAuthSecrets(*clientID, *clientSecret, *refreshToken)
 
 	fmt.Println()
 	for _, name := range nodeNames {
