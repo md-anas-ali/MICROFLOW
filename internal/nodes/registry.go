@@ -32,8 +32,8 @@ func DefaultRegistry(deps Deps) map[model.NodeType]engine.NodeExecutor {
 		model.TypeExecuteCommand: &ExecuteCommandExecutor{AllowedBinaries: deps.AllowedBinaries, ScratchRoot: deps.ScratchRoot},
 		model.TypeReadWriteFile:  &ReadWriteFileExecutor{ScratchRoot: deps.ScratchRoot},
 
-		model.TypeGoogleSheets: &GoogleSheetsExecutor{Creds: deps.CredentialResolver},
-		model.TypeYouTube:      &YouTubeExecutor{Creds: deps.CredentialResolver},
-		model.TypeGmail:        &GmailExecutor{Creds: deps.CredentialResolver},
+		model.TypeGoogleSheets: &GoogleSheetsExecutor{Creds: deps.CredentialResolver, Accounts: deps.GoogleAccounts, Service: "sheets"},
+		model.TypeYouTube:      &YouTubeExecutor{Creds: deps.CredentialResolver, Accounts: deps.GoogleAccounts, Service: "youtube"},
+		model.TypeGmail:        &GmailExecutor{Creds: deps.CredentialResolver, Accounts: deps.GoogleAccounts, Service: "gmail"},
 	}
 }

@@ -17,6 +17,13 @@ type Deps struct {
 	EnvAllowlist       []string          // env var names exposed to Code node's $env (security rule 11/22) -- see CodeExecutor.envAllowlist
 	ScratchRoot        string
 	CredentialResolver engine.CredentialResolver
+	// GoogleAccounts is the per-service (gmail/youtube/sheets) connected
+	// Google account fallback for googleSheets/youTube/gmail nodes -- see
+	// internal/nodes/google.go's GoogleAccountResolver and
+	// internal/vault.GoogleServiceAccounts. Nil-safe: nil means Google
+	// OAuth isn't configured on this server, so those nodes only work via
+	// an explicit per-node CredentialResolver override.
+	GoogleAccounts GoogleAccountResolver
 }
 
 // PassThroughExecutor is used for trigger nodes (the scheduler/webhook/
