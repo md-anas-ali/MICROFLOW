@@ -1304,6 +1304,13 @@
         method: "POST",
         signal: controller.signal,
       });
+      // A 2xx response should always carry a real execution object now
+      // that the backend never sends `null` on success (see
+      // handleExecute), but guard anyway so a malformed/empty response
+      // shows a clear toast instead of throwing inside renderExecPanel.
+      if (!ex || typeof ex.status !== "string") {
+        throw new Error("Server returned an unexpected response for this execution.");
+      }
       editorState.lastExecution = ex;
       drawCanvas();
       renderExecPanel(ex);
