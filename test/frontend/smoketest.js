@@ -57,6 +57,14 @@ async function main() {
     if (u === "/api/credentials/google" && (!opts.method || opts.method === "GET")) return json({ configured: false });
     if (u === "/api/credentials/google" && opts.method === "POST") return json({ status: "ok" });
     if (u === "/api/credentials/google" && opts.method === "DELETE") return json({ status: "ok" });
+    if (u === "/api/google/connections" && (!opts.method || opts.method === "GET")) {
+      return json([
+        { service: "gmail", connected: true, email: "user@gmail.com", updatedAt: "2026-01-01T00:00:00Z" },
+        { service: "youtube", connected: false },
+        { service: "sheets", connected: false },
+      ]);
+    }
+    if (u.indexOf("/api/google/disconnect/") === 0 && opts.method === "POST") return json({ status: "ok", service: u.split("/").pop() });
     throw new Error("unmocked fetch: " + opts.method + " " + u);
   };
   window.alert = () => {};
@@ -136,6 +144,10 @@ async function main() {
   window.location.hash = "#/credentials";
   await new Promise((r) => setTimeout(r, 20));
   ok("central credentials page rendered its fields", !!doc.getElementById("centralClientId") && !!doc.getElementById("centralSaveBtn"));
+  ok("google connections cards rendered", doc.querySelectorAll(".google-conn-card").length === 3);
+  ok("connected gmail card shows the connected email", doc.body.textContent.indexOf("user@gmail.com") !== -1);
+  const disconnectBtn = doc.querySelector(".google-disconnect-btn");
+  ok("connected service has a Disconnect button", !!disconnectBtn);
   doc.getElementById("centralClientId").value = "cid";
   doc.getElementById("centralClientSecret").value = "secret";
   doc.getElementById("centralRefreshToken").value = "reftok";
