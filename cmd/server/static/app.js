@@ -90,6 +90,11 @@
     try {
       res = await fetch(path, opts);
     } catch (e) {
+      // A caller-triggered AbortController (see executeCurrentWorkflow's
+      // timeout) is not a connectivity problem -- rethrow as-is so
+      // callers can tell an intentional abort apart from a real network
+      // failure, and don't flip the header status to "unreachable" for it.
+      if (e.name === "AbortError") throw e;
       setConn(false);
       throw new Error("Network error \u2014 could not reach the MicroFlow API");
     }
@@ -1273,21 +1278,43 @@
     }
   }
 
+  // Root-cause fix: the fetch below previously had no timeout/abort
+  // signal, so if the connection ever hung (Render free-tier cold
+  // start/spin-down, a dropped connection with no FIN/RST, etc.) the
+  // await never settled -- the "finally" block that re-enables
+  // btnExecute never ran, and the button stayed disabled forever with
+  // no console error and no new network request on subsequent clicks
+  // (browsers don't dispatch click events on disabled buttons). The
+  // AbortController below guarantees the promise always settles,
+  // bounded by the same 30-minute ceiling the backend already enforces
+  // (internal/runner.Runner.Timeout, "rule 22: nothing unbounded") plus
+  // a small buffer, so the button can never get stuck again.
+  const EXECUTE_TIMEOUT_MS = 31 * 60 * 1000;
+
   async function executeCurrentWorkflow() {
     const btn = document.getElementById("btnExecute");
     const startNode = document.getElementById("startNodeSelect").value;
     btn.disabled = true;
     btn.textContent = "Running\u2026";
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), EXECUTE_TIMEOUT_MS);
     try {
       const q = startNode ? "?startNode=" + encodeURIComponent(startNode) : "";
-      const ex = await apiJSON("/api/workflows/" + encodeURIComponent(editorState.workflow.id) + "/execute" + q, { method: "POST" });
+      const ex = await apiJSON("/api/workflows/" + encodeURIComponent(editorState.workflow.id) + "/execute" + q, {
+        method: "POST",
+        signal: controller.signal,
+      });
       editorState.lastExecution = ex;
       drawCanvas();
       renderExecPanel(ex);
       toast("Execution " + ex.status, ex.status === "error" ? "error" : "success");
     } catch (e) {
-      toast("Execute failed: " + e.message, "error");
+      const msg = e.name === "AbortError"
+        ? "Execute timed out or the connection was lost. The workflow may still be running on the server \u2014 check back shortly."
+        : "Execute failed: " + e.message;
+      toast(msg, "error");
     } finally {
+      clearTimeout(timeoutId);
       btn.disabled = false;
       btn.textContent = "\u25B6 Execute";
     }
