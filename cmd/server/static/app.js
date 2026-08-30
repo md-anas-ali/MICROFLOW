@@ -8,27 +8,34 @@
 //   POST   /api/workflows/{id}/execute?startNode=...
 //   GET    /api/workflows/{id}/credentials
 //   POST   /api/workflows/{id}/credentials
-//   GET    /api/credentials/google
-//   POST   /api/credentials/google
-//   DELETE /api/credentials/google
+//   GET    /api/credentials/google              (legacy manual-paste, kept for back-compat)
+//   POST   /api/credentials/google               (legacy manual-paste, kept for back-compat)
+//   DELETE /api/credentials/google                (legacy manual-paste, kept for back-compat)
+//   GET    /api/google/connections               (n8n-style Connect: per-service status)
+//   GET    /api/google/connect/{service}          (n8n-style Connect: starts OAuth, browser nav)
+//   POST   /api/google/disconnect/{service}       (n8n-style Connect: disconnect one service)
 // No execution-history endpoint exists server-side, so execution
 // results are only ever what the most recent POST .../execute call
 // returned — there is nothing to page through.
 //
-// Credentials, two scopes:
-//  - Central (/api/credentials/google): ONE Google account, saved once
-//    on the "Google Credentials" page, used automatically by every
-//    googleSheets/youTube/gmail node in every workflow (see
-//    internal/vault/central.go's CentralFallbackResolver). This is the
-//    normal path — most people never need anything below.
+// Credentials, three scopes (see internal/vault/central.go and
+// internal/api/google_connect.go):
+//  - Per-service connected account (/api/google/*): Gmail, YouTube, and
+//    Sheets each connect independently to their own Google account via
+//    a real "Connect Google" OAuth flow (no pasted tokens) -- this is
+//    the primary path, rendered on the "Google Connections" page.
+//  - Legacy central (/api/credentials/google): the older single
+//    shared-account manual-paste flow. Kept working for installs that
+//    already used it; falls back automatically for any service that
+//    hasn't been individually (re)connected via the new flow.
 //  - Per-node override (/api/workflows/{id}/credentials): the original
 //    mechanism, kept for backward compatibility and for the rare case a
-//    specific node needs a *different* Google account than the central
-//    one. Scoped to a single (workflowID, nodeName) pair, exactly what
+//    specific node needs a *different* Google account than the rest.
+//    Scoped to a single (workflowID, nodeName) pair, exactly what
 //    vault.Put/cmd/setcred already write.
-// Neither GET ever returns clientSecret/refreshToken, only
-// nodeName/nodeType/updatedAt (or configured/updatedAt for the central
-// one) -- so the UI never has secret bytes to accidentally render.
+// No response here ever returns clientSecret/refreshToken -- only
+// nodeName/nodeType/updatedAt/email/configured -- so the UI never has
+// secret bytes to accidentally render.
 
 (function () {
   "use strict";
@@ -402,18 +409,36 @@
     return html;
   }
 
-  // ---------------- central google credentials page ----------------
+  // ---------------- Google Connections page ----------------
   //
-  // One Google account, saved once here, used automatically by every
-  // googleSheets/youTube/gmail node in every workflow (see
-  // internal/vault/central.go). This is the primary credential flow;
-  // the per-node section further down is only an optional override.
+  // n8n-style "Connect with Google": one Connect/Reconnect/Disconnect
+  // button per service (Gmail, YouTube, Sheets), each independently
+  // wired to its own Google account via the Authorization Code flow
+  // (GET /api/google/connections, GET /api/google/connect/{service},
+  // POST /api/google/disconnect/{service} -- see
+  // internal/api/google_connect.go). No client ID/secret/refresh token
+  // ever touches this page or this browser tab.
+  //
+  // The legacy manual-paste central credential (GET/POST/DELETE
+  // /api/credentials/google) is kept below as a collapsed "Advanced"
+  // section for backward compatibility -- most people never need it.
+
+  const GOOGLE_SERVICE_LABELS = { gmail: "Gmail", youtube: "YouTube", sheets: "Google Sheets" };
+  const GOOGLE_SERVICE_ORDER = ["gmail", "youtube", "sheets"];
 
   async function renderCentralCredentialsPage() {
     viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Google Credentials</h1>' +
-      '<div class="sub">One Google account, used automatically by every Google node (Sheets, YouTube, Gmail) in every workflow \u2014 no per-node setup needed.</div></div></div>' +
+      '<div class="page-head"><div><h1>Google Connections</h1>' +
+      '<div class="sub">Connect each service to its own Google account \u2014 no copying refresh tokens, ' +
+      "no manual setup. Once connected, every workflow's Gmail/YouTube/Sheets nodes use it automatically, " +
+      "including scheduled runs with no browser open.</div></div></div>" +
+      '<div id="googleConnCards" class="google-conn-cards">' + loadingRow("Checking connections\u2026") + "</div>" +
+      '<div id="googleConnNotConfigured" class="field-error" style="display:none;"></div>' +
+      '<details class="cred-advanced"><summary>Advanced: manual credential (override)</summary>' +
       '<div class="card cred-page-card">' +
+      '<div class="cred-section-note">Only needed if you already have a Google OAuth client ID/secret/refresh ' +
+      "token from elsewhere and want to paste it in directly, instead of using Connect above. Most people never " +
+      "need this.</div>" +
       '<div id="centralCredStatus" class="cred-status">' + loadingRow("Checking saved account\u2026") + "</div>" +
       '<div class="field"><label>Client ID</label><input type="text" id="centralClientId" autocomplete="off"></div>' +
       '<div class="field"><label>Client Secret</label><input type="password" id="centralClientSecret" autocomplete="off"></div>' +
@@ -423,11 +448,114 @@
       '<button id="centralClearBtn" class="btn btn-danger">Clear</button>' +
       "</div>" +
       '<div id="centralCredError" class="field-error"></div>' +
-      "</div>";
+      "</div></details>";
 
+    handleGoogleCallbackQueryParams();
     wireCentralCredentialsPage();
     refreshCentralCredentialStatus();
+    refreshGoogleConnections();
   }
+
+  // Google's OAuth redirect lands back here as
+  // /#/credentials?googleConnected=gmail or ?googleError=<message> --
+  // show a toast once, then strip the query string so a page refresh
+  // doesn't replay it.
+  function handleGoogleCallbackQueryParams() {
+    const hash = location.hash || "";
+    const qIdx = hash.indexOf("?");
+    if (qIdx === -1) return;
+    const params = new URLSearchParams(hash.slice(qIdx + 1));
+    const connected = params.get("googleConnected");
+    const err = params.get("googleError");
+    if (connected) {
+      toast((GOOGLE_SERVICE_LABELS[connected] || connected) + " connected", "success");
+    } else if (err) {
+      toast(err, "error");
+    }
+    if (connected || err !== null) {
+      history.replaceState(null, "", hash.slice(0, qIdx));
+    }
+  }
+
+  function googleServiceCardHTML(view) {
+    const label = GOOGLE_SERVICE_LABELS[view.service] || view.service;
+    let statusHTML;
+    if (view.connected && view.needsReconnect) {
+      statusHTML = '<span class="badge badge-inactive">connection expired</span>' +
+        '<div class="google-conn-msg">Google connection expired. Please reconnect.</div>';
+    } else if (view.connected) {
+      statusHTML = '<span class="badge badge-active">connected</span>' +
+        (view.email ? '<div class="google-conn-email">Connected as: ' + escapeHtml(view.email) + "</div>" : "") +
+        (view.updatedAt ? '<div class="cred-status-time">since ' + escapeHtml(fmtDate(view.updatedAt)) + "</div>" : "");
+    } else {
+      statusHTML = '<span class="badge badge-inactive">not connected</span>';
+    }
+
+    let actionsHTML;
+    if (view.connected) {
+      actionsHTML =
+        '<a class="btn btn-secondary btn-sm" href="/api/google/connect/' + encodeURIComponent(view.service) + '">' +
+        (view.needsReconnect ? "Reconnect" : "Reconnect") + "</a> " +
+        '<button class="btn btn-danger btn-sm google-disconnect-btn" data-service="' + escapeHtml(view.service) + '">Disconnect</button>';
+    } else {
+      actionsHTML = '<a class="btn btn-primary btn-sm" href="/api/google/connect/' + encodeURIComponent(view.service) + '">Connect Google</a>';
+    }
+
+    return (
+      '<div class="google-conn-card">' +
+      "<h3>" + escapeHtml(label) + "</h3>" +
+      '<div class="google-conn-status">' + statusHTML + "</div>" +
+      '<div class="google-conn-actions">' + actionsHTML + "</div>" +
+      "</div>"
+    );
+  }
+
+  async function refreshGoogleConnections() {
+    const cardsEl = document.getElementById("googleConnCards");
+    const notConfiguredEl = document.getElementById("googleConnNotConfigured");
+    if (!cardsEl) return; // navigated away
+    try {
+      const services = await apiJSON("/api/google/connections");
+      const byService = {};
+      (services || []).forEach((v) => { byService[v.service] = v; });
+      cardsEl.innerHTML = GOOGLE_SERVICE_ORDER
+        .map((svc) => byService[svc] || { service: svc, connected: false })
+        .map(googleServiceCardHTML)
+        .join("");
+      wireGoogleDisconnectButtons();
+      notConfiguredEl.style.display = "none";
+    } catch (e) {
+      // Server has no GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL set --
+      // Connect buttons aren't available; the Advanced section below
+      // still works.
+      cardsEl.innerHTML = "";
+      notConfiguredEl.style.display = "";
+      notConfiguredEl.textContent =
+        "\"Connect with Google\" isn't set up on this server yet (missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL). " +
+        "Use the Advanced section below, or ask an operator to configure it.";
+    }
+  }
+
+  function wireGoogleDisconnectButtons() {
+    document.querySelectorAll(".google-disconnect-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const service = btn.dataset.service;
+        const label = GOOGLE_SERVICE_LABELS[service] || service;
+        if (!confirm("Disconnect " + label + "? Workflows using it will stop working until it's reconnected.")) return;
+        btn.disabled = true;
+        try {
+          await apiJSON("/api/google/disconnect/" + encodeURIComponent(service), { method: "POST" });
+          toast(label + " disconnected", "success");
+          refreshGoogleConnections();
+        } catch (e) {
+          toast("Disconnect failed: " + e.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // ---------------- legacy manual-paste central credential (advanced/override) ----------------
 
   // Re-fetches central status and updates just the status line -- never
   // touches the input fields, so it's safe to call again right after a

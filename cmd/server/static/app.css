@@ -419,3 +419,32 @@ textarea.json-paste {
   .view { padding: 14px; }
   table.wf-table { display: block; overflow-x: auto; white-space: nowrap; }
 }
+
+/* ---------- Google Connections (n8n-style Connect/Reconnect/Disconnect) ---------- */
+
+.google-conn-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.google-conn-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.google-conn-card h3 { margin: 0 0 10px; font-size: 15px; }
+.google-conn-status { min-height: 42px; margin-bottom: 12px; font-size: 12px; }
+.google-conn-email { margin-top: 6px; font-weight: 600; }
+.google-conn-msg { margin-top: 6px; color: var(--error); }
+.google-conn-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.google-conn-actions a.btn { text-decoration: none; }
+
+.cred-advanced { margin-top: 8px; }
+.cred-advanced summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
