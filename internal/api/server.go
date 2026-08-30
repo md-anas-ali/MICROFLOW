@@ -193,10 +193,24 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	seed := model.NodeOutput{{{JSON: map[string]any{}}}}
-	ex, _ := s.run.RunFromNode(r.Context(), wf.ID, startNode, "manual", seed)
-	// Note: RunFromNode's error return is the *workflow's* run error --
-	// the HTTP call itself succeeded (we have a valid `ex` either way,
-	// even on failure), so this always replies 200 with status in the body.
+	ex, err := s.run.RunFromNode(r.Context(), wf.ID, startNode, "manual", seed)
+	// RunFromNode returns (non-nil execution, workflow-run-error) once a
+	// run actually starts -- engine.Run always populates the execution
+	// even on failure, so that case correctly replies 200 with the
+	// status/error visible in the body for the exec panel.
+	//
+	// But RunFromNode can also fail *before* a run ever starts (its own
+	// LoadWorkflow race, missing start node, or the per-execution scratch
+	// dir failing to create -- e.g. a full/read-only disk). Those return
+	// (nil, err) and were previously falling through to `writeJSON(200,
+	// nil)`: an HTTP success with a JSON `null` body. The frontend then
+	// dereferenced fields on that null (ex.nodeRuns, ex.status), which is
+	// the silent-failure bug this fixes -- give it a real error status
+	// instead of a fake success.
+	if ex == nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, ex)
 }
 
