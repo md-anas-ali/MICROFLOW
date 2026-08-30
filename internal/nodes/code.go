@@ -20,10 +20,10 @@ import (
 // Security posture (rule 5 + rule 22): goja has NO access to the host
 // filesystem, network, or process by default -- we only expose the data
 // bindings the workflow actually needs ($json, $node, $env allowlist,
-// $execution, plus JS builtins like JSON/Date/Array/String which goja
-// provides natively). We do not expose `require`, so npm-style module
-// loading is impossible from inside a Code node. A wall-clock timeout
-// aborts runaway scripts (rule 22: infinite loops).
+// $execution, items/item, plus JS builtins like JSON/Date/Array/String
+// which goja provides natively). We do not expose `require`, so
+// npm-style module loading is impossible from inside a Code node. A
+// wall-clock timeout aborts runaway scripts (rule 22: infinite loops).
 type CodeExecutor struct {
 	// EnvAllowlist holds the env var *names* an operator has opted in to
 	// exposing to Code node scripts via $env (populated from server
@@ -73,6 +73,19 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 				mustSet(vm, "$json", itemsIn[0].JSON)
 			} else {
 				mustSet(vm, "$json", map[string]any{})
+			}
+			// n8n's Code node also exposes bare (non-$-prefixed) globals as
+			// a convenience, and workflows imported from n8n commonly use
+			// them directly instead of $input.all(): `items` (the full
+			// input array) in "Run Once for All Items" mode, `item` (the
+			// single current item) in "Run Once for Each Item" mode.
+			// Exposing both here regardless of mode is harmless and
+			// maximizes compatibility with imported scripts either way.
+			mustSet(vm, "items", inputItems)
+			if len(inputItems) > 0 {
+				mustSet(vm, "item", inputItems[0])
+			} else {
+				mustSet(vm, "item", map[string]any{"json": map[string]any{}})
 			}
 
 			nodeGetter := func(name string) map[string]any {
