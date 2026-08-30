@@ -3,6 +3,7 @@ package nodes
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -20,10 +21,12 @@ import (
 // Security posture (rule 5 + rule 22): goja has NO access to the host
 // filesystem, network, or process by default -- we only expose the data
 // bindings the workflow actually needs ($json, $node, $env allowlist,
-// $execution, items/item, plus JS builtins like JSON/Date/Array/String
-// which goja provides natively). We do not expose `require`, so
-// npm-style module loading is impossible from inside a Code node. A
-// wall-clock timeout aborts runaway scripts (rule 22: infinite loops).
+// $execution, items/item, console.log/warn/error/info/debug (forwarded
+// to the server log, length-capped), plus JS builtins like
+// JSON/Date/Array/String which goja provides natively). We do not
+// expose `require`, so npm-style module loading is impossible from
+// inside a Code node. A wall-clock timeout aborts runaway scripts
+// (rule 22: infinite loops).
 type CodeExecutor struct {
 	// EnvAllowlist holds the env var *names* an operator has opted in to
 	// exposing to Code node scripts via $env (populated from server
@@ -87,6 +90,21 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 			} else {
 				mustSet(vm, "item", map[string]any{"json": map[string]any{}})
 			}
+			// n8n Code node scripts commonly use console.log/warn/error/info
+			// for debugging; goja has no built-in console. Forward to the
+			// server log (prefixed with the node name so multiple nodes'
+			// output isn't ambiguous), capped in length per call so a
+			// runaway/malicious script can't flood the log (rule 22: no
+			// unbounded resource use). This never returns anything to the
+			// script -- console methods are fire-and-forget, matching
+			// real console semantics.
+			mustSet(vm, "console", map[string]any{
+				"log":   consoleLogger(node.Name, "LOG"),
+				"info":  consoleLogger(node.Name, "INFO"),
+				"warn":  consoleLogger(node.Name, "WARN"),
+				"error": consoleLogger(node.Name, "ERROR"),
+				"debug": consoleLogger(node.Name, "DEBUG"),
+			})
 
 			nodeGetter := func(name string) map[string]any {
 				if out, ok := rc2ExprNodeOutputs(rc)[name]; ok {
@@ -193,6 +211,27 @@ func wrapCode(body string) string {
 func mustSet(vm *goja.Runtime, name string, v any) {
 	if err := vm.Set(name, v); err != nil {
 		panic(err) // programmer error (bad binding), not user input
+	}
+}
+
+// maxConsoleLogBytes bounds a single console.log/warn/etc call's
+// formatted output so a runaway or malicious script can't flood the
+// server log (rule 22: no unbounded resource use).
+const maxConsoleLogBytes = 2000
+
+// consoleLogger returns a variadic function suitable for vm.Set as
+// console.log/info/warn/error/debug: formats args the way JS console
+// methods do (space-joined) and writes one line to the server log,
+// prefixed with the node name and level so concurrent nodes' output
+// isn't ambiguous. Never returns anything to the script.
+func consoleLogger(nodeName, level string) func(args ...any) {
+	return func(args ...any) {
+		msg := fmt.Sprintln(args...)
+		msg = strings.TrimRight(msg, "\n")
+		if len(msg) > maxConsoleLogBytes {
+			msg = msg[:maxConsoleLogBytes] + "...(truncated)"
+		}
+		log.Printf("code node %q [%s]: %s", nodeName, level, msg)
 	}
 }
 
