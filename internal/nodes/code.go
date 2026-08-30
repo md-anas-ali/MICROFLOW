@@ -216,6 +216,14 @@ func rc2ExprNodeOutputs(rc *engine.RunContext) map[string]map[string]any {
 // exportToItems normalizes a goja-exported return value (array of
 // {json:...} objects, a single object, or a bare array of objects) into
 // MicroFlow items, matching the shapes n8n Code nodes commonly return.
+//
+// goja's Export() doesn't always produce []any for a JS array: when
+// every element happens to export to the same concrete Go map type, it
+// can produce a more specific slice type instead (observed:
+// []map[string]interface{} for an array of plain JS objects). Both
+// shapes are handled explicitly rather than relying on a single
+// []any case, so a Code node returning a plain array of objects works
+// regardless of which slice type goja happened to pick.
 func exportToItems(v any) ([]model.Item, error) {
 	switch val := v.(type) {
 	case []any:
@@ -225,21 +233,29 @@ func exportToItems(v any) ([]model.Item, error) {
 			if !ok {
 				return nil, fmt.Errorf("code node: array element is not an object")
 			}
-			if j, ok := m["json"].(map[string]any); ok {
-				out = append(out, model.Item{JSON: j})
-			} else {
-				out = append(out, model.Item{JSON: m})
-			}
+			out = append(out, itemFromMap(m))
+		}
+		return out, nil
+	case []map[string]any:
+		var out []model.Item
+		for _, m := range val {
+			out = append(out, itemFromMap(m))
 		}
 		return out, nil
 	case map[string]any:
-		if j, ok := val["json"].(map[string]any); ok {
-			return []model.Item{{JSON: j}}, nil
-		}
-		return []model.Item{{JSON: val}}, nil
+		return []model.Item{itemFromMap(val)}, nil
 	case nil:
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("code node: unsupported return type %T", v)
 	}
+}
+
+// itemFromMap unwraps n8n's {json: {...}} item shape if present,
+// otherwise treats the whole map as the item's json.
+func itemFromMap(m map[string]any) model.Item {
+	if j, ok := m["json"].(map[string]any); ok {
+		return model.Item{JSON: j}
+	}
+	return model.Item{JSON: m}
 }
