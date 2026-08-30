@@ -95,8 +95,15 @@ func main() {
 	// to the node; plain API-key credentials (no refreshToken) pass
 	// through unchanged.
 	perNodeCreds := vault.NewOAuthResolver(baseVault)
-	accountCreds := vault.NewAccountResolver(accountVault)
+	accountCreds := vault.NewAccountResolver(accountVault, vault.CentralGoogleAccount)
 	creds := vault.NewCentralFallbackResolver(perNodeCreds, accountCreds)
+	// googleAccounts backs the new n8n-style "Connect with Google" flow:
+	// one connected account PER SERVICE (Gmail/YouTube/Sheets), each
+	// independently connect/reconnect/disconnect-able, falling back to
+	// the legacy single `creds` account above only for a service that
+	// was never individually (re)connected -- see
+	// vault.GoogleServiceAccounts's doc comment.
+	googleAccounts := vault.NewGoogleServiceAccounts(accountVault)
 
 	scratchRoot := envOr("MICROFLOW_SCRATCH_DIR", "/tmp/microflow")
 	_ = os.MkdirAll(scratchRoot, 0o700)
@@ -123,11 +130,17 @@ func main() {
 	}
 
 	registry := nodes.DefaultRegistry(nodes.Deps{
-		HTTPClient:         &http.Client{Timeout: 60 * time.Second},
-		AllowedBinaries:    allowedBinaries,
-		EnvAllowlist:       codeEnvAllowlist,
-		ScratchRoot:        scratchRoot,
-		CredentialResolver: creds,
+		HTTPClient:      &http.Client{Timeout: 60 * time.Second},
+		AllowedBinaries: allowedBinaries,
+		EnvAllowlist:    codeEnvAllowlist,
+		ScratchRoot:     scratchRoot,
+		// CredentialResolver: per-node/per-workflow override only (an
+		// explicit credential saved for one specific node) -- Google
+		// executors fall back to GoogleAccounts, not this resolver's own
+		// central fallback, so each service's connected account can be
+		// chosen independently. See internal/nodes/google.go.
+		CredentialResolver: perNodeCreds,
+		GoogleAccounts:     googleAccounts,
 	})
 	eng := engine.New(registry)
 
@@ -149,6 +162,21 @@ func main() {
 	// needed just to save a credential. accountVault is the central
 	// Google account store backing /api/credentials/google.
 	apiServer := api.New(st, run, st, baseVault, accountVault)
+
+	// "Connect with Google" (n8n-style OAuth Authorization Code flow)
+	// only turns on if a Google Cloud OAuth client is configured -- see
+	// the GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL doc comment in
+	// vault.GoogleOAuthAppFromEnv. Without it, the server still runs
+	// fine; only the "Connect Google" buttons are unavailable, and the
+	// legacy manual clientId/clientSecret/refreshToken paste (cmd/setcred
+	// or the central credentials endpoint) still works as a fallback.
+	if oauthApp, ok := vault.GoogleOAuthAppFromEnv(os.Getenv); ok {
+		apiServer.EnableGoogleOAuth(oauthApp, googleAccounts)
+		log.Printf("Google OAuth configured -- \"Connect with Google\" is enabled for Gmail/YouTube/Sheets")
+	} else {
+		log.Printf("warning: GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/GOOGLE_OAUTH_REDIRECT_URL not fully set -- " +
+			"\"Connect with Google\" buttons are disabled; existing manual credential paste still works")
+	}
 
 	whServer := webhook.NewServer()
 	webhookToken := envOr("MICROFLOW_WEBHOOK_TOKEN", "")
