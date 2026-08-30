@@ -45,6 +45,16 @@ type Server struct {
 	// so a server wired up without central-credential storage (e.g. an
 	// older test helper) still serves every other endpoint normally.
 	accounts *vault.AccountVault
+
+	// googleOAuth/googleAccounts back the "Google Connections" page
+	// (Connect/Reconnect/Disconnect per service). Both are nil unless
+	// EnableGoogleOAuth is called (main.go does this only when
+	// GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL are configured), so a
+	// server without a registered OAuth app simply doesn't expose the
+	// /api/google/* routes rather than panicking -- existing manual
+	// credential paste endpoints above are unaffected either way.
+	googleOAuth    *vault.GoogleOAuthApp
+	googleAccounts *vault.GoogleServiceAccounts
 }
 
 // New wires the API to the shared runner/store/vault -- the exact same
@@ -382,6 +392,9 @@ func (s *Server) handleDeleteCentralCredential(w http.ResponseWriter, r *http.Re
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
+
+// Google Connections (Connect/Reconnect/Disconnect per service) handlers
+// live in google_connect.go, registered via EnableGoogleOAuth.
 
 func readBody(r *http.Request, max int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r.Body, max))
