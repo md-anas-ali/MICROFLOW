@@ -100,20 +100,24 @@ func (av *AccountVault) Status(ctx context.Context, account string) (updatedAt t
 	return av.store.AccountCredentialMeta(ctx, account)
 }
 
-// AccountResolver refreshes and resolves the central Google account
-// credential, transparently keeping its accessToken fresh the same way
-// OAuthResolver does for per-node credentials (see refreshEngine in
-// oauth.go, which this and OAuthResolver both use).
+// AccountResolver refreshes and resolves ONE named central-account
+// credential row, transparently keeping its accessToken fresh the same
+// way OAuthResolver does for per-node credentials (see refreshEngine in
+// oauth.go, which this and OAuthResolver both use). `account` used to
+// be hardcoded to CentralGoogleAccount (one shared row for every Google
+// node); it's now a constructor parameter so the same type can also
+// back one row per connected Google *service* (gmail/youtube/sheets --
+// see GoogleServiceAccounts below), without a second implementation of
+// the refresh/lock logic.
 type AccountResolver struct {
 	accounts *AccountVault
 	account  string
 	eng      *refreshEngine
 }
 
-// NewAccountResolver builds a resolver for the central Google account
-// (CentralGoogleAccount).
-func NewAccountResolver(av *AccountVault) *AccountResolver {
-	return &AccountResolver{accounts: av, account: CentralGoogleAccount, eng: newRefreshEngine()}
+// NewAccountResolver builds a resolver for the given central-account row.
+func NewAccountResolver(av *AccountVault, account string) *AccountResolver {
+	return &AccountResolver{accounts: av, account: account, eng: newRefreshEngine()}
 }
 
 func (r *AccountResolver) Resolve(ctx context.Context) (map[string]string, error) {
@@ -154,4 +158,121 @@ func (r *CentralFallbackResolver) Resolve(ctx context.Context, workflowID, logic
 		return secrets, nil
 	}
 	return r.account.Resolve(ctx)
+}
+
+// --- per-service connected Google accounts (n8n-style "Connect with
+// Google" per node type) ---
+//
+// GoogleServices are the connectable service keys, one per Google node
+// type MicroFlow has an executor for. Keep this list, the scope map in
+// googleoauth.go, and internal/nodes/google.go's node-type-to-service
+// mapping in sync if a Google node type is ever added.
+var GoogleServices = []string{"gmail", "youtube", "sheets"}
+
+func IsGoogleService(s string) bool {
+	for _, v := range GoogleServices {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// serviceAccountKey namespaces each service's row distinctly from the
+// legacy single CentralGoogleAccount row, so introducing per-service
+// accounts can never collide with or silently overwrite an existing
+// install's central credential.
+func serviceAccountKey(service string) string { return "svc:" + service }
+
+// GoogleServiceAccounts holds one AccountResolver per connectable
+// Google service, each backed by its own row (so Gmail, YouTube, and
+// Sheets can each be connected to the same Google account or to three
+// different ones, independently of each other), plus the legacy single
+// CentralGoogleAccount resolver as a migration fallback: an install
+// that already had the old single "log in once" credential configured
+// keeps working for every service, unmodified, until an operator
+// connects a specific service through the new per-service flow (at
+// which point that service's own row takes over and the legacy row is
+// no longer consulted for it).
+type GoogleServiceAccounts struct {
+	accounts  *AccountVault
+	resolvers map[string]*AccountResolver
+	legacy    *AccountResolver
+}
+
+// NewGoogleServiceAccounts builds resolvers for every GoogleServices
+// entry plus the legacy fallback, all sharing av's storage/cipher.
+func NewGoogleServiceAccounts(av *AccountVault) *GoogleServiceAccounts {
+	m := make(map[string]*AccountResolver, len(GoogleServices))
+	for _, svc := range GoogleServices {
+		m[svc] = NewAccountResolver(av, serviceAccountKey(svc))
+	}
+	return &GoogleServiceAccounts{
+		accounts:  av,
+		resolvers: m,
+		legacy:    NewAccountResolver(av, CentralGoogleAccount),
+	}
+}
+
+// Put stores/replaces the connected-account credential for one service
+// (called by the OAuth callback once a code exchange succeeds).
+func (g *GoogleServiceAccounts) Put(ctx context.Context, service string, secrets map[string]string) error {
+	if !IsGoogleService(service) {
+		return fmt.Errorf("vault: unknown google service %q", service)
+	}
+	return g.accounts.Put(ctx, serviceAccountKey(service), secrets)
+}
+
+// Disconnect removes only this service's own row -- it never touches
+// the legacy central row or any other service's row, so disconnecting
+// YouTube can't affect Gmail/Sheets.
+func (g *GoogleServiceAccounts) Disconnect(ctx context.Context, service string) error {
+	if !IsGoogleService(service) {
+		return fmt.Errorf("vault: unknown google service %q", service)
+	}
+	return g.accounts.Delete(ctx, serviceAccountKey(service))
+}
+
+// Resolve is what node executors call at run time: this service's own
+// connected account first, falling back to the legacy central account
+// only if this service was never individually connected (see type doc).
+func (g *GoogleServiceAccounts) Resolve(ctx context.Context, service string) (map[string]string, error) {
+	r, ok := g.resolvers[service]
+	if !ok {
+		return nil, fmt.Errorf("vault: unknown google service %q", service)
+	}
+	secrets, err := r.Resolve(ctx)
+	if err == nil {
+		return secrets, nil
+	}
+	legacySecrets, legacyErr := g.legacy.Resolve(ctx)
+	if legacyErr == nil {
+		return legacySecrets, nil
+	}
+	return nil, err
+}
+
+// Status reports this service's OWN connection state for the "Google
+// Connections" UI (never the legacy fallback -- the UI should show
+// "Connect Google" for a service that hasn't been individually
+// connected yet, even if the legacy account would still work at
+// execution time). needsReconnect is true when a credential row exists
+// but Google has revoked/expired the refresh token (invalid_grant) --
+// the UI's cue to show "Reconnect" instead of "Connect".
+func (g *GoogleServiceAccounts) Status(ctx context.Context, service string) (email string, updatedAt time.Time, connected bool, needsReconnect bool, err error) {
+	if !IsGoogleService(service) {
+		return "", time.Time{}, false, false, fmt.Errorf("vault: unknown google service %q", service)
+	}
+	updatedAt, exists, err := g.accounts.Status(ctx, serviceAccountKey(service))
+	if err != nil || !exists {
+		return "", updatedAt, false, false, err
+	}
+	secrets, rerr := g.resolvers[service].Resolve(ctx)
+	if rerr != nil {
+		if errors.Is(rerr, ErrGoogleReauthRequired) {
+			return "", updatedAt, true, true, nil
+		}
+		return "", updatedAt, true, false, rerr
+	}
+	return secrets["email"], updatedAt, true, false, nil
 }

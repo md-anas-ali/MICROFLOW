@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,6 +12,17 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrGoogleReauthRequired is returned (wrapped, so errors.Is still
+// matches) when Google's token endpoint rejects a refresh_token with
+// "invalid_grant" -- i.e. the person revoked access, changed their
+// Google password, or the refresh token otherwise died. There is no
+// way to recover an accessToken in this state; the only fix is for the
+// person to reconnect (see the Google Connections UI / handleGoogle*
+// endpoints in internal/api), which is why callers translate this into
+// "Google connection expired. Please reconnect." instead of the raw
+// Google error.
+var ErrGoogleReauthRequired = errors.New("google: refresh token invalid or revoked -- reconnect required")
 
 // OAuthResolver wraps a Vault and transparently refreshes Google OAuth2
 // access tokens before handing them to node executors, so
@@ -174,6 +186,9 @@ func (e *refreshEngine) refresh(ctx context.Context, clientID, clientSecret, ref
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return "", time.Time{}, fmt.Errorf("decode token response: %w", err)
+	}
+	if body.Error == "invalid_grant" {
+		return "", time.Time{}, fmt.Errorf("token endpoint rejected refresh token: %w", ErrGoogleReauthRequired)
 	}
 	if resp.StatusCode >= 300 || body.Error != "" {
 		return "", time.Time{}, fmt.Errorf("token endpoint returned %d: %s: %s", resp.StatusCode, body.Error, body.ErrorDesc)
