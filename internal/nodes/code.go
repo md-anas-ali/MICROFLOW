@@ -99,11 +99,11 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 			// script -- console methods are fire-and-forget, matching
 			// real console semantics.
 			mustSet(vm, "console", map[string]any{
-				"log":   consoleLogger(node.Name, "LOG"),
-				"info":  consoleLogger(node.Name, "INFO"),
-				"warn":  consoleLogger(node.Name, "WARN"),
-				"error": consoleLogger(node.Name, "ERROR"),
-				"debug": consoleLogger(node.Name, "DEBUG"),
+				"log":   consoleLogger(rc.Redactor, node.Name, "LOG"),
+				"info":  consoleLogger(rc.Redactor, node.Name, "INFO"),
+				"warn":  consoleLogger(rc.Redactor, node.Name, "WARN"),
+				"error": consoleLogger(rc.Redactor, node.Name, "ERROR"),
+				"debug": consoleLogger(rc.Redactor, node.Name, "DEBUG"),
 			})
 
 			nodeGetter := func(name string) map[string]any {
@@ -223,14 +223,19 @@ const maxConsoleLogBytes = 2000
 // console.log/info/warn/error/debug: formats args the way JS console
 // methods do (space-joined) and writes one line to the server log,
 // prefixed with the node name and level so concurrent nodes' output
-// isn't ambiguous. Never returns anything to the script.
-func consoleLogger(nodeName, level string) func(args ...any) {
+// isn't ambiguous. Never returns anything to the script. redactor (if
+// set) scrubs any secret-shaped value the script logs -- e.g. a Config
+// Center-style node's `console.log(cfg.geminiApiKey)` during debugging
+// -- before it ever reaches the server's own log output, matching the
+// same redaction applied to stored/served execution data.
+func consoleLogger(redactor *engine.SecretRedactor, nodeName, level string) func(args ...any) {
 	return func(args ...any) {
 		msg := fmt.Sprintln(args...)
 		msg = strings.TrimRight(msg, "\n")
 		if len(msg) > maxConsoleLogBytes {
 			msg = msg[:maxConsoleLogBytes] + "...(truncated)"
 		}
+		msg = redactor.RedactString(msg)
 		log.Printf("code node %q [%s]: %s", nodeName, level, msg)
 	}
 }

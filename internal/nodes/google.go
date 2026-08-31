@@ -236,12 +236,30 @@ func googleAPICall(ctx context.Context, method, url, token string, body []byte, 
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		// Network-level failures (DNS, connection reset, timeout) are
+		// transient by nature -- let the node's own RetryOnFail/MaxTries
+		// budget (if configured) retry them.
+		return fmt.Errorf("google api %s %s: %w", method, url, err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("google api %s %s: status %d: %s", method, url, resp.StatusCode, truncate(string(respBody), 500))
+		msg := fmt.Errorf("google api %s %s: status %d: %s", method, url, resp.StatusCode, truncate(string(respBody), 500))
+		switch {
+		case resp.StatusCode == 401 || resp.StatusCode == 403:
+			// Invalid/expired/missing credential -- retrying the same
+			// request with the same token can never succeed, so mark
+			// this permanent: the engine stops retrying immediately and
+			// reports a clear configuration/credential error instead of
+			// burning the retry budget on guaranteed-identical failures.
+			return engine.Permanent(fmt.Errorf("credential/configuration error (not retried): %w", msg))
+		case resp.StatusCode == 429 || resp.StatusCode >= 500:
+			// Rate limit or transient server error -- exactly what the
+			// node's RetryOnFail/MaxTries + backoff exists for.
+			return fmt.Errorf("transient error (will retry if configured): %w", msg)
+		default:
+			return msg
+		}
 	}
 	if into != nil {
 		return json.Unmarshal(respBody, into)
