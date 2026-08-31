@@ -45,6 +45,39 @@ func TestParseActualWorkflow(t *testing.T) {
 	}
 }
 
+// TestParseReadUsedTopicsRetryConfig locks in the production-readiness
+// fix for "Read Used Topics": a transient Google Sheets error (503/429/
+// 5xx) must retry up to 3 times, and ContinueOnFail must be OFF so a
+// read that still fails after retries becomes a real, visible node
+// error instead of silently letting the workflow continue with no
+// used-topics data (which risks writing a duplicate topic).
+func TestParseReadUsedTopicsRetryConfig(t *testing.T) {
+	raw, err := os.ReadFile("../../test/testdata/sample_workflow.json")
+	if err != nil {
+		t.Fatalf("read testdata: %v", err)
+	}
+	result, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	node, ok := result.Workflow.Nodes["Read Used Topics"]
+	if !ok {
+		t.Fatal("expected node \"Read Used Topics\" to be present after parse")
+	}
+	if !node.RetryOnFail {
+		t.Error("Read Used Topics: RetryOnFail = false, want true")
+	}
+	if node.MaxTries != 3 {
+		t.Errorf("Read Used Topics: MaxTries = %d, want 3", node.MaxTries)
+	}
+	if node.WaitBetweenTriesMs <= 0 {
+		t.Errorf("Read Used Topics: WaitBetweenTriesMs = %d, want a positive backoff base", node.WaitBetweenTriesMs)
+	}
+	if node.ContinueOnFail {
+		t.Error("Read Used Topics: ContinueOnFail = true, want false -- a failed read must stop the run, not silently risk a duplicate topic")
+	}
+}
+
 func TestParseRejectsEmptyWorkflow(t *testing.T) {
 	_, err := Parse([]byte(`{"nodes": [], "connections": {}}`))
 	if err == nil {

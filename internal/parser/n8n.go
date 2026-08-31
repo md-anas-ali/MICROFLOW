@@ -149,6 +149,16 @@ func Parse(raw []byte) (*ParseResult, error) {
 			waitMs = 1000
 		}
 
+		// onErrorMode preserves which *kind* of continue-on-fail n8n asked
+		// for (regular output vs dedicated error output) so the engine can
+		// route a failed node's error item correctly instead of just
+		// knowing "continue or not". A bare legacy continueOnFail:true
+		// (pre-onError n8n versions) behaves like continueRegularOutput.
+		onErrorMode := rn.OnError
+		if onErrorMode == "" && rn.ContinueOnFail {
+			onErrorMode = "continueRegularOutput"
+		}
+
 		wf.Nodes[rn.Name] = &model.Node{
 			ID:                 rn.ID,
 			Name:               rn.Name,
@@ -163,6 +173,7 @@ func Parse(raw []byte) (*ParseResult, error) {
 			MaxTries:           maxTries,
 			WaitBetweenTriesMs: waitMs,
 			ContinueOnFail:     rn.ContinueOnFail || rn.OnError == "continueRegularOutput" || rn.OnError == "continueErrorOutput",
+			OnErrorMode:        onErrorMode,
 		}
 	}
 

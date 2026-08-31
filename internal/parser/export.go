@@ -31,6 +31,7 @@ type exportN8NNode struct {
 	MaxTries         int            `json:"maxTries,omitempty"`
 	WaitBetweenTries int            `json:"waitBetweenTries,omitempty"`
 	ContinueOnFail   bool           `json:"continueOnFail,omitempty"`
+	OnError          string         `json:"onError,omitempty"`
 }
 
 // Export converts a MicroFlow workflow back to n8n's export JSON shape.
@@ -82,6 +83,7 @@ func Export(wf *model.Workflow) ([]byte, error) {
 			MaxTries:         n.MaxTries,
 			WaitBetweenTries: n.WaitBetweenTriesMs,
 			ContinueOnFail:   n.ContinueOnFail,
+			OnError:          n.OnErrorMode,
 		})
 	}
 
