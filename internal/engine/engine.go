@@ -74,6 +74,17 @@ type RunContext struct {
 	// dropped once the cap is exceeded; the most recent entries (which is
 	// what an error/status needs) are always kept.
 	nodeRunCap int
+
+	// Redactor scrubs secret-shaped values (API keys, tokens, passwords
+	// -- see redact.go) out of anything stored in Execution.NodeRuns,
+	// which is what gets persisted, returned from the execute API, and
+	// rendered in the frontend's node inspector. It never touches the
+	// live data node executors/expressions actually work with (see
+	// recordNodeOutput below), so Config Center's real key values keep
+	// flowing to the nodes that need them -- only the copy that gets
+	// displayed/logged is redacted. Nil is a safe no-op (a Runner that
+	// doesn't set one behaves exactly as before, just unredacted).
+	Redactor *SecretRedactor
 }
 
 // appendNodeRun records one node's result, trimming the oldest entries
@@ -211,15 +222,26 @@ runLoop:
 			if nodeErr == nil {
 				break
 			}
+			// A permanent (config/credential) error can't be fixed by
+			// retrying the identical request again -- e.g. an HTTP
+			// 401/403 from a missing/invalid API key. Stop immediately
+			// instead of burning the rest of the MaxTries budget (and
+			// their backoff waits) on attempts guaranteed to fail the
+			// same way; this also makes the resulting error message
+			// arrive faster and stay unambiguous (transient vs
+			// permanent), per the "clear configuration error" goal.
+			if IsPermanent(nodeErr) {
+				break
+			}
 			if a < maxTries {
-				time.Sleep(time.Duration(node.WaitBetweenTriesMs) * time.Millisecond)
+				time.Sleep(retryBackoff(node.WaitBetweenTriesMs, a))
 			}
 		}
 		duration := time.Since(started)
 
 		result := model.NodeRunResult{
 			NodeName:  node.Name,
-			Input:     item.input,
+			Input:     rc.Redactor.RedactOutput(item.input),
 			StartedAt: started,
 			Duration:  duration,
 			Attempt:   attempt,
@@ -227,18 +249,41 @@ runLoop:
 
 		if nodeErr != nil {
 			result.Status = model.StatusError
-			result.Error = nodeErr.Error()
-			rc.appendNodeRun(result)
+			result.Error = rc.Redactor.RedactString(nodeErr.Error())
 			if node.ContinueOnFail {
-				continue // swallow and keep processing the rest of the queue
+				// Match n8n's actual continueOnFail/onError behavior:
+				// the failure doesn't just vanish -- it becomes a
+				// pass-through item carrying the error, which flows on
+				// (a) the node's normal output, mixed in with regular
+				// items, for onError=continueRegularOutput (or the
+				// legacy bare continueOnFail:true), or (b) the node's
+				// dedicated second/error output branch, for
+				// onError=continueErrorOutput. Previously this branch
+				// just swallowed the error and stopped -- nothing
+				// flowed downstream at all, which silently truncated
+				// any workflow relying on a real error/fallback branch
+				// (exactly the "silent failure" class of bug flagged
+				// for fix) even though the run reported StatusSuccess.
+				errItem := model.Item{JSON: map[string]any{"error": nodeErr.Error()}}
+				errOut := model.NodeOutput{{errItem}}
+				branchIdx := 0
+				if node.OnErrorMode == "continueErrorOutput" {
+					branchIdx = 1
+					errOut = model.NodeOutput{{}, {errItem}}
+				}
+				result.Output = rc.Redactor.RedactOutput(errOut)
+				rc.appendNodeRun(result)
+				enqueueFromBranch(&queue, rc.Workflow, node.Name, branchIdx, []model.Item{errItem})
+				continue
 			}
+			rc.appendNodeRun(result)
 			runErr = fmt.Errorf("node %q failed: %w", node.Name, nodeErr)
 			rc.Execution.Status = model.StatusError
 			break runLoop
 		}
 
 		result.Status = model.StatusSuccess
-		result.Output = out
+		result.Output = rc.Redactor.RedactOutput(out)
 		rc.appendNodeRun(result)
 		rc.recordNodeOutput(node.Name, out)
 
@@ -266,4 +311,57 @@ runLoop:
 		rc.Execution.Error = runErr.Error()
 	}
 	return rc.Execution, runErr
+}
+
+// enqueueFromBranch appends one queue item per connection leaving
+// node.Name on output index branchIdx, carrying items as that
+// connection's input. Used both by the normal success path (inlined
+// above) and by the ContinueOnFail error-item path, which needs the
+// exact same branch-routing logic (continueErrorOutput routes to
+// index 1, continueRegularOutput/legacy continueOnFail to index 0).
+func enqueueFromBranch(queue *[]queueItem, wf *model.Workflow, nodeName string, branchIdx int, items []model.Item) int {
+	if len(items) == 0 {
+		return 0
+	}
+	n := 0
+	for _, conn := range wf.Connections[nodeName] {
+		if conn.SourceIndex != branchIdx {
+			continue
+		}
+		*queue = append(*queue, queueItem{nodeName: conn.TargetName, input: model.NodeOutput{items}})
+		n++
+	}
+	return n
+}
+
+// maxRetryBackoff caps exponential backoff between a node's own retry
+// attempts so a misconfigured/very large WaitBetweenTriesMs (or a
+// high MaxTries) can never stall a run for an unreasonable time.
+const maxRetryBackoff = 30 * time.Second
+
+// retryBackoff computes the wait before retry attempt (a+1), given the
+// node's configured base wait in milliseconds. It doubles per attempt
+// (1x, 2x, 4x, ...) so a run of transient 429/5xx errors backs off
+// instead of hammering the same failing endpoint on a fixed interval,
+// capped at maxRetryBackoff. baseMs<=0 falls back to a 1s base (the
+// parser already defaults WaitBetweenTriesMs to 1000 when unset, so
+// this is just a defensive floor for callers that construct a Node
+// directly, e.g. in tests).
+func retryBackoff(baseMs int, attempt int) time.Duration {
+	if baseMs <= 0 {
+		baseMs = 1000
+	}
+	base := time.Duration(baseMs) * time.Millisecond
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 10 { // guard against overflow from a runaway attempt count
+		shift = 10
+	}
+	wait := base << shift
+	if wait > maxRetryBackoff || wait <= 0 {
+		wait = maxRetryBackoff
+	}
+	return wait
 }
