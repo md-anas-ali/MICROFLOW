@@ -268,7 +268,10 @@
           "name": "Google Sheets account"
         }
       },
-      "onError": "continueRegularOutput"
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "continueOnFail": false
     },
     {
       "parameters": {
