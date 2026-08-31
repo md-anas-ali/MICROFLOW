@@ -96,6 +96,12 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 		Credentials: r.Credentials,
 		ScratchDir:  scratchDir,
 		MemGuard:    r.MemGuard,
+		// Seeded fresh per run from the current process environment (not
+		// cached on Runner) so a rotated secret takes effect immediately
+		// and every run's redaction reflects the credentials actually in
+		// use for it. Never touches the live values node executors use --
+		// see RunContext.Redactor's doc comment.
+		Redactor: engine.NewSecretRedactorFromEnv(),
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
