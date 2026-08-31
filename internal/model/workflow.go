@@ -52,6 +52,15 @@ type Node struct {
 	MaxTries           int  `json:"maxTries"`
 	WaitBetweenTriesMs int  `json:"waitBetweenTriesMs"`
 	ContinueOnFail     bool `json:"continueOnFail"`
+	// OnErrorMode preserves n8n's raw onError setting ("continueRegularOutput"
+	// | "continueErrorOutput" | "stopWorkflow" | ""), distinct from the
+	// derived ContinueOnFail bool above. The engine needs the original
+	// mode (not just "continue or not") to know whether a failed node's
+	// error item should flow out on the normal output (continueRegularOutput,
+	// mixed in with regular items) or on the dedicated second/error output
+	// branch (continueErrorOutput, output index 1) -- these are genuinely
+	// different n8n behaviors that collapsing to one bool would lose.
+	OnErrorMode string `json:"onErrorMode"`
 }
 
 // Connection is a directed edge between two nodes, matching n8n's
