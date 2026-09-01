@@ -185,6 +185,30 @@ func (s *Store) SaveExecution(ctx context.Context, ex *model.Execution) error {
 	return err
 }
 
+// GetExecution loads one persisted execution by id -- the durable
+// fallback GET /api/executions/{id} uses once an async run's in-memory
+// record has been evicted from internal/runner.Manager (process
+// restart, or simply old enough to have rolled off the in-memory
+// cache). Returns the same *model.Execution shape SaveExecution wrote,
+// node_runs included (already capped at maxNodeRuns by SaveExecution).
+func (s *Store) GetExecution(ctx context.Context, id string) (*model.Execution, error) {
+	var ex model.Execution
+	var nodeRunsJSON []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, workflow_id, mode, status, started_at, finished_at, error, node_runs
+		FROM executions WHERE id=$1
+	`, id).Scan(&ex.ID, &ex.WorkflowID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodeRunsJSON) > 0 {
+		if err := json.Unmarshal(nodeRunsJSON, &ex.NodeRuns); err != nil {
+			return nil, fmt.Errorf("store: decode node_runs for execution %q: %w", id, err)
+		}
+	}
+	return &ex, nil
+}
+
 // --- credentials (vault.Store) ---
 
 func (s *Store) GetEncrypted(ctx context.Context, workflowID, logicalName string) ([]byte, error) {
