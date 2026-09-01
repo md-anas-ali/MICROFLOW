@@ -1,6 +1,89 @@
 # MicroFlow — STATUS (read this first)
 
-## This pass: central Google credential + real workflow editor
+## This pass: async execution + live SSE progress (spec sections M/N)
+
+`POST /api/workflows/{id}/execute` used to block for the entire run
+(one HTTP request open the whole time, no way to cancel, no live
+progress). It now returns `202 {executionId, status:"queued"}`
+immediately, and the run proceeds on a bounded worker pool in the
+background.
+
+**New/changed:**
+
+- `internal/runner/async.go` (new): `Manager` — bounded concurrency
+  (`MICROFLOW_MAX_CONCURRENT_EXECUTIONS`, default 1) and a bounded
+  accepted-but-unfinished count (`MICROFLOW_MAX_QUEUED_EXECUTIONS`,
+  default 5) that rejects further work with `ErrQueueFull` once full,
+  rather than queuing without bound. `Runner.RunFromNode`'s internals
+  were split into a shared `runOnce` so Manager and the existing
+  synchronous scheduler/webhook paths use the identical
+  scratch-dir/engine/persist/cleanup logic — no duplicated run logic.
+- `internal/engine/engine.go`: added `RunContext.OnNodeRun`, fired
+  synchronously right after every `appendNodeRun` — the hook live
+  progress is built on. Also fixed a real bug found while wiring this
+  up: a node whose `Execute` failed because the *run's own context*
+  was cancelled/timed out was being reported as an ordinary
+  `StatusError`, not `StatusCancelled` — fixed so cancellation reports
+  the correct terminal state (and skips continueOnFail/onError, which
+  are for business-logic failures, not "the whole run stopped").
+- Bounded, non-blocking per-execution event broadcaster (drop-oldest
+  for a slow subscriber, small replay buffer for reconnects) feeding
+  `GET /api/executions/{id}/events` (SSE). Payloads are metadata only
+  (`NodeRunResult`, never raw media).
+- New endpoints: `GET /api/executions/{id}` (Manager's in-memory
+  record, falling back to a new `Store.GetExecution` once evicted from
+  memory after 10 minutes), `POST /api/executions/{id}/cancel`.
+- `internal/api/server.go`: `Server.WithAsync(mgr, execLoader)` opts a
+  server into the new behavior; a server built with plain `New()`
+  (every existing test) keeps the old synchronous `/execute` response
+  unchanged — `execute_test.go` passes untouched.
+- `cmd/server/static/app.js`: `executeCurrentWorkflow` now POSTs, gets
+  `executionId` back, and follows the run via `EventSource` instead of
+  one long-lived fetch; the exec panel updates live per node instead of
+  once at the end.
+
+**Verified this pass** (this sandbox does have a working Go toolchain
+after all — `apt-get install golang-go` plus `GOPROXY=direct
+GOSUMDB=off` to fetch modules straight from `github.com`, bypassing the
+blocked `proxy.golang.org` — contradicts what earlier passes of this
+file said; that was accurate for those sessions, not this constraint):
+
+```
+go build ./...                          # clean
+go vet ./...                            # clean
+gofmt -l .                              # clean (excluding third_party/)
+go test ./...                           # all packages pass
+go test ./... -race                     # clean, repeated 5x on internal/runner+internal/api
+```
+
+New test coverage: `internal/runner/async_test.go` (7 tests — start
+returns before completion, queued→running→success transition, queue-
+full backpressure, cancel-while-queued, SSE subscribe delivers a
+terminal event then closes, unknown-execution handling) and
+`internal/api/async_execute_test.go` (6 tests — 202 response shape,
+GET reflecting live/finished state, cancel, cancel-unknown-id, a real
+SSE wire-format test that parses `data:` lines out of the raw response
+body, sync-fallback-unaffected). Frontend: `test/frontend/smoketest.js`
+extended with a fake `EventSource` and 6 new assertions covering the
+execute button → POST → SSE → terminal-state → panel/button-reset
+flow; 26/26 assertions pass.
+
+**Not done in this pass** (still open from the original spec):
+disk-backed execution-scoped scratch storage audit (section D — the
+scratch dir itself exists per-execution already; the "never share
+global media paths" sweep hasn't been done), the compatibility/
+conformance validator and harness (sections U/V), actual 512MB
+constrained-container memory testing (section R — no container/cgroup
+tooling attempted in this sandbox), and cancellation propagation *into*
+already-running `executeCommand` (FFmpeg/TTS) child processes wasn't
+specifically re-verified this pass — `Cancel()` reliably stops the
+engine loop and any node executor that itself watches `ctx.Done()`
+(confirmed by test), but whether every node executor actually does
+watch it predates this pass and wasn't re-audited here.
+
+---
+
+## Previous pass: central Google credential + real workflow editor
 
 Two features requested on top of the previous draft, both now implemented,
 built, vetted, tested, and (for the frontend) smoke-tested:
@@ -8,6 +91,7 @@ built, vetted, tested, and (for the frontend) smoke-tested:
 ### 1. Central Google credential ("log in once")
 
 Previously the only way to give a googleSheets/youTube/gmail node
+
 credentials was per-node, per-workflow (`cmd/setcred` or the editor's
 side-panel "Google Credentials" section). That still works unchanged,
 but now there's also a single central account:
