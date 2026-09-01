@@ -65,10 +65,41 @@ async function main() {
       ]);
     }
     if (u.indexOf("/api/google/disconnect/") === 0 && opts.method === "POST") return json({ status: "ok", service: u.split("/").pop() });
+    if (u === "/api/workflows/wf1/execute" || u.indexOf("/api/workflows/wf1/execute?") === 0) {
+      if (opts.method === "POST") return json({ executionId: "exec1", status: "queued" }, 202);
+    }
+    if (u === "/api/executions/exec1" && (!opts.method || opts.method === "GET")) {
+      return json({ id: "exec1", workflowId: "wf1", mode: "manual", status: "queued", startedAt: new Date().toISOString(), nodeRuns: [] });
+    }
     throw new Error("unmocked fetch: " + opts.method + " " + u);
   };
   window.alert = () => {};
   window.confirm = () => true; // auto-confirm destructive dialogs for this test
+
+  // Fake EventSource: app.js's followExecution() opens one against
+  // GET /api/executions/{id}/events (see internal/api's SSE endpoint)
+  // and drives the exec panel from .onmessage -- there's no real
+  // network/SSE parser to fake here, just the browser API surface
+  // app.js actually calls (constructor + .onmessage/.onerror + .close),
+  // with an .emit() helper this test uses to play events into it the
+  // same shape internal/api/server.go's writeSSEEvent JSON-encodes.
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.onmessage = null;
+      this.onerror = null;
+      this.closed = false;
+      FakeEventSource.instances.push(this);
+    }
+    close() {
+      this.closed = true;
+    }
+    emit(dataObj) {
+      if (this.onmessage) this.onmessage({ data: JSON.stringify(dataObj) });
+    }
+  }
+  FakeEventSource.instances = [];
+  window.EventSource = FakeEventSource;
 
   window.eval(appJs);
 
@@ -139,6 +170,34 @@ async function main() {
   doc.getElementById("btnSave").dispatchEvent(new window.Event("click", { bubbles: true }));
   await new Promise((r) => setTimeout(r, 20));
   ok("save round-tripped through the fake API without throwing", true);
+
+  // --- execute: async POST 202 + SSE-driven exec panel (spec sections
+  // M/N) -- proves executeCurrentWorkflow/followExecution in app.js
+  // actually wire up EventSource against the executionId the POST
+  // returns, and that a terminal event re-enables the button and shows
+  // the final status, without ever polling in a loop. ---
+  doc.getElementById("btnExecute").dispatchEvent(new window.Event("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  ok("execute button disabled while queued/running", doc.getElementById("btnExecute").disabled === true);
+  ok(
+    "execute POST opened an EventSource for the returned executionId",
+    FakeEventSource.instances.length === 1 && FakeEventSource.instances[0].url.indexOf("exec1") !== -1,
+  );
+  const es = FakeEventSource.instances[0];
+  es.emit({ type: "execution.started", executionId: "exec1", status: "running" });
+  es.emit({
+    type: "node.completed",
+    executionId: "exec1",
+    status: "success",
+    node: { nodeName: "A", status: "success", output: [[{ json: { ok: true } }]], durationMs: 1000000, attempt: 1 },
+  });
+  await new Promise((r) => setTimeout(r, 5));
+  ok("a node.completed event appends to the exec panel before the run finishes", doc.querySelectorAll(".node-run").length === 1);
+  es.emit({ type: "execution.completed", executionId: "exec1", status: "success" });
+  await new Promise((r) => setTimeout(r, 20));
+  ok("exec panel shows success status after the terminal SSE event", !!doc.querySelector(".status-pill.status-success"));
+  ok("execute button re-enabled after the terminal event", doc.getElementById("btnExecute").disabled === false);
+  ok("EventSource was closed after the terminal event", es.closed === true);
 
   // --- central credentials page ---
   window.location.hash = "#/credentials";
