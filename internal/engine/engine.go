@@ -85,12 +85,24 @@ type RunContext struct {
 	// displayed/logged is redacted. Nil is a safe no-op (a Runner that
 	// doesn't set one behaves exactly as before, just unredacted).
 	Redactor *SecretRedactor
+
+	// OnNodeRun, if set, is invoked synchronously with every
+	// NodeRunResult immediately after it's appended to
+	// Execution.NodeRuns -- the single hook point live-progress delivery
+	// (SSE) is built on. It MUST return quickly and MUST NOT block on
+	// I/O: a slow/blocked subscriber would otherwise stall the engine
+	// itself. internal/runner's async Manager wires this to a bounded,
+	// non-blocking per-execution broadcaster (drop-oldest under
+	// backpressure), never a direct network write. Nil is a safe no-op.
+	OnNodeRun func(model.NodeRunResult)
 }
 
 // appendNodeRun records one node's result, trimming the oldest entries
 // once nodeRunCap is exceeded (default 500, matching the store's
 // persisted-history cap) instead of growing rc.Execution.NodeRuns
-// without bound for the lifetime of a long-running execution.
+// without bound for the lifetime of a long-running execution. Also
+// fires OnNodeRun (if set) so live progress (SSE) reflects every node
+// transition, not just the terminal execution state.
 func (rc *RunContext) appendNodeRun(result model.NodeRunResult) {
 	limit := rc.nodeRunCap
 	if limit <= 0 {
@@ -99,6 +111,9 @@ func (rc *RunContext) appendNodeRun(result model.NodeRunResult) {
 	rc.Execution.NodeRuns = append(rc.Execution.NodeRuns, result)
 	if extra := len(rc.Execution.NodeRuns) - limit; extra > 0 {
 		rc.Execution.NodeRuns = rc.Execution.NodeRuns[extra:]
+	}
+	if rc.OnNodeRun != nil {
+		rc.OnNodeRun(result)
 	}
 }
 
@@ -248,6 +263,23 @@ runLoop:
 		}
 
 		if nodeErr != nil {
+			if ctx.Err() != nil {
+				// The node failed because the run itself was
+				// cancelled/timed out (its Execute call got ctx.Err()
+				// back), not because of an ordinary node-level error --
+				// report the correct terminal state instead of
+				// StatusError, and don't apply continueOnFail/onError
+				// (those are for real business-logic failures, not "the
+				// whole run stopped"). Rule H/P: cancellation must
+				// produce the correct terminal state, not be
+				// misreported.
+				result.Status = model.StatusCancelled
+				result.Error = rc.Redactor.RedactString(nodeErr.Error())
+				rc.appendNodeRun(result)
+				rc.Execution.Status = model.StatusCancelled
+				runErr = ctx.Err()
+				break runLoop
+			}
 			result.Status = model.StatusError
 			result.Error = rc.Redactor.RedactString(nodeErr.Error())
 			if node.ContinueOnFail {
