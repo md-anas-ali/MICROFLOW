@@ -67,7 +67,11 @@ func (r *Runner) WithMemGuard(g *engine.MemGuard) *Runner {
 // RunFromNode loads workflowID, starts execution at startNode with the
 // given mode ("manual" | "schedule" | "webhook" | "error") and seed
 // input, persists the resulting execution record (win or lose), and
-// cleans up the run's scratch directory afterward (rule 7/9).
+// cleans up the run's scratch directory afterward (rule 7/9). It
+// blocks until the run finishes -- the scheduler and webhook trigger
+// paths want exactly that. The async HTTP execute endpoint instead
+// uses Manager (async.go), which wraps runOnce directly so it can
+// return before the run completes.
 func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode string, seed model.NodeOutput) (*model.Execution, error) {
 	wf, err := r.Workflows.LoadWorkflow(ctx, workflowID)
 	if err != nil {
@@ -76,8 +80,20 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	if _, ok := wf.Nodes[startNode]; !ok {
 		return nil, fmt.Errorf("runner: workflow %q has no node named %q", workflowID, startNode)
 	}
+	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
+	defer cancel()
+	return r.runOnce(runCtx, wf, newID(), startNode, mode, seed, nil)
+}
 
-	execID := newID()
+// runOnce is the single place that actually builds a RunContext, calls
+// engine.Run, persists the result, and cleans up scratch -- shared by
+// the synchronous RunFromNode above and the async Manager (async.go).
+// execID is supplied by the caller (Manager pre-allocates it so it can
+// hand the id back to the HTTP client before the run starts).
+// onNodeRun, if non-nil, is wired to RunContext.OnNodeRun for live
+// per-node progress (SSE); RunFromNode's callers (scheduler/webhook)
+// don't need it and pass nil.
+func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, onNodeRun func(model.NodeRunResult)) (*model.Execution, error) {
 	scratchDir := filepath.Join(r.ScratchRoot, execID)
 	// Bug fix: this per-execution directory was never actually created --
 	// it was only ever used as exec.Cmd.Dir for executeCommand nodes
@@ -101,13 +117,11 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 		// and every run's redaction reflects the credentials actually in
 		// use for it. Never touches the live values node executors use --
 		// see RunContext.Redactor's doc comment.
-		Redactor: engine.NewSecretRedactorFromEnv(),
+		Redactor:  engine.NewSecretRedactorFromEnv(),
+		OnNodeRun: onNodeRun,
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
-	defer cancel()
-
-	ex, runErr := r.Engine.Run(runCtx, rc, startNode, seed)
+	ex, runErr := r.Engine.Run(ctx, rc, startNode, seed)
 
 	// Always persist, even on failure -- the execution panel/history
 	// needs the error/status either way (rule: execution panel shows
