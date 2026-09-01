@@ -156,12 +156,31 @@ func main() {
 	defer close(stopGuard)
 
 	run := runner.New(st, st, eng, st, creds, scratchRoot).WithMemGuard(memGuard)
+
+	// Async execution (spec sections M/N): bounded worker pool on top
+	// of the same Runner -- MaxConcurrentExecutions caps simultaneous
+	// full workflow runs (independent of, and in addition to,
+	// Engine.MaxConcurrentHeavy's per-run FFmpeg/TTS/HTTP cap);
+	// MaxQueuedExecutions bounds accepted-but-not-yet-finished runs
+	// before POST .../execute starts replying 429 instead of queuing
+	// unboundedly (rule 19). Defaults are deliberately conservative for
+	// a 512MB target -- this workflow's heavy nodes (FFmpeg/TTS/image)
+	// are memory-hungry per run, so "bounded worker pool" here means
+	// small numbers, not a typical web-request worker count.
+	execManager := runner.NewManager(run,
+		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
+		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 5),
+	)
+
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
 	// (not the OAuthResolver) is passed so per-node credential writes go
 	// through the same Put path cmd/setcred uses -- no token refresh
 	// needed just to save a credential. accountVault is the central
-	// Google account store backing /api/credentials/google.
-	apiServer := api.New(st, run, st, baseVault, accountVault)
+	// Google account store backing /api/credentials/google. st also
+	// satisfies api.ExecutionLoader (GetExecution) -- the durable
+	// fallback for GET /api/executions/{id} once execManager evicts a
+	// finished execution from memory.
+	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st)
 
 	// "Connect with Google" (n8n-style OAuth Authorization Code flow)
 	// only turns on if a Google Cloud OAuth client is configured -- see
