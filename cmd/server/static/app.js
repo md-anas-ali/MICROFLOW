@@ -5,7 +5,10 @@
 //   POST   /api/workflows/{id}/save
 //   GET    /api/workflows/{id}
 //   GET    /api/workflows/{id}/export
-//   POST   /api/workflows/{id}/execute?startNode=...
+//   POST   /api/workflows/{id}/execute?startNode=...  (async: 202 {executionId,status:"queued"})
+//   GET    /api/executions/{id}                        (current snapshot; durable-store fallback)
+//   POST   /api/executions/{id}/cancel
+//   GET    /api/executions/{id}/events                 (SSE; see followExecution below)
 //   GET    /api/workflows/{id}/credentials
 //   POST   /api/workflows/{id}/credentials
 //   GET    /api/credentials/google              (legacy manual-paste, kept for back-compat)
@@ -14,9 +17,9 @@
 //   GET    /api/google/connections               (n8n-style Connect: per-service status)
 //   GET    /api/google/connect/{service}          (n8n-style Connect: starts OAuth, browser nav)
 //   POST   /api/google/disconnect/{service}       (n8n-style Connect: disconnect one service)
-// No execution-history endpoint exists server-side, so execution
-// results are only ever what the most recent POST .../execute call
-// returned — there is nothing to page through.
+// Still no execution-*history* endpoint (list of past runs) -- only
+// the single execution a POST .../execute call started, followed live
+// via SSE and re-fetchable by id from GET /api/executions/{id}.
 //
 // Credentials, three scopes (see internal/vault/central.go and
 // internal/api/google_connect.go):
@@ -1289,42 +1292,116 @@
   // bounded by the same 30-minute ceiling the backend already enforces
   // (internal/runner.Runner.Timeout, "rule 22: nothing unbounded") plus
   // a small buffer, so the button can never get stuck again.
-  const EXECUTE_TIMEOUT_MS = 31 * 60 * 1000;
-
+  // executeCurrentWorkflow: POST .../execute now returns immediately
+  // (202 {executionId, status:"queued"} -- see api.handleExecuteAsync)
+  // instead of blocking for the whole run, so there is no long-lived
+  // fetch to time out here any more. followExecution below drives the
+  // panel from there via SSE (spec section N: SSE is primary progress,
+  // not polling).
   async function executeCurrentWorkflow() {
     const btn = document.getElementById("btnExecute");
     const startNode = document.getElementById("startNodeSelect").value;
     btn.disabled = true;
     btn.textContent = "Running\u2026";
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), EXECUTE_TIMEOUT_MS);
     try {
       const q = startNode ? "?startNode=" + encodeURIComponent(startNode) : "";
-      const ex = await apiJSON("/api/workflows/" + encodeURIComponent(editorState.workflow.id) + "/execute" + q, {
+      const accepted = await apiJSON("/api/workflows/" + encodeURIComponent(editorState.workflow.id) + "/execute" + q, {
         method: "POST",
-        signal: controller.signal,
       });
-      // A 2xx response should always carry a real execution object now
-      // that the backend never sends `null` on success (see
-      // handleExecute), but guard anyway so a malformed/empty response
-      // shows a clear toast instead of throwing inside renderExecPanel.
-      if (!ex || typeof ex.status !== "string") {
+      if (!accepted || typeof accepted.executionId !== "string") {
         throw new Error("Server returned an unexpected response for this execution.");
       }
-      editorState.lastExecution = ex;
-      drawCanvas();
-      renderExecPanel(ex);
-      toast("Execution " + ex.status, ex.status === "error" ? "error" : "success");
+      await followExecution(accepted.executionId, btn);
     } catch (e) {
-      const msg = e.name === "AbortError"
-        ? "Execute timed out or the connection was lost. The workflow may still be running on the server \u2014 check back shortly."
-        : "Execute failed: " + e.message;
-      toast(msg, "error");
-    } finally {
-      clearTimeout(timeoutId);
+      toast("Execute failed: " + e.message, "error");
       btn.disabled = false;
       btn.textContent = "\u25B6 Execute";
     }
+  }
+
+  // followExecution subscribes to GET /api/executions/{id}/events (SSE)
+  // and updates the exec panel live as node.completed/node.failed
+  // events arrive -- see internal/api's handleExecutionEvents. Does one
+  // GET .../executions/{id} up front so the panel starts from a real
+  // snapshot even if the run raced ahead of this call, and one more if
+  // the stream drops before a terminal event (the run itself is
+  // unaffected by that -- section M/W: "Client disconnect MUST NOT
+  // cancel the workflow automatically"). Resolves once the execution
+  // reaches a terminal state or the stream can't be followed at all.
+  function followExecution(execID, btn) {
+    return new Promise((resolve) => {
+      let ex = null;
+      let settled = false;
+
+      function finish() {
+        if (settled) return;
+        settled = true;
+        btn.disabled = false;
+        btn.textContent = "\u25B6 Execute";
+        resolve();
+      }
+
+      function refreshSnapshot() {
+        return apiJSON("/api/executions/" + encodeURIComponent(execID))
+          .then((snapshot) => {
+            ex = snapshot;
+            editorState.lastExecution = ex;
+            drawCanvas();
+            renderExecPanel(ex);
+          })
+          .catch(() => {});
+      }
+
+      refreshSnapshot();
+
+      var es;
+      try {
+        es = new EventSource("/api/executions/" + encodeURIComponent(execID) + "/events");
+      } catch (e) {
+        finish();
+        return;
+      }
+
+      var TERMINAL_TYPES = {
+        "execution.completed": true,
+        "execution.failed": true,
+        "execution.cancelled": true,
+      };
+
+      es.onmessage = function (msg) {
+        var ev;
+        try {
+          ev = JSON.parse(msg.data);
+        } catch (e) {
+          return;
+        }
+        if (!ex) {
+          ex = { status: "queued", mode: "manual", nodeRuns: [], startedAt: new Date().toISOString() };
+        }
+        if (ev.status) ex.status = ev.status;
+        if (ev.error) ex.error = ev.error;
+        if (ev.node) ex.nodeRuns = (ex.nodeRuns || []).concat([ev.node]);
+        editorState.lastExecution = ex;
+        drawCanvas();
+        renderExecPanel(ex);
+
+        if (TERMINAL_TYPES[ev.type]) {
+          toast("Execution " + ex.status, ex.status === "error" ? "error" : "success");
+          es.close();
+          finish();
+        }
+      };
+
+      es.onerror = function () {
+        // The stream dropped (network blip, idle proxy, browser tab
+        // backgrounded, etc.). Don't retry indefinitely -- one final
+        // snapshot read is enough to un-stick the panel; the person can
+        // re-open the workflow to pick the live stream back up, and the
+        // run itself keeps going server-side either way.
+        es.close();
+        refreshSnapshot().then(finish);
+      };
+    });
   }
 
   function renderExecPanel(ex) {
