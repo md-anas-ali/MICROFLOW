@@ -34,6 +34,15 @@ type CredentialStore interface {
 	ListCredentials(ctx context.Context, workflowID string) ([]store.CredentialInfo, error)
 }
 
+// ExecutionLoader is the durable fallback GET /api/executions/{id}
+// uses once an async execution's in-memory record (in *runner.Manager)
+// has been evicted or was never async in the first place (scheduler/
+// webhook runs still go through the synchronous Runner.RunFromNode
+// path and are only ever visible here). *store.Store satisfies this.
+type ExecutionLoader interface {
+	GetExecution(ctx context.Context, id string) (*model.Execution, error)
+}
+
 type Server struct {
 	mux         *http.ServeMux
 	workflows   WorkflowStore
@@ -55,6 +64,29 @@ type Server struct {
 	// credential paste endpoints above are unaffected either way.
 	googleOAuth    *vault.GoogleOAuthApp
 	googleAccounts *vault.GoogleServiceAccounts
+
+	// manager and execLoader back the async execute/executions/events
+	// endpoints (handleExecuteAsync, handleGetExecution,
+	// handleCancelExecution, handleExecutionEvents). Both nil-safe by
+	// design, same pattern as accounts above: a Server built with plain
+	// New() (every existing test helper) keeps the old synchronous
+	// /execute behavior and 501s the new endpoints, rather than
+	// panicking. Call WithAsync to enable them.
+	manager    *runner.Manager
+	execLoader ExecutionLoader
+}
+
+// WithAsync enables the async execute/executions/events endpoints:
+// mgr is the bounded worker-pool Manager handleExecuteAsync starts
+// runs on; execs is the durable fallback handleGetExecution reads from
+// once Manager evicts a finished execution's in-memory record. Returns
+// s for chaining, mirroring runner.Runner.WithMemGuard's pattern.
+// Both must be non-nil for the async endpoints to actually activate --
+// passing a nil mgr is a no-op (existing sync behavior keeps working).
+func (s *Server) WithAsync(mgr *runner.Manager, execs ExecutionLoader) *Server {
+	s.manager = mgr
+	s.execLoader = execs
+	return s
 }
 
 // New wires the API to the shared runner/store/vault -- the exact same
@@ -78,6 +110,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/workflows/{id}", s.handleGet)
 	s.mux.HandleFunc("GET /api/workflows/{id}/export", s.handleExport)
 	s.mux.HandleFunc("POST /api/workflows/{id}/execute", s.handleExecute)
+
+	// Async execution follow-up endpoints (spec sections M/N). Always
+	// registered; each handler 501s cleanly if WithAsync was never
+	// called, rather than the route simply not existing (see manager's
+	// doc comment above).
+	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
+	s.mux.HandleFunc("POST /api/executions/{id}/cancel", s.handleCancelExecution)
+	s.mux.HandleFunc("GET /api/executions/{id}/events", s.handleExecutionEvents)
+
 	s.mux.HandleFunc("GET /api/workflows/{id}/credentials", s.handleListCredentials)
 	s.mux.HandleFunc("POST /api/workflows/{id}/credentials", s.handleSaveCredential)
 
@@ -174,10 +215,54 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(raw)
 }
 
-// handleExecute runs a workflow manually via the shared runner (the
-// exact same path the scheduler and webhook server use), starting from
-// the given node (default: the first trigger found).
+// handleExecute starts a workflow run and returns immediately (spec
+// section M: "The HTTP request MUST NEVER wait for workflow
+// completion"). If the server was wired with WithAsync, it enqueues
+// the run on the bounded Manager and replies 202 with
+// {executionId, status:"queued"}; progress is then followed via
+// GET /api/executions/{id} or the SSE stream at
+// GET /api/executions/{id}/events. A server not wired with WithAsync
+// (e.g. an older test helper -- see execute_test.go) falls back to the
+// previous synchronous behavior unchanged, so existing callers/tests
+// are unaffected.
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	if s.manager != nil {
+		s.handleExecuteAsync(w, r)
+		return
+	}
+	s.handleExecuteSync(w, r)
+}
+
+type executeAcceptedResponse struct {
+	ExecutionID string `json:"executionId"`
+	Status      string `json:"status"`
+}
+
+func (s *Server) handleExecuteAsync(w http.ResponseWriter, r *http.Request) {
+	wfID := r.PathValue("id")
+	startNode := r.URL.Query().Get("startNode")
+	seed := model.NodeOutput{{{JSON: map[string]any{}}}}
+
+	execID, err := s.manager.Start(r.Context(), wfID, startNode, "manual", seed)
+	if err != nil {
+		if errors.Is(err, runner.ErrQueueFull) {
+			// 429: bounded backpressure, not an unbounded queue (rule 19).
+			writeErr(w, http.StatusTooManyRequests, err)
+			return
+		}
+		// Everything else Manager.Start can return (workflow not found,
+		// no trigger/startNode, unknown startNode) is a client error
+		// about this specific request, not a server failure.
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, executeAcceptedResponse{ExecutionID: execID, Status: string(model.StatusQueued)})
+}
+
+// handleExecuteSync is the original (pre-async) behavior: runs the
+// workflow via the shared runner and blocks until it finishes. Kept as
+// the fallback for a Server not wired with WithAsync.
+func (s *Server) handleExecuteSync(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.workflows.LoadWorkflow(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
@@ -212,6 +297,139 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ex)
+}
+
+// handleGetExecution returns the current state of one execution: the
+// live in-memory record from Manager while it's queued/running/newly
+// finished, falling back to the durable store once Manager has evicted
+// it (see runner.finishedRetention) or for executions that were never
+// started through this Manager at all (scheduler/webhook runs).
+func (s *Server) handleGetExecution(w http.ResponseWriter, r *http.Request) {
+	execID := r.PathValue("id")
+	if s.manager != nil {
+		if ex, ok := s.manager.Get(execID); ok {
+			writeJSON(w, http.StatusOK, ex)
+			return
+		}
+	}
+	if s.execLoader == nil {
+		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
+		return
+	}
+	ex, err := s.execLoader.GetExecution(r.Context(), execID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, ex)
+}
+
+// handleCancelExecution requests cancellation of a queued or running
+// execution. Only meaningful for async executions (a synchronous
+// RunFromNode call has no separate cancel handle); returns 404 if the
+// Manager has no live record (already finished, or never async).
+func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("async execution is not enabled on this server"))
+		return
+	}
+	execID := r.PathValue("id")
+	if err := s.manager.Cancel(execID); err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelling"})
+}
+
+// writeSSEEvent writes one event as a plain default-"message" SSE
+// frame (id + data only, deliberately no `event:` line): the frontend
+// listens with a single EventSource.onmessage handler and reads
+// ev.type from the decoded JSON payload itself, rather than needing a
+// named addEventListener per runner.EventType. `data` is the
+// JSON-encoded runner.Event -- metadata/NodeRunResult only, never raw
+// media (see runner.Event's doc comment).
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, seq int, ev runner.Event) error {
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", seq, payload); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+// handleExecutionEvents streams live progress for one execution over
+// SSE (spec section N). Replays a small bounded backlog first (so a
+// client connecting a moment late still sees execution.created/early
+// node events), then forwards new events as Manager's broadcaster
+// publishes them, until the execution reaches a terminal state (the
+// broadcaster closes the channel) or the client disconnects (request
+// context cancelled). Payloads are metadata-only NodeRunResult
+// snapshots -- never raw media (rule: "NEVER send video/audio/image/
+// binary data through SSE"); the per-client channel is bounded
+// (runner.subscriberBufSize) so a slow client cannot grow server
+// memory (rule 10).
+func (s *Server) handleExecutionEvents(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("async execution is not enabled on this server"))
+		return
+	}
+	execID := r.PathValue("id")
+	events, replay, unsubscribe, ok := s.manager.Subscribe(execID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, errors.New("execution not found or already finished"))
+		return
+	}
+	defer unsubscribe()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	seq := 0
+	for _, ev := range replay {
+		if err := writeSSEEvent(w, flusher, seq, ev); err != nil {
+			return
+		}
+		seq++
+	}
+
+	ctx := r.Context()
+	// keepAlive prevents idle proxies/load balancers from closing a
+	// long Wait node's connection; it's a comment, not a payload, so it
+	// never counts as an "event" a client needs to parse.
+	keepAlive := time.NewTicker(25 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, chOK := <-events:
+			if !chOK {
+				return // broadcaster closed: execution reached a terminal state
+			}
+			if err := writeSSEEvent(w, flusher, seq, ev); err != nil {
+				return
+			}
+			seq++
+		}
+	}
 }
 
 // credentialNodeTypes are exactly the node types
