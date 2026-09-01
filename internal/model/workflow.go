@@ -128,6 +128,11 @@ type NodeOutput [][]Item
 type ExecutionStatus string
 
 const (
+	// StatusQueued is the initial state of an async execution: accepted
+	// by the API and persisted, but not yet picked up by a worker. Only
+	// used by the async execute path (internal/runner.Manager); Engine.Run
+	// itself moves a run straight to StatusRunning.
+	StatusQueued    ExecutionStatus = "queued"
 	StatusRunning   ExecutionStatus = "running"
 	StatusSuccess   ExecutionStatus = "success"
 	StatusError     ExecutionStatus = "error"
