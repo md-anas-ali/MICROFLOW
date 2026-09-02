@@ -95,3 +95,34 @@ func TestParseRejectsInvalidJSON(t *testing.T) {
 		t.Fatal("expected error for invalid json, got nil")
 	}
 }
+
+func TestParseAssignsIDWhenMissing(t *testing.T) {
+	raw := []byte(`{"name":"Imported workflow","nodes":[{"id":"n1","name":"Start","type":"n8n-nodes-base.manualTrigger"}],"connections":{}}`)
+	result, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if result.Workflow.ID == "" {
+		t.Fatal("expected parser to assign an ID when export has no top-level id")
+	}
+	if len(result.Workflow.ID) != 36 {
+		t.Fatalf("got workflow ID %q, want UUID-shaped 36-character ID", result.Workflow.ID)
+	}
+	if result.Workflow.ID[14] != '4' {
+		t.Fatalf("got workflow ID %q, want UUIDv4", result.Workflow.ID)
+	}
+	if result.Workflow.ID[19] != '8' && result.Workflow.ID[19] != '9' && result.Workflow.ID[19] != 'a' && result.Workflow.ID[19] != 'b' {
+		t.Fatalf("got workflow ID %q, want UUID variant", result.Workflow.ID)
+	}
+}
+
+func TestParseKeepsExplicitID(t *testing.T) {
+	raw := []byte(`{"id":"existing-id","name":"Imported workflow","nodes":[{"id":"n1","name":"Start","type":"n8n-nodes-base.manualTrigger"}],"connections":{}}`)
+	result, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if result.Workflow.ID != "existing-id" {
+		t.Fatalf("got workflow ID %q, want %q", result.Workflow.ID, "existing-id")
+	}
+}
