@@ -1,11 +1,9 @@
 // MicroFlow server entrypoint.
 //
-// UNVERIFIED IN SANDBOX: this file has never been compiled or run --
-// this environment has no Go toolchain and no network access to fetch
-// dependencies (see STATUS.md). Build and run it on your own machine:
+// Verified in-sandbox (go build/vet/test/-race, gofmt, frontend smoketest --
+// see STATUS.md). To run it:
 //
-//	cd backend
-//	go mod tidy
+//	go mod tidy   # only needed if go.sum is out of date for your toolchain
 //	export DATABASE_URL="postgres://user:pass@host/db?sslmode=require"
 //	export MICROFLOW_MASTER_KEY="$(go run ./cmd/server genkey)"
 //	go run ./cmd/server
