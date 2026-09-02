@@ -288,6 +288,22 @@ func (s *syncRecorder) contentType() string {
 	return s.rec.Header().Get("Content-Type")
 }
 
+func TestHandleCancelExecutionAlreadyFinishedIsIdempotent(t *testing.T) {
+	s, _ := newAsyncTestServer(t, map[model.NodeType]engine.NodeExecutor{model.TypeManualTrigger: instantExecutor{}}, 1, 1)
+	loader := &fakeExecLoader{execs: map[string]*model.Execution{
+		"done-1": {ID: "done-1", WorkflowID: "wf1", Mode: "manual", Status: model.StatusSuccess, StartedAt: time.Now()},
+	}}
+	s.execLoader = loader
+
+	req := httptest.NewRequest(http.MethodPost, "/api/executions/done-1/cancel", nil)
+	req.SetPathValue("id", "done-1")
+	rec := httptest.NewRecorder()
+	s.handleCancelExecution(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for already-finished execution, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleExecutionEventsStreamsToTerminalEvent(t *testing.T) {
 	s, _ := newAsyncTestServer(t, map[model.NodeType]engine.NodeExecutor{model.TypeManualTrigger: instantExecutor{}}, 2, 5)
 

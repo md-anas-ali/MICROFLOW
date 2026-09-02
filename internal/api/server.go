@@ -449,6 +449,22 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 	}
 	execID := r.PathValue("id")
 	if err := s.manager.Cancel(execID); err != nil {
+		// The in-memory manager only owns live executions. If the record
+		// disappeared between the UI refresh and this click, consult the
+		// durable execution row so a race with normal completion is not
+		// shown as a misleading "execution not found" failure.
+		if errors.Is(err, runner.ErrExecutionNotFound) && s.execLoader != nil {
+			if ex, loadErr := s.execLoader.GetExecution(r.Context(), execID); loadErr == nil && ex != nil {
+				switch ex.Status {
+				case model.StatusSuccess, model.StatusError, model.StatusCancelled:
+					writeJSON(w, http.StatusOK, map[string]string{"status": string(ex.Status)})
+					return
+				default:
+					writeErr(w, http.StatusConflict, errors.New("execution is no longer live on this server and cannot be cancelled"))
+					return
+				}
+			}
+		}
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
