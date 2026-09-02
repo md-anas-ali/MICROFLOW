@@ -126,3 +126,48 @@ func TestHandleExecuteScratchDirFailureReturnsProperError(t *testing.T) {
 		t.Fatalf("expected no execution to be persisted when the run never started, got %d", len(execs.saved))
 	}
 }
+
+// TestExecuteRouteMethodRegression is a routing-level regression test
+// (mission section 4/17): the Execute endpoint is registered as
+// `POST /api/workflows/{id}/execute` on the real *http.ServeMux built
+// by New()/routes() -- not just called directly like the tests above.
+// It locks in that GET (and any other non-POST method) on the exact
+// same path correctly gets Go 1.22 ServeMux's built-in 405
+// MethodNotAllowed, POST on that path is routed to the real handler
+// (200, not 404/405), and a neighboring but distinct path/method
+// combination is not accidentally matched by the same pattern.
+func TestExecuteRouteMethodRegression(t *testing.T) {
+	wfStore := &fakeWorkflowStore{workflows: map[string]*model.Workflow{"wf1": testWorkflow()}}
+	eng := engine.New(map[model.NodeType]engine.NodeExecutor{})
+	execs := &fakeExecSaver{}
+	run := runner.New(wfStore, execs, eng, fakeStaticData{}, fakeCreds{}, t.TempDir())
+	s := New(wfStore, run, nil, nil, nil)
+	handler := s.Handler()
+
+	t.Run("GET on execute path is 405, not 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/workflows/wf1/execute", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET /api/workflows/wf1/execute: got %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+	})
+
+	t.Run("POST on execute path is routed and succeeds", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/workflows/wf1/execute", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /api/workflows/wf1/execute: got %d, want 200, body: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("trailing slash does not silently match", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/workflows/wf1/execute/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			t.Fatalf("POST with trailing slash unexpectedly matched the execute route (got 200)")
+		}
+	})
+}
