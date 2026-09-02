@@ -128,9 +128,30 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 			}
 		}
 
-		result := map[string]any{
-			"statusCode": resp.StatusCode,
-			"headers":    flattenHeader(resp.Header),
+		// n8n's httpRequest node (default "Response Format: JSON", no
+		// "Full Response" option enabled -- confirmed true for every
+		// httpRequest node in the reference workflow, see
+		// STATUS.md/verification notes) puts the parsed JSON body
+		// directly on the output item: $json.candidates, $json.choices,
+		// $json.error, etc. -- NOT nested under a $json.json wrapper.
+		// This node previously always wrapped as
+		// {statusCode, headers, json: <body>}, which silently broke
+		// every downstream Code node that reads the body's fields
+		// directly off $json (e.g. Validate Attempt's
+		// `$json?.candidates?.[0]?...`) -- the response always looked
+		// empty/invalid to them, so a workflow's own AI-provider retry
+		// loop (Model Controller -> Unified AI Request -> Validate
+		// Attempt -> Loop Router -> Loop Wait) span forever cycling
+		// through every model without ever succeeding, discovered by
+		// actually running this exact workflow through the engine.
+		// fullResponse opts back into the old wrapped shape, matching
+		// n8n's real "Full Response" option (Options > Response >
+		// Full Response), for any node that explicitly asks for it.
+		fullResponse := wantsFullResponse(node)
+		result := map[string]any{}
+		if fullResponse {
+			result["statusCode"] = resp.StatusCode
+			result["headers"] = flattenHeader(resp.Header)
 		}
 		ct := resp.Header.Get("Content-Type")
 
@@ -164,8 +185,22 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 
 		if strings.Contains(ct, "application/json") {
 			// best-effort JSON decode; fall back to raw body on failure
-			if m, err := decodeJSONLoose(respBody); err == nil {
-				result["json"] = m
+			if decoded, err := decodeJSONLoose(respBody); err == nil {
+				if fullResponse {
+					result["body"] = decoded
+				} else if m, ok := decoded.(map[string]any); ok {
+					// Object bodies (the overwhelming common case --
+					// every AI provider/REST API response here) merge
+					// directly onto the item, matching n8n's default.
+					for k, v := range m {
+						result[k] = v
+					}
+				} else {
+					// A bare JSON array/string/number can't be merged
+					// as top-level fields; n8n itself wraps these under
+					// a synthetic key in this situation.
+					result["data"] = decoded
+				}
 			} else {
 				result["body"] = string(respBody)
 			}
@@ -233,6 +268,33 @@ func flattenHeader(h http.Header) map[string]any {
 		}
 	}
 	return m
+}
+
+// wantsFullResponse reports whether the node's options ask for n8n's
+// "Full Response" behavior (Options > Response > Full Response),
+// i.e. { statusCode, headers, body } instead of the parsed body
+// merged directly onto the item. Supports both the nested v4 shape
+// n8n currently writes (options.response.response.fullResponse) and
+// the flatter options.fullResponse some exports/older versions use.
+func wantsFullResponse(node *model.Node) bool {
+	opts, _ := node.Parameters["options"].(map[string]any)
+	if opts == nil {
+		return false
+	}
+	if b, ok := opts["fullResponse"].(bool); ok {
+		return b
+	}
+	if respOpt, ok := opts["response"].(map[string]any); ok {
+		if inner, ok := respOpt["response"].(map[string]any); ok {
+			if b, ok := inner["fullResponse"].(bool); ok {
+				return b
+			}
+		}
+		if b, ok := respOpt["fullResponse"].(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 func decodeJSONLoose(b []byte) (any, error) {

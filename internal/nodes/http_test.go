@@ -36,10 +36,12 @@ func testRunContext() *engine.RunContext {
 // opt in via RetryOnFail (the existing AI-request-loop nodes -- Unified
 // AI Request, Fact AI Request, Semantic AI Request, QC AI Request --
 // none of which set RetryOnFail today) must keep succeeding on every
-// status code exactly as before, with the JSON body decoded into the
-// output regardless of status, so their own body-inspection retry-loop
-// design (Validate Attempt et al.) is completely unaffected by this
-// change.
+// status code exactly as before, with the JSON body's fields merged
+// directly onto the output item (matching n8n's actual default
+// behavior -- no options.response.response.fullResponse set), so their
+// own body-inspection retry-loop design (Validate Attempt et al., which
+// reads $json.error.message / $json.candidates directly, not
+// $json.json.error) is completely unaffected by this change.
 func TestHTTPRequestNoRetryOnFailNeverErrorsOnStatus(t *testing.T) {
 	allowLoopbackInTest(t)
 	for _, status := range []int{200, 400, 401, 403, 429, 500, 503} {
@@ -60,8 +62,12 @@ func TestHTTPRequestNoRetryOnFailNeverErrorsOnStatus(t *testing.T) {
 		if len(out) == 0 || len(out[0]) == 0 {
 			t.Fatalf("status %d: expected an output item", status)
 		}
-		if out[0][0].JSON["statusCode"] != status {
-			t.Errorf("status %d: statusCode in output = %v", status, out[0][0].JSON["statusCode"])
+		errObj, ok := out[0][0].JSON["error"].(map[string]any)
+		if !ok || errObj["message"] != "denied" {
+			t.Errorf("status %d: expected $json.error.message == \"denied\" (n8n's default unwrapped shape), got JSON = %#v", status, out[0][0].JSON)
+		}
+		if _, present := out[0][0].JSON["statusCode"]; present {
+			t.Errorf("status %d: statusCode should not be present unless the node requests Full Response", status)
 		}
 	}
 }
