@@ -2,8 +2,7 @@
 //
 // For details about the project, see:
 //
-//     http://labix.org/gocheck
-//
+//	http://labix.org/gocheck
 package check
 
 import (
