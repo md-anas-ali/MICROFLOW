@@ -7,6 +7,7 @@
 package parser
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 
@@ -110,8 +111,21 @@ func Parse(raw []byte) (*ParseResult, error) {
 		return nil, fmt.Errorf("parser: workflow has zero nodes")
 	}
 
+	workflowID := rw.ID
+	if workflowID == "" {
+		var b [16]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, fmt.Errorf("parser: generate workflow id: %w", err)
+		}
+		// UUIDv4: set version and variant bits.
+		b[6] = (b[6] & 0x0f) | 0x40
+		b[8] = (b[8] & 0x3f) | 0x80
+		workflowID = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	}
+
 	wf := &model.Workflow{
-		ID:          rw.ID,
+		ID:          workflowID,
 		Name:        rw.Name,
 		Active:      rw.Active,
 		Nodes:       make(map[string]*model.Node, len(rw.Nodes)),
