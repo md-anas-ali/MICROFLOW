@@ -51,6 +51,14 @@ func (f *fakeExecLoader) GetExecution(ctx context.Context, id string) (*model.Ex
 	return nil, errString("not found")
 }
 
+func (f *fakeExecLoader) ListExecutions(ctx context.Context, limit int) ([]*model.Execution, error) {
+	out := make([]*model.Execution, 0, len(f.execs))
+	for _, ex := range f.execs {
+		out = append(out, ex)
+	}
+	return out, nil
+}
+
 type errString string
 
 func (e errString) Error() string { return string(e) }
@@ -124,6 +132,44 @@ func TestHandleGetExecutionReflectsCompletion(t *testing.T) {
 	if ex.Status != model.StatusSuccess {
 		t.Fatalf("final status = %q, want success (error=%q)", ex.Status, ex.Error)
 	}
+}
+
+func TestHandleListExecutionsIncludesLiveQueueStats(t *testing.T) {
+	release := make(chan struct{})
+	s, _ := newAsyncTestServer(t, map[model.NodeType]engine.NodeExecutor{model.TypeManualTrigger: blockingExecutor{release: release}}, 1, 2)
+	defer close(release)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/workflows/wf1/execute", nil)
+		req.SetPathValue("id", "wf1")
+		rec := httptest.NewRecorder()
+		s.handleExecute(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("execute %d: got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/api/executions?limit=10", nil)
+		rec := httptest.NewRecorder()
+		s.handleListExecutions(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list: %d: %s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Executions []model.Execution `json:"executions"`
+			Queue      map[string]int    `json:"queue"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode list: %v", err)
+		}
+		if len(body.Executions) >= 2 && body.Queue["accepted"] == 2 && body.Queue["running"] == 1 && body.Queue["waiting"] == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("list never exposed the expected live queue state")
 }
 
 func TestHandleCancelExecution(t *testing.T) {
