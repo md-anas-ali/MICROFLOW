@@ -17,9 +17,9 @@
 //   GET    /api/google/connections               (n8n-style Connect: per-service status)
 //   GET    /api/google/connect/{service}          (n8n-style Connect: starts OAuth, browser nav)
 //   POST   /api/google/disconnect/{service}       (n8n-style Connect: disconnect one service)
-// Still no execution-*history* endpoint (list of past runs) -- only
-// the single execution a POST .../execute call started, followed live
-// via SSE and re-fetchable by id from GET /api/executions/{id}.
+// Execution monitoring/history: GET /api/executions returns the newest
+// runs plus queue stats; GET /api/executions/events is the global live SSE
+// stream; per-run GET .../{id}/events remains the detailed node stream.
 //
 // Credentials, three scopes (see internal/vault/central.go and
 // internal/api/google_connect.go):
@@ -48,6 +48,9 @@
   const sidebar = document.getElementById("sidebar");
   const sidebarBackdrop = document.getElementById("sidebarBackdrop");
   const navToggle = document.getElementById("navToggle");
+  let executionsMonitorES = null;
+  let executionsMonitorTimer = null;
+  let executionDetailES = null;
 
   // ---------------- small helpers ----------------
 
@@ -150,8 +153,15 @@
     return parts;
   }
 
+  function stopExecutionMonitoring() {
+    if (executionsMonitorES) { executionsMonitorES.close(); executionsMonitorES = null; }
+    if (executionDetailES) { executionDetailES.close(); executionDetailES = null; }
+    if (executionsMonitorTimer) { clearInterval(executionsMonitorTimer); executionsMonitorTimer = null; }
+  }
+
   async function route() {
     closeSidebar();
+    stopExecutionMonitoring();
     const parts = parseHash();
     try {
       if (parts.length === 0 || parts[0] === "dashboard") {
@@ -162,7 +172,11 @@
         await renderWorkflowsList();
       } else if (parts[0] === "workflows" && parts.length >= 2) {
         setActiveNav("workflows");
-        await renderEditor(decodeURIComponent(parts[1]));
+        const executionID = new URLSearchParams(location.hash.split("?")[1] || "").get("execution") || "";
+        await renderEditor(decodeURIComponent(parts[1]), executionID);
+      } else if (parts[0] === "executions") {
+        setActiveNav("executions");
+        await renderExecutions(parts[1] ? decodeURIComponent(parts[1]) : "");
       } else if (parts[0] === "import") {
         setActiveNav("import");
         renderImport();
@@ -236,6 +250,160 @@
       '<div class="card stat-card"><div class="stat-num">' + escapeHtml(num) +
       '</div><div class="stat-label">' + escapeHtml(label) + "</div></div>"
     );
+  }
+
+  // ---------------- executions monitor/history ----------------
+
+  async function renderExecutions(selectedID) {
+    viewEl.innerHTML =
+      '<div class="page-head"><div><h1>Executions</h1><div class="sub">Live queue, running workflows, and the last 12 hours of history</div></div></div>' +
+      '<div id="execMonitorStats" class="grid-stats"></div>' +
+      '<div class="execution-layout"><div>' +
+      '<div class="section-head"><h3>Live & recent executions</h3><span id="execLiveState" class="live-indicator">● live</span></div>' +
+      '<div id="execHistoryTable">' + loadingRow("Loading executions…") + '</div>' +
+      '</div><div id="execDetailHost" class="card exec-detail-host">' +
+      emptyState("Select an execution", "Running executions update live here.", "↗") +
+      '</div></div>';
+
+    const workflowNames = {};
+    try {
+      const wfs = await apiJSON("/api/workflows");
+      (wfs || []).forEach((wf) => { workflowNames[wf.id] = wf.name || wf.id; });
+    } catch (_) {}
+
+    const tableHost = document.getElementById("execHistoryTable");
+    const statsHost = document.getElementById("execMonitorStats");
+    const detailHost = document.getElementById("execDetailHost");
+    let selected = selectedID || "";
+    let detailFollowID = "";
+
+    function renderStats(queue) {
+      queue = queue || {};
+      statsHost.innerHTML =
+        statCard(queue.accepted || 0, "Accepted / active") +
+        statCard(queue.running || 0, "Running") +
+        statCard(queue.waiting || 0, "Waiting in queue") +
+        statCard((queue.maxConcurrent || 0) + " / " + (queue.maxQueued || 0), "Workers / queue limit");
+    }
+
+    function renderRows(executions) {
+      if (!executions || !executions.length) {
+        tableHost.innerHTML = emptyState("No executions", "Run a workflow and its execution will appear here.");
+        return;
+      }
+      const rows = executions.map((ex) => {
+        const terminal = ["success", "error", "cancelled"].indexOf(ex.status) >= 0;
+        const workflow = workflowNames[ex.workflowId] || ex.workflowId;
+        const action = terminal
+          ? '<button class="btn btn-sm" data-exec-open="' + escapeHtml(ex.id) + '">View</button>'
+          : '<button class="btn btn-sm" data-exec-open="' + escapeHtml(ex.id) + '">Live</button>' +
+            '<button class="btn btn-sm btn-danger" data-exec-cancel="' + escapeHtml(ex.id) + '">Cancel</button>';
+        return '<tr class="clickable" data-exec-row="' + escapeHtml(ex.id) + '">' +
+          '<td><div class="wf-name">' + escapeHtml(workflow) + '</div><div class="exec-id">' + escapeHtml(ex.id) + '</div></td>' +
+          '<td><span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + '</span></td>' +
+          '<td>' + escapeHtml(ex.mode || "") + '</td>' +
+          '<td>' + escapeHtml(fmtDate(ex.startedAt)) + '</td>' +
+          '<td>' + (ex.finishedAt ? escapeHtml(fmtDate(ex.finishedAt)) : '<span class="live-dot">● running</span>') + '</td>' +
+          '<td class="wf-actions">' + action + '</td></tr>';
+      }).join("");
+      tableHost.innerHTML =
+        '<div class="history-note">History is automatically deleted after 12 hours. Running/queued executions are never removed by cleanup.</div>' +
+        '<table class="wf-table"><thead><tr><th>Workflow</th><th>Status</th><th>Mode</th><th>Started</th><th>Finished</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table>';
+
+      tableHost.querySelectorAll("tr[data-exec-row]").forEach((row) => row.addEventListener("click", (ev) => {
+        if (ev.target.closest("button")) return;
+        openExecution(row.dataset.execRow);
+      }));
+      tableHost.querySelectorAll("button[data-exec-open]").forEach((btn) => btn.addEventListener("click", (ev) => {
+        ev.stopPropagation(); openExecution(btn.dataset.execOpen);
+      }));
+      tableHost.querySelectorAll("button[data-exec-cancel]").forEach((btn) => btn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        btn.disabled = true;
+        try {
+          await apiJSON("/api/executions/" + encodeURIComponent(btn.dataset.execCancel) + "/cancel", { method: "POST" });
+          toast("Cancellation requested", "success");
+          await load();
+        } catch (e) { toast("Cancel failed: " + e.message, "error"); btn.disabled = false; }
+      }));
+    }
+
+    async function load() {
+      try {
+        const data = await apiJSON("/api/executions?limit=100");
+        renderStats(data.queue || {});
+        renderRows(data.executions || []);
+        if (selected) {
+          const found = (data.executions || []).find((x) => x.id === selected);
+          if (found) renderExecutionDetail(found, true);
+        }
+      } catch (e) {
+        tableHost.innerHTML = emptyState("Can't load executions", escapeHtml(e.message));
+      }
+    }
+
+    function renderExecutionDetail(ex, live) {
+      if (!ex) return;
+      const runs = ex.nodeRuns || [];
+      const workflowID = ex.workflowId || "";
+      detailHost.innerHTML =
+        '<div class="exec-detail-head"><div><h3>' + escapeHtml(workflowNames[workflowID] || workflowID) + '</h3><div class="exec-id">' + escapeHtml(ex.id) + '</div></div>' +
+        '<span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + '</span></div>' +
+        '<div class="exec-detail-meta"><span>Mode: ' + escapeHtml(ex.mode || "") + '</span><span>Started: ' + escapeHtml(fmtDate(ex.startedAt)) + '</span>' +
+        (ex.finishedAt ? '<span>Finished: ' + escapeHtml(fmtDate(ex.finishedAt)) + '</span>' : '<span class="live-dot">● LIVE</span>') + '</div>' +
+        (ex.error ? '<div class="err-text exec-detail-error">' + escapeHtml(ex.error) + '</div>' : '') +
+        '<div class="exec-detail-actions">' +
+        (!(["success", "error", "cancelled"].indexOf(ex.status) >= 0) ? '<button id="detailCancel" class="btn btn-danger btn-sm">Cancel</button>' : '') +
+        (workflowID ? '<a class="btn btn-sm" href="#/workflows/' + encodeURIComponent(workflowID) + '?execution=' + encodeURIComponent(ex.id) + '">Open live canvas</a>' : '') +
+        '</div>' +
+        '<div class="exec-node-list">' + (runs.length ? runs.map(renderNodeRun).join("") : '<div class="empty-state">Waiting for the first node event…</div>') + '</div>';
+      detailHost.querySelectorAll(".node-run-head").forEach((h) => h.addEventListener("click", () => h.parentElement.classList.toggle("open")));
+      const cancel = document.getElementById("detailCancel");
+      if (cancel) cancel.addEventListener("click", async () => {
+        cancel.disabled = true;
+        try { await apiJSON("/api/executions/" + encodeURIComponent(ex.id) + "/cancel", { method: "POST" }); toast("Cancellation requested", "success"); }
+        catch (e) { toast("Cancel failed: " + e.message, "error"); cancel.disabled = false; }
+      });
+      if (live && ["success", "error", "cancelled"].indexOf(ex.status) < 0) followExecutionDetail(ex.id);
+      else if (executionDetailES && detailFollowID === ex.id) { executionDetailES.close(); executionDetailES = null; detailFollowID = ""; }
+    }
+
+    function followExecutionDetail(execID) {
+      if (detailFollowID === execID && executionDetailES) return;
+      if (executionDetailES) executionDetailES.close();
+      detailFollowID = execID;
+      try { executionDetailES = new EventSource("/api/executions/" + encodeURIComponent(execID) + "/events"); }
+      catch (_) { return; }
+      executionDetailES.onmessage = function (msg) {
+        try {
+          const ev = JSON.parse(msg.data);
+          if (selected !== execID) return;
+          load();
+          apiJSON("/api/executions/" + encodeURIComponent(execID)).then((latest) => renderExecutionDetail(latest, true)).catch(() => {});
+        } catch (_) {}
+      };
+      executionDetailES.onerror = function () {
+        if (executionDetailES) executionDetailES.close();
+        executionDetailES = null;
+        detailFollowID = "";
+      };
+    }
+
+    function openExecution(id) {
+      selected = id;
+      apiJSON("/api/executions/" + encodeURIComponent(id)).then((ex) => renderExecutionDetail(ex, true)).catch((e) => {
+        detailHost.innerHTML = emptyState("Execution unavailable", escapeHtml(e.message));
+      });
+    }
+
+    await load();
+    executionsMonitorTimer = setInterval(load, 2000);
+    try {
+      executionsMonitorES = new EventSource("/api/executions/events");
+      executionsMonitorES.onmessage = () => load();
+      executionsMonitorES.onerror = () => { /* 2s refresh remains as a resilient fallback */ };
+    } catch (_) {}
+    if (selected) openExecution(selected);
   }
 
   // ---------------- workflows list ----------------
@@ -314,7 +482,8 @@
         btn.textContent = "Running\u2026";
         try {
           const ex = await apiJSON("/api/workflows/" + encodeURIComponent(btn.dataset.id) + "/execute", { method: "POST" });
-          toast("Execution finished: " + ex.status, ex.status === "error" ? "error" : "success");
+          toast("Execution queued", "success");
+          location.hash = "#/executions/" + encodeURIComponent(ex.executionId);
         } catch (e) {
           toast(e.message, "error");
         } finally {
@@ -767,7 +936,7 @@
     ["stickyNote", "Sticky Note"],
   ];
 
-  async function renderEditor(id) {
+  async function renderEditor(id, executionID) {
     viewEl.innerHTML = loadingRow("Loading workflow\u2026");
     let wf;
     try {
@@ -815,6 +984,18 @@
     drawCanvas();
     wireEditorToolbar();
     if (editorState.lastExecution) renderExecPanel(editorState.lastExecution);
+    if (executionID) {
+      apiJSON("/api/executions/" + encodeURIComponent(executionID))
+        .then((ex) => {
+          editorState.lastExecution = ex;
+          drawCanvas();
+          renderExecPanel(ex);
+          if (["success", "error", "cancelled"].indexOf(ex.status) < 0) {
+            followExecution(executionID, document.getElementById("btnExecute"));
+          }
+        })
+        .catch((e) => toast("Could not load execution: " + e.message, "error"));
+    }
   }
 
   function renderSidePanelEmpty() {
