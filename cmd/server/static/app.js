@@ -354,7 +354,7 @@
         (ex.error ? '<div class="err-text exec-detail-error">' + escapeHtml(ex.error) + '</div>' : '') +
         '<div class="exec-detail-actions">' +
         (!(["success", "error", "cancelled"].indexOf(ex.status) >= 0) ? '<button id="detailCancel" class="btn btn-danger btn-sm">Cancel</button>' : '') +
-        (workflowID ? '<a class="btn btn-sm" href="#/workflows/' + encodeURIComponent(workflowID) + '?execution=' + encodeURIComponent(ex.id) + '">Open live canvas</a>' : '') +
+        (workflowID && workflowNames[workflowID] ? '<a class="btn btn-sm" href="#/workflows/' + encodeURIComponent(workflowID) + '?execution=' + encodeURIComponent(ex.id) + '">Open live canvas</a>' : '') +
         '</div>' +
         '<div class="exec-node-list">' + (runs.length ? runs.map(renderNodeRun).join("") : '<div class="empty-state">Waiting for the first node event…</div>') + '</div>';
       detailHost.querySelectorAll(".node-run-head").forEach((h) => h.addEventListener("click", () => h.parentElement.classList.toggle("open")));
