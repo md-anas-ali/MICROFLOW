@@ -555,3 +555,8 @@ degrades the pipeline to silent voiceover, it doesn't break it.
 - Added durable execution-history cleanup: terminal executions older than **12 hours** are deleted once at startup and automatically every 12 hours; queued/running executions are never deleted by the cleanup job.
 - Added a database index on `executions.finished_at` for efficient retention cleanup.
 - Added unit/API coverage for global execution events and live queue statistics.
+## Live execution monitor follow-up fix
+
+- Startup now marks queued/running/waiting executions left by a previous server process as cancelled, because the async Manager is intentionally in-memory and cannot resume them after restart.
+- Cancel is idempotent for executions that finished between UI refresh and the cancel click; the API returns their terminal status instead of a misleading `execution not found`.
+- The UI only offers `Open live canvas` when the execution's workflow ID still exists, preventing stale/deleted workflow IDs from opening a guaranteed `no rows in result set` page.
