@@ -232,6 +232,24 @@ func (s *Store) ListExecutions(ctx context.Context, limit int) ([]*model.Executi
 // DeleteExecutionsBefore permanently removes terminal execution history
 // older than cutoff. Running/queued records are deliberately retained so
 // the cleanup job can never delete an execution that is still in flight.
+// MarkInterruptedExecutions marks non-terminal executions left behind by a
+// previous server process as cancelled. The async Manager is in-memory, so
+// after a restart those queued/running records cannot be resumed or cancelled
+// by the new process; keeping them as active would make the live monitor lie
+// and leave stale Cancel buttons forever.
+func (s *Store) MarkInterruptedExecutions(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE executions
+		SET status='cancelled', finished_at=COALESCE(finished_at, now()),
+			error=CASE WHEN error IS NULL OR error='' THEN 'execution interrupted by server restart' ELSE error END
+		WHERE status IN ('queued', 'running', 'waiting') AND finished_at IS NULL
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) DeleteExecutionsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
 		DELETE FROM executions
