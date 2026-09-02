@@ -90,6 +90,11 @@ func main() {
 			log.Printf("execution history cleanup: deleted %d execution(s) older than 12h", deleted)
 		}
 	}
+	if interrupted, err := st.MarkInterruptedExecutions(ctx); err != nil {
+		log.Printf("interrupted execution recovery failed: %v", err)
+	} else if interrupted > 0 {
+		log.Printf("execution recovery: marked %d interrupted execution(s) cancelled", interrupted)
+	}
 	cleanupExecutionHistory()
 	go func() {
 		ticker := time.NewTicker(12 * time.Hour)
