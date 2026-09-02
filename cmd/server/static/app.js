@@ -172,8 +172,8 @@
         await renderWorkflowsList();
       } else if (parts[0] === "workflows" && parts.length >= 2) {
         setActiveNav("workflows");
-        const executionID = new URLSearchParams(location.hash.split("?")[1] || "").get("execution") || "";
-        await renderEditor(decodeURIComponent(parts[1]), executionID);
+        const executionId = new URLSearchParams(location.hash.split("?")[1] || "").get("execution") || "";
+        await renderEditor(decodeURIComponent(parts[1]), executionId);
       } else if (parts[0] === "executions") {
         setActiveNav("executions");
         await renderExecutions(parts[1] ? decodeURIComponent(parts[1]) : "");
@@ -936,7 +936,7 @@
     ["stickyNote", "Sticky Note"],
   ];
 
-  async function renderEditor(id, executionID) {
+  async function renderEditor(id, executionId) {
     viewEl.innerHTML = loadingRow("Loading workflow\u2026");
     let wf;
     try {
@@ -947,7 +947,7 @@
     }
     wf.nodes = wf.nodes || {};
     wf.connections = wf.connections || {};
-    editorState = { workflow: wf, selectedNodeName: null, lastExecution: null, _layout: null };
+    editorState = { workflow: wf, selectedNodeName: null, lastExecution: null, _layout: null, executionId: executionId || "" };
     paintEditor();
   }
 
@@ -984,14 +984,15 @@
     drawCanvas();
     wireEditorToolbar();
     if (editorState.lastExecution) renderExecPanel(editorState.lastExecution);
-    if (executionID) {
-      apiJSON("/api/executions/" + encodeURIComponent(executionID))
+    if (editorState.executionId) {
+      const execId = editorState.executionId;
+      apiJSON("/api/executions/" + encodeURIComponent(execId))
         .then((ex) => {
           editorState.lastExecution = ex;
           drawCanvas();
           renderExecPanel(ex);
           if (["success", "error", "cancelled"].indexOf(ex.status) < 0) {
-            followExecution(executionID, document.getElementById("btnExecute"));
+            followExecution(execId, document.getElementById("btnExecute"));
           }
         })
         .catch((e) => toast("Could not load execution: " + e.message, "error"));
