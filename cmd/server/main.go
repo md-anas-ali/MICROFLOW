@@ -73,6 +73,37 @@ func main() {
 		log.Printf("warning: could not read schema.sql locally (%v) -- apply internal/store/schema.sql manually if this is a fresh database", err)
 	}
 
+	// Execution history is intentionally short-lived: keep completed runs
+	// for 12 hours, clean them once at startup, then repeat every 12 hours.
+	// Running/queued executions are never deleted by this job. This keeps
+	// Postgres history bounded without requiring a separate cron service.
+	cleanupExecutionHistory := func() {
+		cutoff := time.Now().Add(-12 * time.Hour)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		deleted, cleanupErr := st.DeleteExecutionsBefore(cleanupCtx, cutoff)
+		if cleanupErr != nil {
+			log.Printf("execution history cleanup failed: %v", cleanupErr)
+			return
+		}
+		if deleted > 0 {
+			log.Printf("execution history cleanup: deleted %d execution(s) older than 12h", deleted)
+		}
+	}
+	cleanupExecutionHistory()
+	go func() {
+		ticker := time.NewTicker(12 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanupExecutionHistory()
+			}
+		}
+	}()
+
 	baseVault, err := vault.New(st, masterKey)
 	if err != nil {
 		log.Fatal(err)
