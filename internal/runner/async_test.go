@@ -308,6 +308,29 @@ func TestManagerSubscribeReceivesTerminalEvent(t *testing.T) {
 // TestManagerSubscribeUnknownExecution verifies Subscribe reports
 // ok=false for an id the Manager has no record of, rather than
 // blocking or panicking.
+func TestManagerSubscribeAllReceivesExecutionEvents(t *testing.T) {
+	wf := oneNodeWorkflow("wf1")
+	r, _ := newTestRunner(t, map[model.NodeType]engine.NodeExecutor{model.TypeManualTrigger: instantExecutor{}}, wf)
+	m := NewManager(r, 1, 2)
+	events, _, unsubscribe := m.SubscribeAll()
+	defer unsubscribe()
+
+	if _, err := m.Start(context.Background(), "wf1", "", "manual", nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventExecutionStarted || ev.Type == EventExecutionCompleted {
+				return
+			}
+		case <-deadline:
+			t.Fatal("global execution event stream produced no event")
+		}
+	}
+}
+
 func TestManagerSubscribeUnknownExecution(t *testing.T) {
 	wf := oneNodeWorkflow("wf1")
 	r, _ := newTestRunner(t, map[model.NodeType]engine.NodeExecutor{}, wf)

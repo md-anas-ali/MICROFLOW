@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -204,6 +205,7 @@ type Manager struct {
 
 	mu     sync.Mutex
 	states map[string]*runState
+	all    *broadcaster // process-wide stream for the live executions monitor
 }
 
 // NewManager wires an async Manager around an existing *Runner (same
@@ -227,6 +229,7 @@ func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
 		sem:       make(chan struct{}, maxConcurrent),
 		maxQueued: int32(maxQueued),
 		states:    map[string]*runState{},
+		all:       newBroadcaster(),
 	}
 }
 
@@ -285,7 +288,7 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	if saveErr := m.r.Execs.SaveExecution(context.Background(), rs.snapshot()); saveErr != nil {
 		log.Printf("runner: manager: failed to persist queued execution %s: %v", execID, saveErr)
 	}
-	rs.bcast.publish(Event{Type: EventExecutionCreated, ExecutionID: execID, Time: time.Now(), Status: model.StatusQueued})
+	m.publish(rs, Event{Type: EventExecutionCreated, ExecutionID: execID, Time: time.Now(), Status: model.StatusQueued})
 
 	go m.runJob(runCtx, wf, execID, startNode, mode, seed, rs)
 
@@ -316,7 +319,7 @@ func (m *Manager) runJob(ctx context.Context, wf *model.Workflow, execID, startN
 	rs.mu.Lock()
 	rs.ex.Status = model.StatusRunning
 	rs.mu.Unlock()
-	rs.bcast.publish(Event{Type: EventExecutionStarted, ExecutionID: execID, Time: time.Now(), Status: model.StatusRunning})
+	m.publish(rs, Event{Type: EventExecutionStarted, ExecutionID: execID, Time: time.Now(), Status: model.StatusRunning})
 
 	onNodeRun := func(result model.NodeRunResult) {
 		rs.mu.Lock()
@@ -333,9 +336,9 @@ func (m *Manager) runJob(ctx context.Context, wf *model.Workflow, execID, startN
 		// result is this closure's own parameter (a fresh copy per
 		// call, not a shared loop variable), so &result is safe to hand
 		// to publish/replay without a capture bug.
-		rs.bcast.publish(Event{Type: evType, ExecutionID: execID, Time: time.Now(), Node: &result, Status: result.Status})
+		m.publish(rs, Event{Type: evType, ExecutionID: execID, Time: time.Now(), Node: &result, Status: result.Status})
 		if result.Status == model.StatusWaiting {
-			rs.bcast.publish(Event{Type: EventExecutionWaiting, ExecutionID: execID, Time: time.Now(), Status: model.StatusWaiting})
+			m.publish(rs, Event{Type: EventExecutionWaiting, ExecutionID: execID, Time: time.Now(), Status: model.StatusWaiting})
 		}
 	}
 
@@ -357,7 +360,7 @@ func (m *Manager) runJob(ctx context.Context, wf *model.Workflow, execID, startN
 	errMsg := rs.ex.Error
 	rs.mu.Unlock()
 
-	rs.bcast.publish(Event{Type: terminalEventFor(status), ExecutionID: execID, Time: time.Now(), Status: status, Error: errMsg})
+	m.publish(rs, Event{Type: terminalEventFor(status), ExecutionID: execID, Time: time.Now(), Status: status, Error: errMsg})
 	rs.bcast.close()
 	m.scheduleEviction(execID)
 }
@@ -375,7 +378,7 @@ func (m *Manager) finishCancelled(execID string, rs *runState, reason string) {
 	if err := m.r.Execs.SaveExecution(context.Background(), ex); err != nil {
 		log.Printf("runner: manager: failed to persist cancelled execution %s: %v", execID, err)
 	}
-	rs.bcast.publish(Event{Type: EventExecutionCancelled, ExecutionID: execID, Time: time.Now(), Status: model.StatusCancelled, Error: reason})
+	m.publish(rs, Event{Type: EventExecutionCancelled, ExecutionID: execID, Time: time.Now(), Status: model.StatusCancelled, Error: reason})
 	rs.bcast.close()
 	m.scheduleEviction(execID)
 }
@@ -386,6 +389,63 @@ func (m *Manager) scheduleEviction(execID string) {
 		delete(m.states, execID)
 		m.mu.Unlock()
 	})
+}
+
+func (m *Manager) publish(rs *runState, ev Event) {
+	rs.bcast.publish(ev)
+	m.all.publish(ev)
+}
+
+// List returns a bounded snapshot of all executions still held in the
+// manager. Finished records remain here briefly for fast live/history
+// views; durable history is supplied by the Store through the API.
+func (m *Manager) List(limit int) []*model.Execution {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	m.mu.Lock()
+	states := make([]*runState, 0, len(m.states))
+	for _, rs := range m.states {
+		states = append(states, rs)
+	}
+	m.mu.Unlock()
+
+	out := make([]*model.Execution, 0, len(states))
+	for _, rs := range states {
+		out = append(out, rs.snapshot())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// Stats exposes only queue capacity/occupancy metadata for the live
+// monitor; it never includes workflow payloads or binary data.
+func (m *Manager) Stats() map[string]int {
+	queued := int(atomic.LoadInt32(&m.queued))
+	running := len(m.sem)
+	waiting := queued - running
+	if waiting < 0 {
+		waiting = 0
+	}
+	return map[string]int{
+		"accepted":      queued,
+		"running":       running,
+		"waiting":       waiting,
+		"maxConcurrent": cap(m.sem),
+		"maxQueued":     int(m.maxQueued),
+	}
+}
+
+// SubscribeAll streams metadata-only events for the global live monitor.
+func (m *Manager) SubscribeAll() (<-chan Event, []Event, func()) {
+	id, ch, replay := m.all.subscribe()
+	return ch, replay, func() { m.all.unsubscribe(id) }
 }
 
 func terminalEventFor(status model.ExecutionStatus) EventType {
