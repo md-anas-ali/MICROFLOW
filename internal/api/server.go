@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +45,12 @@ type ExecutionLoader interface {
 	GetExecution(ctx context.Context, id string) (*model.Execution, error)
 }
 
+// ExecutionHistoryStore supplies durable execution history for the live
+// monitor/history page. *store.Store implements it.
+type ExecutionHistoryStore interface {
+	ListExecutions(ctx context.Context, limit int) ([]*model.Execution, error)
+}
+
 type Server struct {
 	mux         *http.ServeMux
 	workflows   WorkflowStore
@@ -72,8 +80,9 @@ type Server struct {
 	// New() (every existing test helper) keeps the old synchronous
 	// /execute behavior and 501s the new endpoints, rather than
 	// panicking. Call WithAsync to enable them.
-	manager    *runner.Manager
-	execLoader ExecutionLoader
+	manager     *runner.Manager
+	execLoader  ExecutionLoader
+	execHistory ExecutionHistoryStore
 }
 
 // WithAsync enables the async execute/executions/events endpoints:
@@ -86,6 +95,9 @@ type Server struct {
 func (s *Server) WithAsync(mgr *runner.Manager, execs ExecutionLoader) *Server {
 	s.manager = mgr
 	s.execLoader = execs
+	if history, ok := execs.(ExecutionHistoryStore); ok {
+		s.execHistory = history
+	}
 	return s
 }
 
@@ -115,6 +127,8 @@ func (s *Server) routes() {
 	// registered; each handler 501s cleanly if WithAsync was never
 	// called, rather than the route simply not existing (see manager's
 	// doc comment above).
+	s.mux.HandleFunc("GET /api/executions", s.handleListExecutions)
+	s.mux.HandleFunc("GET /api/executions/events", s.handleAllExecutionEvents)
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
 	s.mux.HandleFunc("POST /api/executions/{id}/cancel", s.handleCancelExecution)
 	s.mux.HandleFunc("GET /api/executions/{id}/events", s.handleExecutionEvents)
@@ -297,6 +311,106 @@ func (s *Server) handleExecuteSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ex)
+}
+
+// handleListExecutions returns the newest executions, merging live Manager
+// snapshots over durable history so queued/running records are immediately
+// visible and completed records remain available after the in-memory cache
+// expires.
+func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	byID := make(map[string]*model.Execution, limit)
+	if s.execHistory != nil {
+		history, err := s.execHistory.ListExecutions(r.Context(), limit)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		for _, ex := range history {
+			if ex != nil {
+				byID[ex.ID] = ex
+			}
+		}
+	}
+	if s.manager != nil {
+		for _, ex := range s.manager.List(limit) {
+			if ex != nil {
+				byID[ex.ID] = ex
+			}
+		}
+	}
+
+	out := make([]*model.Execution, 0, len(byID))
+	for _, ex := range byID {
+		out = append(out, ex)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	queue := map[string]int{}
+	if s.manager != nil {
+		queue = s.manager.Stats()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"executions": out, "queue": queue})
+}
+
+// handleAllExecutionEvents is the global SSE stream used by the Executions
+// page. Events are metadata only; clients refresh the bounded list when an
+// execution changes instead of receiving workflow payloads over this stream.
+func (s *Server) handleAllExecutionEvents(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("async execution is not enabled on this server"))
+		return
+	}
+	events, replay, unsubscribe := s.manager.SubscribeAll()
+	defer unsubscribe()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, errors.New("streaming is not supported by this server"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	seq := 0
+	for _, ev := range replay {
+		seq++
+		if err := writeSSEEvent(w, flusher, seq, ev); err != nil {
+			return
+		}
+	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			seq++
+			if err := writeSSEEvent(w, flusher, seq, ev); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // handleGetExecution returns the current state of one execution: the
