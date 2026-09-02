@@ -20,10 +20,12 @@ func TestParseActualWorkflow(t *testing.T) {
 	if len(result.Workflow.Nodes) == 0 {
 		t.Fatal("expected nodes, got none")
 	}
-	// This is the caller's actual workflow: assert the exact node count
-	// so a future n8n export format change or parser regression is
-	// caught immediately rather than silently under-importing nodes.
-	const wantNodes = 120
+	// This is the caller's actual workflow (the real exported
+	// "My workflow 14" JSON, verbatim -- see test/testdata/README or
+	// STATUS.md): assert the exact node count so a future n8n export
+	// format change or parser regression is caught immediately rather
+	// than silently under-importing nodes.
+	const wantNodes = 123
 	if len(result.Workflow.Nodes) != wantNodes {
 		t.Errorf("got %d nodes, want %d", len(result.Workflow.Nodes), wantNodes)
 	}
@@ -45,12 +47,17 @@ func TestParseActualWorkflow(t *testing.T) {
 	}
 }
 
-// TestParseReadUsedTopicsRetryConfig locks in the production-readiness
-// fix for "Read Used Topics": a transient Google Sheets error (503/429/
-// 5xx) must retry up to 3 times, and ContinueOnFail must be OFF so a
-// read that still fails after retries becomes a real, visible node
-// error instead of silently letting the workflow continue with no
-// used-topics data (which risks writing a duplicate topic).
+// TestParseReadUsedTopicsRetryConfig locks in the "Read Used Topics"
+// node's retry/failure config exactly as authored in the real
+// "My workflow 14" export. NOTE: an earlier pass's testdata fixture had
+// this node edited to RetryOnFail=true/MaxTries=3/ContinueOnFail=false
+// ("production-readiness fix") -- that was a change to the *workflow*,
+// which the mission for this pass explicitly forbids ("do not change
+// ... node logic ... of My workflow 14"). The real uploaded workflow
+// has waitBetweenTries=1000 with retryOnFail unset and
+// continueOnFail=true (a failed read is swallowed and the run
+// continues), so that is what parsing must produce; this test was
+// updated to match the actual file instead of the other way around.
 func TestParseReadUsedTopicsRetryConfig(t *testing.T) {
 	raw, err := os.ReadFile("../../test/testdata/sample_workflow.json")
 	if err != nil {
@@ -64,17 +71,14 @@ func TestParseReadUsedTopicsRetryConfig(t *testing.T) {
 	if !ok {
 		t.Fatal("expected node \"Read Used Topics\" to be present after parse")
 	}
-	if !node.RetryOnFail {
-		t.Error("Read Used Topics: RetryOnFail = false, want true")
+	if node.RetryOnFail {
+		t.Error("Read Used Topics: RetryOnFail = true, want false (matches the real workflow export)")
 	}
-	if node.MaxTries != 3 {
-		t.Errorf("Read Used Topics: MaxTries = %d, want 3", node.MaxTries)
+	if node.WaitBetweenTriesMs != 1000 {
+		t.Errorf("Read Used Topics: WaitBetweenTriesMs = %d, want 1000", node.WaitBetweenTriesMs)
 	}
-	if node.WaitBetweenTriesMs <= 0 {
-		t.Errorf("Read Used Topics: WaitBetweenTriesMs = %d, want a positive backoff base", node.WaitBetweenTriesMs)
-	}
-	if node.ContinueOnFail {
-		t.Error("Read Used Topics: ContinueOnFail = true, want false -- a failed read must stop the run, not silently risk a duplicate topic")
+	if !node.ContinueOnFail {
+		t.Error("Read Used Topics: ContinueOnFail = false, want true (matches the real workflow export)")
 	}
 }
 
