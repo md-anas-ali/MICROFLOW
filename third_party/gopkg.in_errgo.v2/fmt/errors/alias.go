@@ -82,7 +82,7 @@ func SetLocation(err error, callDepth int) {
 // Details returns information about the stack of
 // underlying errors wrapped by err, in the format:
 //
-// 	[{filename:99: error one} {otherfile:55: cause of error one}]
+//	[{filename:99: error one} {otherfile:55: cause of error one}]
 //
 // The details are found by type-asserting the error to
 // the Locator, Causer and Wrapper interfaces.
@@ -98,7 +98,7 @@ func Details(err error) string {
 // It is intended to be used as a "shouldPreserveCause" argument
 // to Note. For example:
 //
-// 	return errgo.Note(err, errgo.Is(http.ErrNoCookie), "")
+//	return errgo.Note(err, errgo.Is(http.ErrNoCookie), "")
 //
 // would return an error with an http.ErrNoCookie cause
 // only if that was err's cause.
