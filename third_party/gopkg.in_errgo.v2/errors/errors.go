@@ -10,11 +10,11 @@
 // An error created by this package holds three values, any one of
 // which (but not all) may be zero
 //
-//	- an error message. This is used as part of the result of the Error method.
-//	- an underlying error. This holds the error that the error was created in response to.
-//	- an error cause. See below.
+//   - an error message. This is used as part of the result of the Error method.
+//   - an underlying error. This holds the error that the error was created in response to.
+//   - an error cause. See below.
 //
-// Error Causes
+// # Error Causes
 //
 // The "cause" of an error is something that code can use to diagnose
 // what an error means and take action accordingly.
@@ -36,7 +36,7 @@
 // The Because function can be used to associate an error with an
 // existing cause value.
 //
-// Error wrapping
+// # Error wrapping
 //
 // When an error is returned that "wraps" another one, the new error
 // records the source code location of the caller. This means that it is
@@ -134,10 +134,10 @@ func SetLocation(err error, callDepth int) {
 // Details returns information about the stack of underlying errors
 // wrapped by err, in the format:
 //
-// 		[
-//			{filename:99: error one}
-//			{otherfile:55: cause of error one}
-//		]
+//	[
+//		{filename:99: error one}
+//		{otherfile:55: cause of error one}
+//	]
 //
 // The details are found by type-asserting the error to the Locator,
 // Causer and Wrapper interfaces. Details of the underlying stack are
@@ -180,7 +180,7 @@ func Details(err error) string {
 // the given error. It is intended to be used as a "shouldPreserveCause"
 // argument to Note. For example:
 //
-// 	return errgo.Note(err, errgo.Is(http.ErrNoCookie), "")
+//	return errgo.Note(err, errgo.Is(http.ErrNoCookie), "")
 //
 // would return an error with an http.ErrNoCookie cause
 // only if that was err's cause.
