@@ -2,7 +2,10 @@ package nodes
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"microflow/internal/engine"
@@ -245,15 +248,45 @@ func toFloat(v any) (float64, bool) {
 		return n, true
 	case int:
 		return float64(n), true
+	case string:
+		// A numeric-looking string (e.g. an IF node's "right" literal
+		// "200" being compared against $json.statusCode, which decodes
+		// from JSON as a float64) must still compare numerically equal.
+		// Without this, fmtEq's numeric fast-path silently rejected the
+		// pair (aok=true, bok=false) and fell through to toStr(a)==toStr(b),
+		// which used to return "" for any non-string value -- so a real,
+		// correct HTTP 200 could never satisfy `{{ $json.statusCode }}
+		// equals "200"`, a hugely common n8n pattern.
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	}
 	return 0, false
 }
 
 func toStr(v any) string {
-	if s, ok := v.(string); ok {
-		return s
+	// Matches n8n's own loose "equals" comparison: values are coerced to
+	// a display string before comparing, not just passed through when
+	// they already happen to be a Go string. Previously this returned ""
+	// for every non-string type (numbers, bools), so e.g. numeric
+	// $json.statusCode vs a string literal "200" always compared "" == "200"
+	// -> false, no matter what the actual status code was.
+	switch n := v.(type) {
+	case string:
+		return n
+	case float64:
+		return strconv.FormatFloat(n, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(n)
+	case bool:
+		return strconv.FormatBool(n)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", n)
 	}
-	return ""
 }
 
 func contains(haystack, needle string) bool {
