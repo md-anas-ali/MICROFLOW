@@ -191,6 +191,58 @@ func (s *Store) SaveExecution(ctx context.Context, ex *model.Execution) error {
 // restart, or simply old enough to have rolled off the in-memory
 // cache). Returns the same *model.Execution shape SaveExecution wrote,
 // node_runs included (already capped at maxNodeRuns by SaveExecution).
+// ListExecutions returns recent execution history, newest first. The
+// retention cleaner removes terminal records older than 12 hours; the
+// limit keeps the UI response bounded even before cleanup runs.
+func (s *Store) ListExecutions(ctx context.Context, limit int) ([]*model.Execution, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, workflow_id, mode, status, started_at, finished_at, error, node_runs
+		FROM executions
+		ORDER BY started_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*model.Execution, 0, limit)
+	for rows.Next() {
+		var ex model.Execution
+		var nodeRunsJSON []byte
+		if err := rows.Scan(&ex.ID, &ex.WorkflowID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON); err != nil {
+			return nil, err
+		}
+		if len(nodeRunsJSON) > 0 {
+			if err := json.Unmarshal(nodeRunsJSON, &ex.NodeRuns); err != nil {
+				return nil, fmt.Errorf("store: decode node_runs for execution %q: %w", ex.ID, err)
+			}
+		}
+		out = append(out, &ex)
+	}
+	return out, rows.Err()
+}
+
+// DeleteExecutionsBefore permanently removes terminal execution history
+// older than cutoff. Running/queued records are deliberately retained so
+// the cleanup job can never delete an execution that is still in flight.
+func (s *Store) DeleteExecutionsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM executions
+		WHERE finished_at IS NOT NULL AND finished_at < $1
+	`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) GetExecution(ctx context.Context, id string) (*model.Execution, error) {
 	var ex model.Execution
 	var nodeRunsJSON []byte

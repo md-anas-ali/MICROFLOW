@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS executions (
     node_runs    JSONB NOT NULL DEFAULT '[]'::jsonb -- capped/pruned by the app layer, not unbounded (rule 18)
 );
 CREATE INDEX IF NOT EXISTS idx_executions_workflow ON executions(workflow_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_executions_finished_at ON executions(finished_at);
 
 -- Credentials are stored ONLY as vault ciphertext (nonce+AES-GCM
 -- sealed box); the server never writes plaintext secrets to this table
