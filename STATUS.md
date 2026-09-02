@@ -1,6 +1,83 @@
 # MicroFlow — STATUS (read this first)
 
-## This pass: async execution + live SSE progress (spec sections M/N)
+## This pass: fixed a real MicroFlow bug + two real workflow bugs, found by
+## actually running "My workflow 14" end-to-end via cmd/e2echeck
+
+Found while checking the workflow's script-writer "auto free model finder"
+loop and its image pipeline against the real engine, not by inspection:
+
+1. **MicroFlow bug — `internal/nodes/control.go` (`IfExecutor`/`fmtEq`)**:
+   an IF node's numeric `$json` field (decodes from JSON as `float64`, e.g.
+   `$json.statusCode`) compared against a string literal condition (e.g.
+   `"200"`) could **never** be equal, regardless of the actual value.
+   `toFloat` only accepted `float64`/`int`, so the numeric fast path bailed
+   out to `toStr(a) == toStr(b)`, and the old `toStr` returned `""` for any
+   non-string value. This is an extremely common n8n IF-node shape ("did
+   this HTTP call return 200?"), so it silently broke that pattern for
+   every imported workflow, not just this one. Fixed `toFloat` to parse
+   numeric strings and `toStr` to format numbers/bools instead of
+   returning `""`; regression test added:
+   `internal/nodes/control_test.go`.
+2. **Workflow bug — image generation could never succeed.** "Get Image"
+   and both fallback image nodes never had n8n's "Full Response" option
+   set, so `$json.statusCode` was never populated at all — combined with
+   bug #1, "Image Generated?" was unsatisfiable even before today, but
+   would have stayed broken after fixing #1 alone. Added
+   `options.response.response.fullResponse: true` to all three nodes.
+3. **Workflow bug — retries used stale/undefined data.** The pollinations
+   URL on those same three nodes read `$json.imagePromptEncoded` /
+   `$json.imageSeed`, and "Image Retry Router" read `$json.idx` — but by
+   the time any of these run, `$json` is the *previous* HTTP node's
+   response (n8n replaces `$json` with the response body), so those
+   fields were `undefined` on every retry, producing broken
+   `prompt/<nil>` URLs, and different scenes' retry counters collided on
+   the shared key `wf.imageRetries['undefined']`. Switched all four
+   references to `$node["Prep Scene"].json...`, matching how "Save Image"
+   already (correctly) does it.
+4. **Workflow bug — the script writer's "auto free model finder" never
+   actually re-checked what's free.** `$getWorkflowStaticData('global')`
+   persists *across* separate executions (e.g. each day's schedule
+   trigger), but nothing reset `wf.liveModelQueue`/`modelAttempt`/
+   `fullCycles` (or the Fact/Semantic/Image-Prompt/QC controllers'
+   equivalents) at the start of a run — so a queue built on day 1 just
+   kept getting reused on day 2, day 3, etc. until an entire lap failed
+   inside a single run, defeating the "live" part of live free-model
+   discovery. Added a reset block to "Mark Run Started" (already the
+   first node of every run).
+5. **Workflow bug — the same script-writer loop didn't advance properly
+   through its model queue.** "Validate Attempt" reset `modelAttempt` to
+   `0` on a merely shallow-valid API response (before "Parse JSON" had
+   even checked whether the content was usable), so a later
+   schema-validation failure only ever advanced the counter to `1`
+   instead of past whichever model had just actually failed — the loop
+   kept circling near the front of the queue instead of working through
+   all the free models. Removed the premature reset so "Parse JSON"'s
+   existing increment advances correctly.
+
+**Verified this pass:**
+
+```
+go build ./...                          # clean
+go vet ./...                            # clean
+gofmt -l . (excl. third_party/)         # clean
+go test ./...                           # all packages pass
+go test ./... -race                     # clean
+node test/frontend/smoketest.js         # 26/26 assertions pass
+go run ./cmd/e2echeck test/testdata/sample_workflow.json
+  # before fix #1: "Get Image"/fallbacks/Image Retry Router all broken,
+  #   run finished with 5 node errors, image never saved for any scene
+  # after all 5 fixes: 61/61 nodes success, run finishes in ~38s
+  #   (was hitting the 90s wall-clock cap before), image saved on the
+  #   very first attempt
+```
+
+`test/testdata/sample_workflow.json` has been updated to the corrected
+workflow (all 5 fixes applied) so `cmd/e2echeck` now exercises the fixed
+path by default.
+
+---
+
+## Previous pass: async execution + live SSE progress (spec sections M/N)
 
 `POST /api/workflows/{id}/execute` used to block for the entire run
 (one HTTP request open the whole time, no way to cancel, no live
@@ -468,3 +545,13 @@ breaks later, the failure mode is safe: the workflow's own
 as expected and falls back to generating a silent clip with `ffmpeg`
 (see its `EDGE_FAILED_SILENT` branch) -- so a protocol mismatch here
 degrades the pipeline to silent voiceover, it doesn't break it.
+
+## Live execution monitor / history (2026-09-02)
+
+- Added `GET /api/executions` for a bounded execution list plus live queue/worker stats.
+- Added global `GET /api/executions/events` SSE stream for near-instant monitor refreshes.
+- Added an **Executions** UI page with live/running/queued status, queue occupancy, cancellation, per-node details, and links back to the workflow canvas.
+- The workflow canvas can now reopen a specific execution with `?execution=<id>` and continue the per-node SSE stream while it is running.
+- Added durable execution-history cleanup: terminal executions older than **12 hours** are deleted once at startup and automatically every 12 hours; queued/running executions are never deleted by the cleanup job.
+- Added a database index on `executions.finished_at` for efficient retention cleanup.
+- Added unit/API coverage for global execution events and live queue statistics.
