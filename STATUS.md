@@ -1,5 +1,40 @@
 # MicroFlow — STATUS (read this first)
 
+## Latest fix: editor crashed on load (`executionId is not defined`)
+
+`renderEditor(id, executionId)` took `executionId` as a parameter but
+handed off rendering to a separate top-level function, `paintEditor()`,
+which takes no arguments — yet `paintEditor`'s body referenced the bare
+name `executionId` (to resume live-following an in-progress execution
+when the canvas is opened via `?execution=<id>`). Under `"use strict"`
+that's a `ReferenceError`, not a silent `undefined`, so **every** call
+to `route()` that reached the editor (`#/workflows/<id>`, with or
+without `?execution=`) threw immediately inside `route()`'s try/catch
+and rendered the "Something went wrong — executionId is not defined"
+empty-state instead of the canvas. The editor could never open at all.
+
+This is exactly what `test/frontend/smoketest.js` caught (it wasn't
+being run before this pass, or this would have been caught immediately
+— `go build`/`vet`/`test` all stay green regardless of frontend JS
+errors, they don't touch `app.js`).
+
+Fixed by storing the execution id on `editorState` in `renderEditor`
+(`editorState.executionId = executionId || ""`) instead of relying on
+closure, and reading `editorState.executionId` inside `paintEditor`.
+
+**Verified this pass:**
+```
+go build ./...                          # clean
+go vet ./...                             # clean
+gofmt -l . (excl. third_party/)          # clean
+go test ./... -race                      # all packages pass
+cd test/frontend && npm install && node smoketest.js
+  # before fix: crashed after 3 assertions ("editor rendered a canvas"
+  #   FAIL, "both nodes rendered" FAIL, then a hard crash trying to
+  #   dispatchEvent on a node box that was never rendered)
+  # after fix: 26/26 assertions pass
+```
+
 ## This pass: fixed a real MicroFlow bug + two real workflow bugs, found by
 ## actually running "My workflow 14" end-to-end via cmd/e2echeck
 
