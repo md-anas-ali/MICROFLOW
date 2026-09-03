@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -183,10 +184,29 @@ func (SplitOutExecutor) Execute(_ context.Context, rc *engine.RunContext, node *
 
 // SplitInBatchesExecutor implements n8n's classic "Loop Over Items"
 // pattern: output 0 is "done" (empty until all batches processed),
-// output 1 is "loop" (the next batch). State (current index) is kept in
-// workflow static data keyed by node name so the loop survives across
-// separate engine.Run work-queue steps, matching how n8n's own
-// splitInBatches persists position across executions of the node.
+// output 1 is "loop" (the next batch). State (current index AND the
+// original full item list) is kept in workflow static data keyed by
+// node name so the loop survives across separate engine.Run work-queue
+// steps, matching how n8n's own splitInBatches persists position
+// across executions of the node.
+//
+// IMPORTANT: the node's own `input` argument is only trustworthy on the
+// very FIRST call. Every subsequent call happens via the loop-body's own
+// output looping back into this same node (see e.g. "Cooldown Between
+// Scenes" -> "Loop One By One" in the sample workflow), so on those
+// calls `input` is whatever the single in-flight batch's downstream
+// processing produced -- NOT the original N items. Recomputing `items
+// := flatten(input)` on every call (the previous implementation) used
+// that per-iteration input as the item list, so after the first batch
+// (batchSize=1) the "remaining" list was always just the 1 item that
+// had gone around the loop; idx (already advanced to 1) was then always
+// >= that new length of 1, so the loop silently reported "finished"
+// after exactly one iteration regardless of how many original items
+// there were -- and even then emitted an empty "done" output instead of
+// the full accumulated set, so nothing downstream of the loop ever ran.
+// This executor now snapshots the real item list once, into static
+// data, on the first call, and every later call resumes from that
+// snapshot instead of the loop body's forwarded output.
 type SplitInBatchesExecutor struct{}
 
 func (e *SplitInBatchesExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
@@ -194,16 +214,43 @@ func (e *SplitInBatchesExecutor) Execute(ctx context.Context, rc *engine.RunCont
 	if v, ok := node.Parameters["batchSize"].(float64); ok && v > 0 {
 		batchSize = int(v)
 	}
-	items := flatten(input)
 
 	var doneOut, loopOut []model.Item
 	stateKey := "splitInBatches:" + node.Name
+	idxKey := stateKey + ":idx"
+	itemsKey := stateKey + ":items"
+
 	err := rc.StaticData.WithLock(ctx, rc.Workflow.ID, func(data map[string]any) (map[string]any, error) {
-		idxF, _ := data[stateKey].(float64)
+		var items []model.Item
+		if raw, ok := data[itemsKey]; ok {
+			// Resume: reuse the original snapshot. Static data may have
+			// round-tripped through the Postgres implementation's JSON
+			// marshal/unmarshal (or not, in the in-memory test double),
+			// so re-marshal+unmarshal through the concrete type rather
+			// than relying on a direct type assertion -- that works
+			// whether raw is already []model.Item or generic
+			// []interface{}/map[string]interface{} JSON soup.
+			if b, err := json.Marshal(raw); err == nil {
+				_ = json.Unmarshal(b, &items)
+			}
+		}
+		firstCall := items == nil
+		if firstCall {
+			items = flatten(input)
+		}
+
+		idxF, _ := data[idxKey].(float64)
 		idx := int(idxF)
 		if idx >= len(items) {
-			// finished: reset for next run, emit nothing further on loop
-			delete(data, stateKey)
+			// All batches already went out on a previous call. Real n8n
+			// requires one extra call after the last batch before it
+			// emits "done" -- that's why every n8n loop body wires its
+			// last node back into the SplitInBatches node itself. Emit
+			// the full accumulated set here and clear state so the next
+			// fresh run starts over.
+			delete(data, idxKey)
+			delete(data, itemsKey)
+			doneOut = items
 			return data, nil
 		}
 		end := idx + batchSize
@@ -211,12 +258,13 @@ func (e *SplitInBatchesExecutor) Execute(ctx context.Context, rc *engine.RunCont
 			end = len(items)
 		}
 		loopOut = items[idx:end]
-		if end >= len(items) {
-			delete(data, stateKey)
-			doneOut = items // n8n emits full accumulated set on "done"
-		} else {
-			data[stateKey] = float64(end)
-		}
+		// Keep the snapshot alive (even past the last batch) so the
+		// following call -- idx now == len(items) -- can still resolve
+		// `items` from static data and emit the accumulated "done" set
+		// above, instead of only being able to see this call's forwarded
+		// single-batch input.
+		data[idxKey] = float64(end)
+		data[itemsKey] = items
 		return data, nil
 	})
 	if err != nil {

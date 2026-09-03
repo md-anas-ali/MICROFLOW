@@ -2,9 +2,11 @@ package nodes
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -134,6 +136,37 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 				return sub
 			})
 
+			// $readFileBase64(path) -- a narrow, allowlisted substitute for
+			// the Node.js `fs`/`require` module (which we deliberately do
+			// NOT expose; see the security note atop this file). Several
+			// imported n8n Code node scripts (e.g. this workflow's "Build
+			// QC Vision Request", which base64-encodes locally-extracted
+			// video frames for a vision-model API call) use
+			// `require('fs').readFileSync(path).toString('base64')` --
+			// that pattern is common enough in real n8n exports that
+			// giving it a safe equivalent is worth it, while still never
+			// handing a sandboxed script the general filesystem or
+			// module loader. Same path allowlist as ReadWriteFileExecutor
+			// (scratch dir + OS temp dir, no traversal escapes) and a
+			// hard size cap so a script can't pull a multi-hundred-MB
+			// file into the JS heap and blow the 512MB RAM budget (rule
+			// 19). Returns null (not a thrown error) on any failure --
+			// missing file, path rejected, too large -- matching the
+			// try/catch-wrapped call sites this replaces, which already
+			// treat a null/failed read as "skip this frame".
+			mustSet(vm, "$readFileBase64", func(path string) any {
+				return readFileBase64ForCode(rc, path)
+			})
+			// $readFileText(path) -- same allowlist/size-cap contract as
+			// $readFileBase64, for scripts reading a small local text
+			// file (e.g. the generated .srt subtitle file) directly as a
+			// UTF-8 string. Kept separate rather than having scripts
+			// base64-decode text themselves, since goja has no Node
+			// `Buffer` global to do that decoding with.
+			mustSet(vm, "$readFileText", func(path string) any {
+				return readFileTextForCode(rc, path)
+			})
+
 			done := make(chan struct{})
 			var resultVal goja.Value
 			var runErr error
@@ -212,6 +245,71 @@ func mustSet(vm *goja.Runtime, name string, v any) {
 	if err := vm.Set(name, v); err != nil {
 		panic(err) // programmer error (bad binding), not user input
 	}
+}
+
+// maxReadFileBase64Bytes caps what $readFileBase64 will load into RAM/JS
+// heap in one call. Generous for a single QC preview JPEG frame,
+// nowhere near enough to swallow a full rendered video (rule 19: stay
+// well inside the 512MB budget).
+const maxReadFileBase64Bytes = 5 * 1024 * 1024 // 5MB
+
+// readFileBase64ForCode implements $readFileBase64 for Code node scripts.
+// Enforces the same path allowlist as ReadWriteFileExecutor (scratch dir
+// + OS temp dir, no traversal escapes) since this is the one deliberate,
+// narrow filesystem door into an otherwise sandboxed JS VM -- everything
+// reachable through it must stay inside directories the run already
+// owns.
+func readFileBase64ForCode(rc *engine.RunContext, path string) any {
+	if path == "" {
+		return nil
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(rc.ScratchDir, path)
+	}
+	allowedRoots := []string{rc.ScratchDir, os.TempDir()}
+	if err := guardPathTraversal(allowedRoots, path); err != nil {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return nil
+	}
+	if info.Size() > maxReadFileBase64Bytes {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// readFileTextForCode implements $readFileText for Code node scripts --
+// same allowlist/size-cap contract as readFileBase64ForCode, returning
+// the file's content decoded as a UTF-8 string instead of base64.
+func readFileTextForCode(rc *engine.RunContext, path string) any {
+	if path == "" {
+		return nil
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(rc.ScratchDir, path)
+	}
+	allowedRoots := []string{rc.ScratchDir, os.TempDir()}
+	if err := guardPathTraversal(allowedRoots, path); err != nil {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return nil
+	}
+	if info.Size() > maxReadFileBase64Bytes {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return string(b)
 }
 
 // maxConsoleLogBytes bounds a single console.log/warn/etc call's

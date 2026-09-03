@@ -185,7 +185,19 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		if err != nil {
 			return nil, fmt.Errorf("youTube %q upload: %w", node.Name, err)
 		}
-		out = append(out, model.Item{JSON: map[string]any{"videoId": videoID}})
+		// Field name bug: this used to emit only "videoId", but every
+		// real n8n YouTube-node-derived workflow (and the YouTube Data
+		// API v3 videos.insert response itself, which literally returns
+		// {"id": "...", "snippet": {...}, "status": {...}}) reads the
+		// uploaded video's ID off "id", e.g. `$node("YouTube Upload
+		// (Scheduled)").json.id`. That expression silently resolved to
+		// undefined against the old shape -- not a thrown error, so it
+		// surfaced downstream as a literal "<nil>"/"undefined" baked
+		// into thumbnail-set URLs, comment bodies, and log messages
+		// instead of the real video ID. Emit "id" (matching real n8n)
+		// and keep "videoId" alongside it for any script written
+		// against MicroFlow's previous shape.
+		out = append(out, model.Item{JSON: map[string]any{"id": videoID, "videoId": videoID}})
 	}
 	return model.NodeOutput{out}, nil
 }
