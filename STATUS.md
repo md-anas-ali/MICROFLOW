@@ -1,6 +1,149 @@
 # MicroFlow — STATUS (read this first)
 
-## Latest fix: editor crashed on load (`executionId is not defined`)
+## Latest pass: re-imported "My workflow 14" from the live n8n canvas had
+## drifted from the previously-fixed reference copy, plus a real
+## MicroFlow engine bug that silently truncated every multi-item loop
+## to one iteration
+
+The user re-exported their workflow from n8n after further edits on the
+live canvas (removing Gemini as a fallback model tier, among other
+changes). That re-export had reverted several nodes to pre-fix state
+and exposed one new engine-level bug and one new n8n-compatibility gap.
+Found and fixed by actually running the workflow end-to-end via
+`cmd/e2echeck`, not by inspection alone — five fix→retest cycles, each
+one driven by a real failure the previous fix's retest surfaced:
+
+1. **Workflow bug — every "live free-model discovery" controller was
+   silently always empty.** All five controllers (Model / Fact /
+   Semantic / Image Prompt / QC Model Controller) read
+   `$node('Fetch OpenRouter Models...').json.json` — that extra `.json`
+   doesn't exist in n8n's real (non-fullResponse) HTTP node output
+   shape, so the inner value was always `undefined`, the live model
+   list was always empty, and (for the four controllers with a Gemini
+   fallback) every AI call silently ran on Gemini only, never actually
+   using OpenRouter's live free list despite the code's own comments
+   saying that's the point. Fixed all five to read `$node(...).json`
+   directly.
+2. **MicroFlow bug — Model Controller (no Gemini fallback, by the
+   user's own design) crashed the whole run** when its model queue
+   came up empty (`TypeError: Cannot read property 'model' of
+   undefined`), instead of failing into its own existing retry loop.
+   Added a safe empty-queue fallback so it degrades to a normal retry
+   instead of an unhandled exception.
+3. **Workflow bug — Get Image / Fallback Image (turbo) / Fallback Image
+   2 / Image Retry Router had reverted to the pre-fix version**
+   (missing `fullResponse` option, `$json` instead of
+   `$node["Prep Scene"]` on retries) that a previous pass already
+   diagnosed and fixed (see the "two real workflow bugs" entry below).
+   Re-applied that fix.
+4. **MicroFlow engine bug — `SplitInBatchesExecutor` ("Loop One By One"
+   / n8n's classic Split-In-Batches loop) recomputed its item list from
+   the CURRENT call's `input` on every invocation.** That's correct on
+   the very first call, but every later call happens via the loop
+   body's own output looping back into the same node — so `input` on
+   those calls is only the single batch that just went around, not the
+   original N items. With batchSize=1 (the default) this made the loop
+   always report "finished" after exactly ONE iteration regardless of
+   how many items it started with, and even then emitted an empty
+   "done" output instead of the accumulated set — so a 5-scene video
+   workflow silently only ever processed scene 1 and never reached
+   final assembly/upload, with no error anywhere. This is a generic
+   engine bug, not specific to this workflow — it would truncate every
+   imported workflow's SplitInBatches loop the same way. Fixed to
+   snapshot the real item list once into workflow static data on the
+   first call and resume from that snapshot on every later call,
+   verified to survive a real JSON marshal/unmarshal round-trip (not
+   just the in-memory test double) since the Postgres-backed store
+   does exactly that on every `WithLock`. Regression test:
+   `internal/nodes/control_test.go` (`TestSplitInBatchesLoopsOverAllItems`).
+5. **`require('fs')` used in two Code nodes** ("Build QC Vision
+   Request", "Execution Log") to base64-encode local frame files /
+   read a small timestamp file. MicroFlow's Code executor deliberately
+   has no `require`/filesystem access (a real security boundary, not
+   an oversight — see the security note atop `internal/nodes/code.go`).
+   Rather than weaken that, added two narrow, allowlisted primitives:
+   `$readFileBase64(path)` and `$readFileText(path)`, both scoped to
+   the run's own scratch dir + the OS temp dir (same allowlist
+   `ReadWriteFileExecutor` already uses) with a 5MB size cap, and
+   updated both nodes to use them instead of `require('fs')`.
+6. **MicroFlow bug — the YouTube video-upload executor returned
+   `{"videoId": ...}`, but every downstream reference (and the real
+   YouTube Data API v3 `videos.insert` response itself) uses `.id`.**
+   This didn't throw — the expression just silently resolved to
+   `undefined`/`<nil>`, which then got baked into the thumbnail-set
+   URL, the pin-comment reminder link, and the execution log with no
+   error anywhere. This is a generic MicroFlow bug that would break the
+   same way for any real n8n-exported workflow with a YouTube upload
+   step. Fixed to emit `id` (matching real n8n) alongside the old
+   `videoId` key for backward compatibility.
+7. **`cmd/e2echeck`'s own harness had a 90-second wall-clock cap**,
+   which is fine for a smoke test but too short for a real end-to-end
+   run of a workflow that deliberately paces itself with production
+   rate-limit waits (~85s of real `Wait`/cooldown sleeps across a
+   5-scene run) plus genuine FFmpeg render time. The run was being cut
+   off mid-`Check Final Video` and misreported as a per-command FFmpeg
+   timeout, when the actual cause was the harness's own outer deadline.
+   Raised to 10 minutes (`MaxSteps=400` already bounds a genuine
+   infinite-retry-loop bug independently of wall-clock time, so this
+   doesn't weaken that protection).
+
+**Verified this pass:**
+
+```
+go build ./...                          # clean
+go vet ./...                            # clean
+gofmt -l . (excl. third_party/)         # clean
+go test ./... -race                     # all packages pass, incl. new
+                                         #   TestSplitInBatchesLoopsOverAllItems
+go run ./cmd/e2echeck test/testdata/sample_workflow.json
+  # before fixes: crashed at node 14 ("Model Controller",
+  #   TypeError: Cannot read property 'model' of undefined)
+  # after fixes 1-3: 61/61 nodes success (one scene) -- matched the
+  #   previously-verified checkpoint, but that turned out to be masking
+  #   bug #4 below (only one scene ever ran, not five)
+  # after fix #4 (SplitInBatches): 116/116 nodes success through QC
+  #   frame extraction, then hit bug #5 (require('fs'))
+  # after fix #5: 114/115 nodes, "Check Final Video" misreported as a
+  #   5-minute FFmpeg timeout -- actually harness bug #7
+  # after fix #7 (10-minute cap): 138/138 nodes success, full 5-scene
+  #   run, real FFmpeg concat/color-grade/subtitle render (~18s),
+  #   QC vision check, thumbnail, YouTube upload, comment, thumbnail-set
+  #   -- but with videoId=<nil>/undefined baked into 3 places (bug #6)
+  # after fix #6: 138/138 nodes success, videoId resolves correctly
+  #   everywhere (thumbnail URL, comment body, execution log,
+  #   pin-comment reminder link). Full run ~88s wall clock.
+```
+
+`test/testdata/sample_workflow.json` has been updated to this pass's
+corrected workflow (all 6 fixes applied) so `cmd/e2echeck` exercises the
+fixed path by default going forward.
+
+**RAM / concurrency / scratch-dir requirements (re-verified, no changes
+needed — already correct from a previous pass):** `MICROFLOW_SCRATCH_DIR`
+defaults to `/tmp/microflow` (real disk, not an in-RAM path);
+`ReadWriteFileExecutor` and the HTTP executor's `fullResponse` path both
+spool binary data to disk rather than buffering it in the Go heap;
+`MICROFLOW_MAX_CONCURRENT_EXECUTIONS` defaults to 1 (one full workflow
+run at a time) and `Engine.MaxConcurrentHeavy` defaults to 2 (bounds
+simultaneous FFmpeg/TTS/HTTP calls within a run); `MemGuard` throttles
+new heavy work above a configurable heap ceiling (`MICROFLOW_HEAP_CEILING_MB`,
+default 220MB, well under the 512MB container total).
+
+**Note on `cmd/e2echeck` as "the lightweight non-AI compatibility
+checker":** its own binary is ~13MB (`go build -ldflags="-s -w"`), not
+1-3MB, because it statically links a real JS engine (goja) to actually
+syntax-check and execute every Code node's script, not just pattern-match
+node types. That's a deliberate trade-off — a true sub-3MB tool would
+have to drop either the real JS syntax check or the real engine
+execution, at which point it stops catching bugs like #1-#6 above and
+becomes a much weaker linter. It's a dev-time/audit-time CLI, though —
+it's never deployed to Render and never runs inside the 512MB service
+process, so its binary size doesn't compete with the runtime RAM budget
+at all.
+
+---
+
+## Previous fix: editor crashed on load (`executionId is not defined`)
 
 `renderEditor(id, executionId)` took `executionId` as a parameter but
 handed off rendering to a separate top-level function, `paintEditor()`,
