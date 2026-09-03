@@ -79,10 +79,24 @@ func runEngine(res *parser.ParseResult, startNode string) {
 		ScratchDir: scratch,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// 90s was a reasonable cap for a smoke test that only exercises one
+	// or two nodes, but a real end-to-end run of a workflow like this
+	// one deliberately paces itself with production rate-limit waits
+	// (Wait Before Fact Check, Wait Before Semantic Check, Wait Before
+	// Image x5, Cooldown Between Scenes x5 -- ~85s of real sleep alone
+	// across a 5-scene run) plus genuine FFmpeg render time for the
+	// concat/subtitle/QC-frame steps. A 90s cap cut the run off mid-way
+	// through "Check Final Video" and mis-reported it as a per-command
+	// FFmpeg timeout, when the actual cause was this harness's own
+	// outer deadline elapsing first. 10 minutes comfortably covers one
+	// full multi-scene run with room to spare, while still catching a
+	// genuine infinite-retry-loop bug (which MaxSteps=400 bounds
+	// independently of wall-clock time).
+	const wallClockCap = 10 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), wallClockCap)
 	defer cancel()
 
-	fmt.Printf("=== Engine run: starting at %q (MaxSteps=%d, 90s wall clock cap) ===\n", startNode, eng.MaxSteps)
+	fmt.Printf("=== Engine run: starting at %q (MaxSteps=%d, %s wall clock cap) ===\n", startNode, eng.MaxSteps, wallClockCap)
 	start := time.Now()
 	_, runErr := eng.Run(ctx, rc, startNode, model.NodeOutput{{{JSON: map[string]any{}}}})
 	elapsed := time.Since(start)
