@@ -33,6 +33,21 @@ const workflow = {
   settings: {},
 };
 
+const execution9 = {
+  id: "exec9",
+  workflowId: "wf1",
+  mode: "manual",
+  status: "error",
+  startedAt: new Date(Date.now() - 5000).toISOString(),
+  finishedAt: new Date().toISOString(),
+  error: "boom",
+  nodeRuns: [
+    { nodeName: "A", status: "success", startedAt: new Date(Date.now() - 5000).toISOString(), durationMs: 1000000, attempt: 1 },
+    { nodeName: "B", status: "error", startedAt: new Date(Date.now() - 4000).toISOString(), durationMs: 2000000, attempt: 1, error: "boom" },
+  ],
+};
+const debugReportRequests = [];
+
 async function main() {
   const dom = new JSDOM(html, { url: "http://localhost/#/workflows/wf1", runScripts: "outside-only", pretendToBeVisual: true });
   const { window } = dom;
@@ -70,6 +85,37 @@ async function main() {
     }
     if (u === "/api/executions/exec1" && (!opts.method || opts.method === "GET")) {
       return json({ id: "exec1", workflowId: "wf1", mode: "manual", status: "queued", startedAt: new Date().toISOString(), nodeRuns: [] });
+    }
+    // --- "1-Click Full Execution Copy / Debug Report" feature ---
+    if (u === "/api/executions?limit=100" && (!opts.method || opts.method === "GET")) {
+      return json({ queue: { accepted: 0, running: 0, waiting: 0, maxConcurrent: 1, maxQueued: 5 }, executions: [execution9] });
+    }
+    if (u === "/api/executions/exec9" && (!opts.method || opts.method === "GET")) {
+      return json(execution9);
+    }
+    if (u.indexOf("/api/executions/exec9/debug-report") === 0 && (!opts.method || opts.method === "GET")) {
+      debugReportRequests.push(u);
+      if (u.indexOf("format=text") !== -1 && u.indexOf("scope=error") !== -1) {
+        return {
+          ok: true, status: 200,
+          headers: { get: () => "text/plain; charset=utf-8" },
+          text: async () => "MICROFLOW \u2014 ERROR REPORT\n\nNode: B\nError: boom\n",
+        };
+      }
+      if (u.indexOf("format=text") !== -1) {
+        return {
+          ok: true, status: 200,
+          headers: { get: () => "text/plain; charset=utf-8" },
+          text: async () => "MICROFLOW \u2014 FULL EXECUTION REPORT\n\nNODE 1\n...\nNODE 2\n...\n",
+        };
+      }
+      // default: format=json (the download)
+      const jsonBody = JSON.stringify({ summary: { executionId: "exec9" }, nodes: [] });
+      return {
+        ok: true, status: 200,
+        headers: { get: (h) => (h === "Content-Disposition" ? 'attachment; filename="microflow-execution-exec9.json"' : "application/json") },
+        blob: async () => new window.Blob([jsonBody], { type: "application/json" }),
+      };
     }
     throw new Error("unmocked fetch: " + opts.method + " " + u);
   };
@@ -232,6 +278,65 @@ async function main() {
   const namesAfterReload = Array.from(doc2.querySelectorAll(".node-box")).map((b) => b.dataset.node).sort();
   ok("reload shows the same node set that was saved (2 nodes, code node gone)", namesAfterReload.length === 2 && namesAfterReload.includes("A") && namesAfterReload.includes("B"));
   ok("reload shows the reconnected A->B edge", doc2.querySelectorAll(".conn").length === 1);
+
+  // --- "1-Click Full Execution Copy / Debug Report" buttons on the
+  // Executions page (see internal/api's GET .../debug-report and this
+  // file's wireDebugReportButtons/copyExecutionReport/
+  // downloadExecutionJSON). Uses the original `dom`/`window`/`doc` --
+  // its fetch mock already covers /api/executions*, and its
+  // FakeEventSource already stands in for the executions monitor's
+  // global SSE stream. ---
+
+  // jsdom implements neither the async Clipboard API nor
+  // document.execCommand/URL.createObjectURL -- stand in for exactly
+  // the browser surface app.js actually calls so this exercises the
+  // real copyTextToClipboard/downloadExecutionJSON code paths instead
+  // of skipping them.
+  let lastCopiedText = null;
+  window.navigator.clipboard = undefined; // force the execCommand fallback path, like a non-HTTPS deployment
+  window.document.execCommand = (cmd) => {
+    if (cmd === "copy") {
+      lastCopiedText = window.document.activeElement && window.document.activeElement.value;
+      return true;
+    }
+    return false;
+  };
+  let lastBlobCreated = null;
+  window.URL.createObjectURL = (blob) => { lastBlobCreated = blob; return "blob:mock-url"; };
+  window.URL.revokeObjectURL = () => {};
+  let lastAnchorClicked = null;
+  const origAnchorClick = window.HTMLAnchorElement.prototype.click;
+  window.HTMLAnchorElement.prototype.click = function () { lastAnchorClicked = this; };
+
+  window.location.hash = "#/executions/exec9";
+  await new Promise((r) => setTimeout(r, 20));
+
+  ok("execution detail shows the 3 debug-report buttons", !!doc.getElementById("detailCopyFull") && !!doc.getElementById("detailCopyError") && !!doc.getElementById("detailDownloadJson"));
+
+  // Copy Full Execution
+  doc.getElementById("detailCopyFull").dispatchEvent(new window.Event("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  ok("Copy Full Execution requested format=text&scope=full", debugReportRequests.some((u) => u.indexOf("format=text") !== -1 && u.indexOf("scope=full") !== -1 || (u.indexOf("format=text") !== -1 && u.indexOf("scope=") === -1)));
+  ok("Copy Full Execution copied the full report text to the clipboard", !!lastCopiedText && lastCopiedText.indexOf("FULL EXECUTION REPORT") !== -1);
+  ok("Copy Full Execution showed the success toast", doc.body.textContent.indexOf("Full execution copied to clipboard") !== -1);
+
+  // Copy Error Report
+  lastCopiedText = null;
+  doc.getElementById("detailCopyError").dispatchEvent(new window.Event("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  ok("Copy Error Report requested scope=error", debugReportRequests.some((u) => u.indexOf("scope=error") !== -1));
+  ok("Copy Error Report copied only the error report text to the clipboard", !!lastCopiedText && lastCopiedText.indexOf("ERROR REPORT") !== -1);
+  ok("Copy Error Report showed the success toast", doc.body.textContent.indexOf("Error report copied to clipboard") !== -1);
+
+  // Download Execution JSON
+  doc.getElementById("detailDownloadJson").dispatchEvent(new window.Event("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  ok("Download Execution JSON requested the JSON (non-text) format", debugReportRequests.some((u) => u.indexOf("format=text") === -1));
+  ok("Download Execution JSON created a downloadable blob", !!lastBlobCreated);
+  ok("Download Execution JSON triggered a click on an <a download> element", !!lastAnchorClicked && lastAnchorClicked.download === "microflow-execution-exec9.json");
+  ok("Download Execution JSON showed the success toast", doc.body.textContent.indexOf("Execution JSON downloaded") !== -1);
+
+  window.HTMLAnchorElement.prototype.click = origAnchorClick;
 
   console.log(failures === 0 ? "\nALL SMOKE TESTS PASSED" : "\n" + failures + " SMOKE TEST(S) FAILED");
   process.exit(failures === 0 ? 0 : 1);
