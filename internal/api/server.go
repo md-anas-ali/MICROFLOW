@@ -18,6 +18,7 @@ import (
 
 	"microflow/internal/model"
 	"microflow/internal/parser"
+	"microflow/internal/report"
 	"microflow/internal/runner"
 	"microflow/internal/store"
 	"microflow/internal/vault"
@@ -132,6 +133,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/executions/{id}", s.handleGetExecution)
 	s.mux.HandleFunc("POST /api/executions/{id}/cancel", s.handleCancelExecution)
 	s.mux.HandleFunc("GET /api/executions/{id}/events", s.handleExecutionEvents)
+
+	// 1-Click Full Execution Copy / Debug Report (spec: "Copy Full
+	// Execution" / "Copy Error Report" / "Download Execution JSON").
+	// One endpoint, ?format=json|text&scope=full|error selects the
+	// three response shapes the frontend needs -- see handleDebugReport.
+	s.mux.HandleFunc("GET /api/executions/{id}/debug-report", s.handleDebugReport)
 
 	s.mux.HandleFunc("GET /api/workflows/{id}/credentials", s.handleListCredentials)
 	s.mux.HandleFunc("POST /api/workflows/{id}/credentials", s.handleSaveCredential)
@@ -419,23 +426,33 @@ func (s *Server) handleAllExecutionEvents(w http.ResponseWriter, r *http.Request
 // it (see runner.finishedRetention) or for executions that were never
 // started through this Manager at all (scheduler/webhook runs).
 func (s *Server) handleGetExecution(w http.ResponseWriter, r *http.Request) {
-	execID := r.PathValue("id")
-	if s.manager != nil {
-		if ex, ok := s.manager.Get(execID); ok {
-			writeJSON(w, http.StatusOK, ex)
-			return
-		}
-	}
-	if s.execLoader == nil {
-		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
-		return
-	}
-	ex, err := s.execLoader.GetExecution(r.Context(), execID)
-	if err != nil {
+	ex, ok := s.resolveExecution(r.Context(), r.PathValue("id"))
+	if !ok {
 		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
 		return
 	}
 	writeJSON(w, http.StatusOK, ex)
+}
+
+// resolveExecution looks up one execution the same way handleGetExecution
+// always has: the live in-memory record from Manager first (queued/
+// running/just-finished), falling back to the durable store. Factored
+// out so handleGetExecution and handleDebugReport share the exact same
+// lookup/fallback behavior instead of two copies drifting apart.
+func (s *Server) resolveExecution(ctx context.Context, execID string) (*model.Execution, bool) {
+	if s.manager != nil {
+		if ex, ok := s.manager.Get(execID); ok {
+			return ex, true
+		}
+	}
+	if s.execLoader == nil {
+		return nil, false
+	}
+	ex, err := s.execLoader.GetExecution(ctx, execID)
+	if err != nil || ex == nil {
+		return nil, false
+	}
+	return ex, true
 }
 
 // handleCancelExecution requests cancellation of a queued or running
@@ -469,6 +486,73 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelling"})
+}
+
+// handleDebugReport backs the "1-Click Full Execution Copy / Debug
+// Report" feature: one read-only endpoint over data the engine/store
+// already persist (no new execution behavior, no schema change, no
+// extra copy of node data kept anywhere -- report.Build reads straight
+// off the same *model.Execution handleGetExecution serves).
+//
+// Query params:
+//
+//	format=json (default) -- the full structured DebugReport, for
+//	  "Download Execution JSON". Content-Disposition: attachment so a
+//	  plain link/fetch triggers a real file download.
+//	format=text -- a human-readable report, for the "Copy" buttons.
+//	  scope=full (default) -- every node ("Copy Full Execution").
+//	  scope=error -- only failed/cancelled nodes ("Copy Error Report").
+//
+// Secrets: every string this handler can reach has already passed
+// through internal/engine.SecretRedactor once (at persistence time)
+// and through report's own independent masking pass a second time
+// (see internal/report's package doc) -- never raw credential
+// material, regardless of format.
+func (s *Server) handleDebugReport(w http.ResponseWriter, r *http.Request) {
+	execID := r.PathValue("id")
+	ex, ok := s.resolveExecution(r.Context(), execID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
+		return
+	}
+
+	// The workflow backs node id/type/graph-position lookups only --
+	// it's genuinely optional (spec: never fail the whole report over
+	// missing enrichment data). A deleted/renamed workflow just means
+	// those specific fields render as "None" (see report.Build).
+	var wf *model.Workflow
+	if s.workflows != nil {
+		if loaded, err := s.workflows.LoadWorkflow(r.Context(), ex.WorkflowID); err == nil {
+			wf = loaded
+		}
+	}
+
+	rpt := report.Build(wf, ex)
+
+	format := r.URL.Query().Get("format")
+	if format == "text" {
+		scope := r.URL.Query().Get("scope")
+		var body string
+		if scope == "error" {
+			body = rpt.FormatErrorText()
+		} else {
+			body = rpt.FormatFullText()
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+		return
+	}
+
+	raw, err := rpt.ToJSON()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to build debug report"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="microflow-execution-`+sanitizeExportFilename(execID)+`.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 // writeSSEEvent writes one event as a plain default-"message" SSE
