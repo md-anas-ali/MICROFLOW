@@ -355,6 +355,9 @@
         '<div class="exec-detail-actions">' +
         (!(["success", "error", "cancelled"].indexOf(ex.status) >= 0) ? '<button id="detailCancel" class="btn btn-danger btn-sm">Cancel</button>' : '') +
         (workflowID && workflowNames[workflowID] ? '<a class="btn btn-sm" href="#/workflows/' + encodeURIComponent(workflowID) + '?execution=' + encodeURIComponent(ex.id) + '">Open live canvas</a>' : '') +
+        '<button id="detailCopyFull" class="btn btn-sm" title="Copy a complete human-readable diagnostic report for this execution">\uD83D\uDCCB Copy Full Execution</button>' +
+        '<button id="detailCopyError" class="btn btn-sm" title="Copy only the failed/error nodes plus debugging info">\uD83D\uDD34 Copy Error Report</button>' +
+        '<button id="detailDownloadJson" class="btn btn-sm" title="Download the complete raw execution data as JSON">\uD83D\uDCE6 Download Execution JSON</button>' +
         '</div>' +
         '<div class="exec-node-list">' + (runs.length ? runs.map(renderNodeRun).join("") : '<div class="empty-state">Waiting for the first node event…</div>') + '</div>';
       detailHost.querySelectorAll(".node-run-head").forEach((h) => h.addEventListener("click", () => h.parentElement.classList.toggle("open")));
@@ -364,8 +367,103 @@
         try { await apiJSON("/api/executions/" + encodeURIComponent(ex.id) + "/cancel", { method: "POST" }); toast("Cancellation requested", "success"); }
         catch (e) { toast("Cancel failed: " + e.message, "error"); cancel.disabled = false; }
       });
+      wireDebugReportButtons(ex.id);
       if (live && ["success", "error", "cancelled"].indexOf(ex.status) < 0) followExecutionDetail(ex.id);
       else if (executionDetailES && detailFollowID === ex.id) { executionDetailES.close(); executionDetailES = null; detailFollowID = ""; }
+    }
+
+    // wireDebugReportButtons wires the "1-Click Full Execution Copy /
+    // Debug Report" buttons to GET /api/executions/{id}/debug-report
+    // (see internal/api/server.go's handleDebugReport / internal/report
+    // for the endpoint and internal/report/report.go for the report
+    // content itself -- secret masking, "None" for missing fields,
+    // truncation of huge inline blobs). Every click re-fetches from
+    // that single read-only endpoint; nothing is cached or duplicated
+    // in the frontend.
+    function wireDebugReportButtons(execID) {
+      const copyFullBtn = document.getElementById("detailCopyFull");
+      const copyErrorBtn = document.getElementById("detailCopyError");
+      const downloadBtn = document.getElementById("detailDownloadJson");
+      if (copyFullBtn) copyFullBtn.addEventListener("click", () => copyExecutionReport(execID, "full", copyFullBtn));
+      if (copyErrorBtn) copyErrorBtn.addEventListener("click", () => copyExecutionReport(execID, "error", copyErrorBtn));
+      if (downloadBtn) downloadBtn.addEventListener("click", () => downloadExecutionJSON(execID, downloadBtn));
+    }
+
+    // copyTextToClipboard uses the standard async Clipboard API where
+    // available (secure context required), falling back to the legacy
+    // execCommand("copy") path (works on http:// / older browsers) so
+    // "Copy" doesn't silently do nothing on a non-HTTPS deployment.
+    // Never throws -- resolves false on any failure so callers can
+    // show the standard "could not copy" toast instead of an
+    // unhandled rejection.
+    async function copyTextToClipboard(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); return true; }
+        catch (_) { /* fall through to the legacy path below */ }
+      }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // copyExecutionReport backs "Copy Full Execution" (scope="full")
+    // and "Copy Error Report" (scope="error"): GET the human-readable
+    // text report and put it on the clipboard.
+    async function copyExecutionReport(execID, scope, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api("/api/executions/" + encodeURIComponent(execID) + "/debug-report?format=text&scope=" + encodeURIComponent(scope));
+        const text = await res.text();
+        const ok = await copyTextToClipboard(text);
+        if (!ok) throw new Error("clipboard write failed");
+        toast(scope === "error" ? "\u2713 Error report copied to clipboard" : "\u2713 Full execution copied to clipboard", "success");
+      } catch (e) {
+        toast("\u2715 Could not copy execution report", "error");
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    // downloadExecutionJSON backs "Download Execution JSON": GET the
+    // full raw JSON report (untruncated -- see report.ToJSON) and save
+    // it as a file. Fetched as a blob (rather than navigating the
+    // window to the URL) so a 404/network failure surfaces as the
+    // normal failure toast instead of a broken top-level navigation.
+    async function downloadExecutionJSON(execID, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api("/api/executions/" + encodeURIComponent(execID) + "/debug-report");
+        const blob = await res.blob();
+        let filename = "microflow-execution-" + execID + ".json";
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/.exec(disp);
+        if (m && m[1]) filename = m[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+        toast("\u2713 Execution JSON downloaded", "success");
+      } catch (e) {
+        toast("\u2715 Could not download execution JSON", "error");
+      } finally {
+        if (btn) btn.disabled = false;
+      }
     }
 
     function followExecutionDetail(execID) {
