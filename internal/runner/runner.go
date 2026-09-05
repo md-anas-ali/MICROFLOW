@@ -88,6 +88,21 @@ func New(workflows WorkflowLoader, execs ExecutionSaver, eng *engine.Engine, sta
 	}
 }
 
+// WithTimeout overrides the default 30-minute Timeout. Exposed as a
+// setter (rather than requiring callers to poke the field directly)
+// so cmd/server can wire it from an env var the same way it wires
+// MemGuard/NodeRunCap -- a 30-minute flat cap is far too short for a
+// large real-world pipeline (AI generation + TTS + FFmpeg rendering
+// across 100+ nodes can easily run well past 30 minutes end to end),
+// and the right number depends on the operator's own workflow, not on
+// this package.
+func (r *Runner) WithTimeout(d time.Duration) *Runner {
+	if d > 0 {
+		r.Timeout = d
+	}
+	return r
+}
+
 // WithMemGuard attaches a MemGuard so every future RunFromNode call's
 // RunContext carries it. Optional -- a Runner with no guard behaves
 // exactly as before (nil MemGuard is a documented no-op).
@@ -121,8 +136,6 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	if _, ok := wf.Nodes[startNode]; !ok {
 		return nil, fmt.Errorf("runner: workflow %q has no node named %q", workflowID, startNode)
 	}
-	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
-	defer cancel()
 
 	// Bound this run by the shared execution semaphore (see
 	// WithConcurrencyLimit's doc comment) so scheduler/webhook runs
@@ -131,14 +144,30 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	// A Runner with no semaphore configured (r.sem == nil) runs
 	// unbounded, same as before this fix -- only bare Runners built
 	// without ever calling WithConcurrencyLimit/NewManager hit this.
+	//
+	// Bug fix: this wait used to happen *inside* the r.Timeout window
+	// (the timeout context was created first, then waited on for the
+	// semaphore). With a low-RAM deployment's typical
+	// MICROFLOW_MAX_CONCURRENT_EXECUTIONS=1, a run queued behind an
+	// already-running execution burned its entire Timeout budget just
+	// sitting in line, then had almost nothing left once it actually
+	// started -- observed in practice as a run getting cancelled with
+	// "context deadline exceeded" a couple of minutes after its first
+	// node started, even though the run itself was healthy. The
+	// semaphore wait now uses the caller's own ctx (no extra
+	// deadline); r.Timeout's clock only starts once a worker slot is
+	// actually acquired, i.e. once the run can really begin.
 	if r.sem != nil {
 		select {
 		case r.sem <- struct{}{}:
-		case <-runCtx.Done():
-			return nil, fmt.Errorf("runner: %w waiting for a free execution slot", runCtx.Err())
+		case <-ctx.Done():
+			return nil, fmt.Errorf("runner: %w waiting for a free execution slot", ctx.Err())
 		}
 		defer func() { <-r.sem }()
 	}
+
+	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
+	defer cancel()
 
 	return r.runOnce(runCtx, wf, newID(), startNode, mode, seed, nil)
 }

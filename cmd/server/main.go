@@ -235,9 +235,20 @@ func main() {
 	// in-memory step-by-step history; the terminal status/error and the
 	// last few steps (what actually matters for diagnosing a failure)
 	// are still always kept.
+	// MICROFLOW_EXECUTION_TIMEOUT_MINUTES bounds one full workflow run
+	// (rule 22: nothing unbounded). Default raised from the package's
+	// old 30-minute default to 180: a large real workflow (AI script
+	// generation with retries, TTS, FFmpeg rendering across 100+
+	// nodes) can legitimately run well past 30 minutes end to end, and
+	// 30 minutes was observed cutting off healthy runs. Note this
+	// clock only starts once a run actually acquires a worker slot
+	// (see internal/runner.RunFromNode / Manager.runJob) -- time spent
+	// queued behind another run under MICROFLOW_MAX_CONCURRENT_EXECUTIONS
+	// no longer counts against it.
 	run := runner.New(st, st, eng, st, creds, scratchRoot).
 		WithMemGuard(memGuard).
-		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12))
+		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12)).
+		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
 
 	// Async execution (spec sections M/N): bounded worker pool on top
 	// of the same Runner -- MaxConcurrentExecutions caps simultaneous

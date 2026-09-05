@@ -1,6 +1,65 @@
 # MicroFlow — STATUS (read this first)
 
-## Latest pass: re-imported "My workflow 14" from the live n8n canvas had
+## Latest pass: real execution report showed a run cancelled after
+## 30 minutes having done almost nothing — root cause was a runner
+## bug, not the workflow
+
+The user ran the previous build against their real workflow and sent
+back the execution's debug-report JSON: `executionStatus: CANCELLED`,
+`mainError: "context deadline exceeded"`, only 12 of 117 nodes
+executed, `totalDuration: 30m3s`. All 12 nodes that did run succeeded
+with no errors, which was the tell that this wasn't a workflow bug.
+
+Diagnosis from the report's own timestamps: the execution record's
+`startTime` was 09:49:10, but its first node didn't start until
+10:17:19 — a 28-minute gap with zero recorded node activity, followed
+by only ~2 minutes of real node execution before the 30-minute cutoff
+fired mid-run.
+
+**Root cause (`internal/runner/async.go` + `runner.go`):** both the
+async execute path (`Manager.Start`/`runJob`) and the sync
+scheduler/webhook path (`RunFromNode`) created the run's
+`context.WithTimeout(..., r.Timeout)` (30 min, hardcoded) *before*
+waiting to acquire a worker slot from the concurrency semaphore, then
+used that same context for both the wait and the run. With this
+deployment's low-RAM default of `MICROFLOW_MAX_CONCURRENT_EXECUTIONS=1`
+(a single worker), an execution queued behind an already-running one
+had its 30-minute budget ticking down the entire time it sat waiting
+in line — so by the time it actually got a worker slot, almost nothing
+was left, and it died a couple of minutes later with "context deadline
+exceeded" even though the run itself was healthy and making normal
+progress.
+
+**Fixes:**
+
+1. `Manager.Start`/`runJob` now use a plain cancellable
+   `context.Context` (no deadline) for the semaphore wait; the
+   `r.Timeout`-bounded run context is created only once a worker slot
+   is actually acquired, derived from the same cancellable context so
+   an explicit `Cancel()` still works at any point.
+2. `RunFromNode` gets the identical fix for the scheduler/webhook path.
+3. Added `Runner.WithTimeout(d time.Duration)` and wired
+   `MICROFLOW_EXECUTION_TIMEOUT_MINUTES` (default raised **30 → 180**)
+   in `cmd/server/main.go` — a 117-node pipeline with AI generation,
+   TTS, and FFmpeg rendering can legitimately run well past 30 minutes
+   even with no queueing involved, so the flat 30-minute default was
+   already too aggressive on top of the queueing bug.
+4. Regression test: `internal/runner/async_test.go`
+   (`TestManagerQueueWaitDoesNotConsumeTimeout`) — occupies the sole
+   worker slot directly, starts a queued execution behind it, holds
+   the slot for 3x the configured timeout, then frees it and asserts
+   the queued execution still completes successfully. Confirmed this
+   test fails on the pre-fix code and passes on the fix (reverted the
+   fix locally, watched it fail with the same symptom — status
+   `cancelled` instead of `success` — then restored it).
+
+**Verified this pass:** `go build ./...`, `go vet ./...`, `gofmt -l .`,
+and `go test ./... -race` all clean; `test/frontend/smoketest.js`
+34/34 passing; `cmd/e2echeck` against the user's own workflow JSON —
+all 123 nodes parse, all connections resolve, full run completes with
+no errors.
+
+## Previous pass: re-imported "My workflow 14" from the live n8n canvas had
 ## drifted from the previously-fixed reference copy, plus a real
 ## MicroFlow engine bug that silently truncated every multi-item loop
 ## to one iteration

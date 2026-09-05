@@ -277,9 +277,11 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	// ctx: that request context is cancelled the moment the handler
 	// returns 202, which must NOT cancel a run that's only just been
 	// queued (section M: "Client disconnect MUST NOT cancel the
-	// workflow automatically"). r.Timeout is still the run's own outer
-	// bound; explicit Cancel() is the only other way this fires early.
-	runCtx, cancel := context.WithTimeout(context.Background(), m.r.Timeout)
+	// workflow automatically"). This queueCtx has no deadline of its
+	// own -- it only carries cancellation (from an explicit Cancel()
+	// call). r.Timeout's clock is deliberately NOT started here; see
+	// runJob, which starts it only once a worker slot is acquired.
+	queueCtx, cancel := context.WithCancel(context.Background())
 
 	rs := &runState{
 		ex: &model.Execution{
@@ -302,18 +304,34 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	}
 	m.publish(rs, Event{Type: EventExecutionCreated, ExecutionID: execID, Time: time.Now(), Status: model.StatusQueued})
 
-	go m.runJob(runCtx, wf, execID, startNode, mode, seed, rs)
+	go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs)
 
 	return execID, nil
 }
 
-func (m *Manager) runJob(ctx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState) {
+// runJob waits for a worker slot on queueCtx (cancellable via
+// Manager.Cancel, but with no deadline of its own), then -- only once
+// a slot is actually acquired -- opens the r.Timeout-bounded run
+// context that engine.Run executes under.
+//
+// Bug fix: this used to share a single context.WithTimeout(...,
+// r.Timeout) across both the semaphore wait AND the run itself, so
+// with a low-RAM deployment's typical
+// MICROFLOW_MAX_CONCURRENT_EXECUTIONS=1, an execution queued behind
+// an already-running one burned its entire Timeout budget just
+// waiting in line for a slot. Observed in practice: an execution
+// queued for ~28 minutes behind another run, then got cancelled with
+// "context deadline exceeded" only ~2 minutes after its first node
+// actually started -- the run itself was healthy and made normal
+// progress, it simply never had a real Timeout's worth of time to
+// work with. The clock now only starts once the run can really begin.
+func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState) {
 	defer rs.cancel()
 	defer atomic.AddInt32(&m.queued, -1)
 
 	select {
 	case m.sem <- struct{}{}:
-	case <-ctx.Done():
+	case <-queueCtx.Done():
 		m.finishCancelled(execID, rs, "cancelled while queued")
 		return
 	}
@@ -322,11 +340,17 @@ func (m *Manager) runJob(ctx context.Context, wf *model.Workflow, execID, startN
 	// Re-check: Cancel() may have fired while this job was waiting for
 	// a worker slot.
 	select {
-	case <-ctx.Done():
+	case <-queueCtx.Done():
 		m.finishCancelled(execID, rs, "cancelled while queued")
 		return
 	default:
 	}
+
+	// The run's own Timeout budget starts now -- derived from queueCtx
+	// so an explicit Cancel() during the run still works, but a long
+	// queue wait no longer eats into it.
+	ctx, runCancel := context.WithTimeout(queueCtx, m.r.Timeout)
+	defer runCancel()
 
 	rs.mu.Lock()
 	rs.ex.Status = model.StatusRunning

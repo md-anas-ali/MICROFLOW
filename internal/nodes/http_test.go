@@ -164,3 +164,59 @@ func TestHTTPRequestDefaultUserAgent(t *testing.T) {
 		t.Errorf("node-provided User-Agent was overridden: got %q", gotUA)
 	}
 }
+
+// TestHTTPRequestHeaderExpressionsAreResolved is the regression test for
+// the "Unified AI Request" OpenRouter bug: header VALUES must go through
+// the same {{ ... }} expression evaluator as url/body. Previously this
+// branch set the raw, un-evaluated template string as the header value
+// (e.g. the literal text "{{ $json.authValue }}" instead of the resolved
+// "Bearer sk-or-...") because it skipped expr.Eval entirely. That made
+// every expression-based header -- most critically Authorization --
+// arrive at the provider broken, producing an immediate, universal
+// 401/403 regardless of whether the underlying API key was ever valid.
+func TestHTTPRequestHeaderExpressionsAreResolved(t *testing.T) {
+	allowLoopbackInTest(t)
+	var gotAuth, gotReferer, gotStaticCT string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotReferer = r.Header.Get("HTTP-Referer")
+		gotStaticCT = r.Header.Get("Content-Type")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	node := &model.Node{
+		Name: "Unified AI Request",
+		Parameters: map[string]any{
+			"url":    srv.URL,
+			"method": "POST",
+			"body":   `{{ $json.bodyStr }}`,
+			"headers": map[string]any{
+				"Authorization": "{{ $json.authValue }}",
+				"Content-Type":  "application/json",
+				"HTTP-Referer":  "{{ $json.refererValue }}",
+			},
+		},
+	}
+	exec := &HTTPRequestExecutor{Client: srv.Client()}
+	input := model.NodeOutput{{{JSON: map[string]any{
+		"bodyStr":      `{"model":"test"}`,
+		"authValue":    "Bearer sk-or-real-key-123",
+		"refererValue": "https://example.com",
+	}}}}
+	if _, err := exec.Execute(context.Background(), testRunContext(), node, input); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotAuth != "Bearer sk-or-real-key-123" {
+		t.Errorf("Authorization header not resolved: got %q, want %q (bug: raw template string sent as-is)", gotAuth, "Bearer sk-or-real-key-123")
+	}
+	if gotReferer != "https://example.com" {
+		t.Errorf("HTTP-Referer header not resolved: got %q, want %q", gotReferer, "https://example.com")
+	}
+	if gotStaticCT != "application/json" {
+		t.Errorf("static (non-expression) header value broken by fix: got %q", gotStaticCT)
+	}
+}

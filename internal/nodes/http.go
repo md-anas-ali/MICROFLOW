@@ -85,8 +85,32 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 		}
 		req.Header.Set("User-Agent", defaultUserAgent())
 		if headers, ok := node.Parameters["headers"].(map[string]any); ok {
+			// Header values go through the same {{ ... }} expression
+			// evaluator as url/body above. Previously this branch set
+			// the RAW template string as the header value (e.g. the
+			// literal text "{{ $json.authValue }}" instead of the
+			// resolved "Bearer sk-or-...") because it skipped expr.Eval
+			// entirely -- so every node with an expression-based header
+			// (Authorization, HTTP-Referer, etc.) sent a broken,
+			// unresolved credential on every single request. This
+			// produced an immediate, universal 401 from the provider
+			// regardless of whether the underlying API key was valid,
+			// which is indistinguishable from a real bad/missing key at
+			// the HTTP layer -- the fast, identical failure across every
+			// model in the "Unified AI Request" retry loop was this bug,
+			// not a credential problem.
 			for k, v := range headers {
-				req.Header.Set(k, fmt.Sprintf("%v", v))
+				raw, ok := v.(string)
+				if !ok {
+					req.Header.Set(k, fmt.Sprintf("%v", v))
+					continue
+				}
+				resolved, err := expr.Eval(raw, exprCtx)
+				if err != nil {
+					<-rc.HeavyWorkGate
+					return nil, fmt.Errorf("http request %q: header %q: %w", node.Name, k, err)
+				}
+				req.Header.Set(k, resolved)
 			}
 		}
 

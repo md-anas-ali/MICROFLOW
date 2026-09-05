@@ -268,6 +268,56 @@ func TestManagerCancelWhileQueued(t *testing.T) {
 	t.Fatal("queued job never reached StatusCancelled")
 }
 
+// TestManagerQueueWaitDoesNotConsumeTimeout is a regression test for a
+// real bug: the run's r.Timeout deadline used to be created at Start()
+// time and shared with the semaphore wait, so an execution queued
+// behind an already-running one (the common case with
+// MICROFLOW_MAX_CONCURRENT_EXECUTIONS=1 on a low-RAM deployment) burned
+// its entire Timeout budget just waiting in line for a worker slot,
+// then got cancelled almost immediately once it actually started --
+// observed in production as a healthy run dying with "context deadline
+// exceeded" a couple of minutes after its first node ran. This holds
+// the single worker slot for longer than r.Timeout and verifies a job
+// queued behind it still completes successfully once it finally gets
+// to run, instead of starting already-expired.
+func TestManagerQueueWaitDoesNotConsumeTimeout(t *testing.T) {
+	wf := oneNodeWorkflow("wf1")
+	r, _ := newTestRunner(t, map[model.NodeType]engine.NodeExecutor{model.TypeManualTrigger: instantExecutor{}}, wf)
+	r.Timeout = 300 * time.Millisecond // deliberately short
+	m := NewManager(r, 1, 2)           // maxConcurrent=1 initializes r.sem
+
+	// Occupy the sole worker slot directly (bypassing Start/runJob
+	// entirely) so the holder itself is never subject to r.Timeout --
+	// this isolates the thing under test to the *queued* job's
+	// deadline, rather than racing it against the holder's own.
+	r.sem <- struct{}{}
+
+	queued, err := m.Start(context.Background(), "wf1", "", "manual", nil)
+	if err != nil {
+		t.Fatalf("Start queued: %v", err)
+	}
+
+	// Hold the slot for well longer than r.Timeout, then free it.
+	// Under the old bug, `queued`'s deadline was created at Start()
+	// time (before this sleep) and shared with the semaphore wait, so
+	// it would already be expired the instant it got the slot below.
+	time.Sleep(3 * r.Timeout)
+	<-r.sem
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ex, ok := m.Get(queued)
+		if ok && ex.Status == model.StatusSuccess {
+			return
+		}
+		if ok && ex.Status != model.StatusQueued && ex.Status != model.StatusRunning {
+			t.Fatalf("queued job finished with status %v, want StatusSuccess (its Timeout clock must start when it actually runs, not while queued)", ex.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("queued job never reached StatusSuccess after its slot was freed")
+}
+
 // TestManagerSubscribeReceivesTerminalEvent verifies the SSE-facing
 // Subscribe API delivers events ending in a terminal type and then
 // closes the channel.
