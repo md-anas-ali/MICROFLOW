@@ -1,8 +1,0 @@
-{
-  "name": "microflow-frontend-smoketest",
-  "private": true,
-  "description": "jsdom smoke test for cmd/server/static/app.js. Run: npm install && node smoketest.js",
-  "devDependencies": {
-    "jsdom": "^24.0.0"
-  }
-}

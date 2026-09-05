@@ -149,3 +149,71 @@ filter pass, not anything on the MicroFlow/Go side.
   Treat it as a well-evidenced estimate, not a guarantee -- monitor
   real RSS in your actual deployment (e.g. `docker stats`, or your
   platform's memory graph) and adjust from there.
+
+## Pass 2: pushed further, without re-measuring in a sandbox that can't run Docker
+
+Everything above this section was measured (see the caveats at the top
+and bottom of this file for exactly how). The changes in this pass are
+different in kind: they're additional knobs turned further in the same
+direction, made in a sandbox with no Docker/network access to build
+and profile the actual container image, so **treat the numbers below
+as reasoned-about, not measured** -- verify with real `docker stats`
+(or your platform's memory graph) before trusting them in production.
+
+What changed and why:
+
+- **`MICROFLOW_HEAP_CEILING_MB`: 90 -> 40.** The measured Go-side peak
+  above is ~17-18MB; 40MB is ~2x that, not a bare-bones number picked
+  without the earlier measurement behind it. This only affects the Go
+  heap ceiling -- it does nothing for FFmpeg/python3/edge-tts, which
+  are separate OS processes and were already the dominant cost.
+- **`GOGC`: 30 -> 15.** More proactive GC, more CPU spent collecting.
+  Worth it here because there's no concurrent request traffic to make
+  slower -- one workflow, fully serialized.
+- **`GOMAXPROCS`: unset -> 1.** No code path in this deployment does
+  real parallel work (`MaxConcurrentExecutions=1`,
+  `MaxConcurrentHeavy=1`), so extra Ps just cost their own mcache /
+  scheduler bookkeeping for nothing. Set explicitly rather than left
+  for Go to size off however many (possibly fractional, cgroup-capped)
+  CPUs the host reports.
+- **`GODEBUG=madvdontneed=1`.** Go's default on Linux uses
+  `MADV_FREE` when returning heap pages, which the kernel is allowed
+  to leave counted in the process's RSS until it needs the memory
+  elsewhere -- meaning a container memory graph (and a hard cgroup
+  limit) can show this process as using more than it actually needs.
+  `madvdontneed` forces the more eager `MADV_DONTNEED` behavior instead
+  (small extra CPU cost per GC cycle, memory shows as freed
+  immediately). This is a real, well-known lever for Go processes
+  inside memory-limited containers -- not specific to this workflow.
+- **Alpine instead of Debian for both Dockerfile stages.** Musl's
+  allocator has a smaller per-process arena overhead than glibc's,
+  which matters for python3 and ffmpeg specifically since neither is
+  part of the Go heap and neither is touched by anything above. Not
+  verified end-to-end here (no Docker in this sandbox) -- see the
+  caveat comment at the top of `Dockerfile` about checking Alpine's
+  `ffmpeg` build actually has `libx264` before relying on it, and the
+  fallback to the previous, verified `debian:bookworm-slim` combo if
+  not.
+- **`MICROFLOW_DB_MAX_CONNS`: 2 -> 1.** pgx checks a connection out
+  only for the duration of one query, not for a whole run, so one
+  connection is normally enough for this deployment's single
+  always-on workflow. The real trade-off: if a status/history API call
+  lands at the exact moment the run's own write is mid-flight, it
+  waits briefly for the connection instead of getting a second one
+  immediately. For occasional polling this is unlikely to be
+  noticeable; raise it back to 2 if you see API calls stalling during
+  active runs.
+- **`MICROFLOW_MAX_QUEUED_EXECUTIONS`: 5 -> 2.** Each queued execution
+  holds its own seed-input JSON in memory until a worker slot frees
+  up. With `MaxConcurrentExecutions=1` and a single scheduled
+  workflow, there's little reason to hold more than a couple of extra
+  pending triggers -- past that, a 429 (and the trigger's own
+  retry/schedule) is preferable to accumulating queued memory.
+
+None of this touches `MICROFLOW_NODE_RUN_CAP` (12) or
+`MICROFLOW_MAX_CONCURRENT_HEAVY` (1) -- both were already at the
+tightest values the earlier measurement pass found workable for this
+specific workflow's node graph, and tightening them further without
+re-measuring risks losing debug-report history or breaking the
+one-heavy-thing-at-a-time guarantee outright, not just costing a bit
+more RAM.

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -212,16 +213,19 @@ func main() {
 	// RAM guard: soft ceiling well under the total container budget,
 	// leaving room for the Go runtime/OS/FFmpeg+python3+edge-tts child
 	// processes, which are separate OS processes and are NOT part of
-	// this Go heap (rule 17/19). Default lowered from the 512MB-target
-	// 220MB to 90MB, aimed at a ~170MB total container: roughly
-	// Go heap ≤90MB + ~30MB GC/runtime headroom (see
-	// configureGoRuntimeForLowRAM) + one child process's RSS at a time
-	// (MaxConcurrentHeavy=1 above) fitting in what's left. Tune via
+	// this Go heap (rule 17/19). Default lowered again, 90MB -> 40MB:
+	// LOWRAM.md's own measurement put this exact workflow's Go-side
+	// live heap at ~17-18MB peak, so 40MB is already ~2x that measured
+	// number, not a bare-bones cutoff picked without evidence. FFmpeg's
+	// own measured peak (~81-97MB) is the actual dominant cost and it
+	// lives outside this Go heap entirely, so shrinking this ceiling
+	// further doesn't touch that number -- it only tightens the margin
+	// on the piece that was already small. Tune via
 	// MICROFLOW_HEAP_CEILING_MB once you've measured real usage on your
 	// machine (rule 21: don't claim numbers without measurement) --
-	// these are starting points, not guarantees, since FFmpeg/python3
+	// this is a starting point, not a guarantee, since FFmpeg/python3
 	// RSS depends on the workflow's actual resolution/bitrate/scripts.
-	memGuard := engine.NewMemGuard(uint64(envInt("MICROFLOW_HEAP_CEILING_MB", 90)) * 1024 * 1024)
+	memGuard := engine.NewMemGuard(uint64(envInt("MICROFLOW_HEAP_CEILING_MB", 40)) * 1024 * 1024)
 	stopGuard := make(chan struct{})
 	go memGuard.Start(stopGuard)
 	defer close(stopGuard)
@@ -256,13 +260,19 @@ func main() {
 	// Engine.MaxConcurrentHeavy's per-run FFmpeg/TTS/HTTP cap);
 	// MaxQueuedExecutions bounds accepted-but-not-yet-finished runs
 	// before POST .../execute starts replying 429 instead of queuing
-	// unboundedly (rule 19). Defaults are deliberately conservative for
-	// a 512MB target -- this workflow's heavy nodes (FFmpeg/TTS/image)
-	// are memory-hungry per run, so "bounded worker pool" here means
-	// small numbers, not a typical web-request worker count.
+	// unboundedly (rule 19). Defaults are deliberately conservative --
+	// this workflow's heavy nodes (FFmpeg/TTS/image) are memory-hungry
+	// per run, so "bounded worker pool" here means small numbers, not a
+	// typical web-request worker count. Lowered 5 -> 2: this deployment
+	// runs one always-on scheduled workflow, so there is little value
+	// in holding more than a couple of extra trigger requests (each
+	// holding its own seed-input JSON in memory) while a run that can
+	// take up to MICROFLOW_EXECUTION_TIMEOUT_MINUTES is in flight --
+	// past that, 429 and let the trigger's own retry/schedule handle it
+	// rather than accumulating queued memory.
 	execManager := runner.NewManager(run,
 		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
-		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 5),
+		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 2),
 	)
 
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
@@ -463,23 +473,41 @@ func registerWebhookRoute(whServer *webhook.Server, token string, run *runner.Ru
 // silently overriding an explicit choice.
 func configureGoRuntimeForLowRAM() {
 	if os.Getenv("GOMEMLIMIT") == "" {
-		ceilingMB := envInt("MICROFLOW_HEAP_CEILING_MB", 90)
-		// A little headroom above the soft ceiling MemGuard throttles at,
-		// so SetMemoryLimit (which the runtime treats as closer to a hard
-		// cap for GC pacing purposes) doesn't fight MemGuard's own
-		// throttle point.
-		debug.SetMemoryLimit(int64(ceilingMB+30) * 1024 * 1024)
+		ceilingMB := envInt("MICROFLOW_HEAP_CEILING_MB", 40)
+		// Smaller headroom than the previous pass (was +30MB): LOWRAM.md's
+		// own measurement put this workflow's actual Go-side live heap at
+		// ~17-18MB peak, so +15MB above the soft ceiling is already ~3x
+		// that measured peak. Still enough that SetMemoryLimit (closer to
+		// a hard cap for GC pacing) doesn't fight MemGuard's own throttle
+		// point, without reserving RAM this process has never been shown
+		// to need. Re-measure if a bigger/different workflow is imported.
+		debug.SetMemoryLimit(int64(ceilingMB+15) * 1024 * 1024)
 	}
 	if os.Getenv("GOGC") == "" {
-		// Lower than the default 100 (and lower than the previous
-		// 512MB-target's 50): trades more CPU for GC for a smaller
-		// average heap, which matters more than CPU on a ~170MB total
-		// budget running FFmpeg/python3/edge-tts child processes
-		// alongside the Go process. SetMemoryLimit above is the real
-		// backstop; this just makes the GC work proactively instead of
-		// only reacting once close to that limit.
-		debug.SetGCPercent(30)
+		// Lower than the previous pass's 30: trades more CPU for GC for a
+		// smaller average heap. Worth it here because the tradeoff is
+		// against a single always-on workflow's total RAM budget, not
+		// against latency-sensitive request throughput -- this process
+		// has no concurrent traffic to slow down. SetMemoryLimit above is
+		// the real backstop; this just makes the GC work harder before
+		// ever getting close to it.
+		debug.SetGCPercent(15)
 	}
+	if os.Getenv("GOMAXPROCS") == "" {
+		// This deployment runs one workflow at a time
+		// (MaxConcurrentExecutions=1, MaxConcurrentHeavy=1): there is no
+		// real parallel work for extra Ps to do, and each additional P
+		// costs its own mcache/mspan bookkeeping. Pin to 1 by default so
+		// Go doesn't size its scheduler for however many (possibly
+		// fractional, cgroup-limited) CPUs the host reports. Set
+		// GOMAXPROCS explicitly in the environment to override.
+		runtime.GOMAXPROCS(1)
+	}
+	// Disable memory-profiling sample bookkeeping -- this process is not
+	// profiled in production, and MemProfileRate>0 (the 512KB-interval
+	// default) keeps a background sampling table alive for no benefit
+	// here.
+	runtime.MemProfileRate = 0
 }
 
 func requireEnv(k string) string {
