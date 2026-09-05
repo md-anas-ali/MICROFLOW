@@ -164,7 +164,29 @@ func main() {
 	}
 
 	registry := nodes.DefaultRegistry(nodes.Deps{
-		HTTPClient:      &http.Client{Timeout: 60 * time.Second},
+		// MaxIdleConnsPerHost/MaxIdleConns kept small on purpose: this
+		// process only ever runs one workflow with one heavy call in
+		// flight at a time (MaxConcurrentHeavy below), so a large idle
+		// keep-alive pool just holds buffers for connections that will
+		// never be reused concurrently. IdleConnTimeout releases them
+		// quickly instead of holding sockets/buffers open between the
+		// workflow's ~85s of paced Wait/cooldown gaps.
+		HTTPClient: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        4,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     20 * time.Second,
+				// DialContext enforces the actual SSRF boundary
+				// (resolve-once-then-dial-that-IP) for every
+				// httpRequest node call -- see
+				// nodes.SafeDialContext's doc comment for why this,
+				// not a second hostname check in guardSSRF, is where
+				// hostname-based private-address blocking has to
+				// live to avoid a DNS-rebinding gap.
+				DialContext: nodes.SafeDialContext,
+			},
+		},
 		AllowedBinaries: allowedBinaries,
 		EnvAllowlist:    codeEnvAllowlist,
 		ScratchRoot:     scratchRoot,
@@ -178,18 +200,44 @@ func main() {
 	})
 	eng := engine.New(registry)
 
-	// RAM guard: soft ceiling well under the 512MB total, leaving room
-	// for the Go runtime/frontend assets/OS/FFmpeg-TTS child processes
-	// (rule 17/19). Default 220MB heap ceiling targets the "~200MB free"
-	// ideal from the spec; tune via MICROFLOW_HEAP_CEILING_MB once you've
-	// measured real usage on your machine (rule 21: don't claim numbers
-	// without measurement).
-	memGuard := engine.NewMemGuard(uint64(envInt("MICROFLOW_HEAP_CEILING_MB", 220)) * 1024 * 1024)
+	// MaxConcurrentHeavy bounds how many FFmpeg/TTS/HTTP calls this run
+	// can have in flight at once (engine.go). Defaults to 1 (down from
+	// the 512MB-target default of 2): on a ~170MB total budget there is
+	// no headroom for two concurrent FFmpeg/python3 child processes
+	// alongside the Go heap, so heavy work is fully serialized unless an
+	// operator explicitly opts back into 2+ via
+	// MICROFLOW_MAX_CONCURRENT_HEAVY.
+	eng.MaxConcurrentHeavy = envInt("MICROFLOW_MAX_CONCURRENT_HEAVY", 1)
+
+	// RAM guard: soft ceiling well under the total container budget,
+	// leaving room for the Go runtime/OS/FFmpeg+python3+edge-tts child
+	// processes, which are separate OS processes and are NOT part of
+	// this Go heap (rule 17/19). Default lowered from the 512MB-target
+	// 220MB to 90MB, aimed at a ~170MB total container: roughly
+	// Go heap ≤90MB + ~30MB GC/runtime headroom (see
+	// configureGoRuntimeForLowRAM) + one child process's RSS at a time
+	// (MaxConcurrentHeavy=1 above) fitting in what's left. Tune via
+	// MICROFLOW_HEAP_CEILING_MB once you've measured real usage on your
+	// machine (rule 21: don't claim numbers without measurement) --
+	// these are starting points, not guarantees, since FFmpeg/python3
+	// RSS depends on the workflow's actual resolution/bitrate/scripts.
+	memGuard := engine.NewMemGuard(uint64(envInt("MICROFLOW_HEAP_CEILING_MB", 90)) * 1024 * 1024)
 	stopGuard := make(chan struct{})
 	go memGuard.Start(stopGuard)
 	defer close(stopGuard)
 
-	run := runner.New(st, st, eng, st, creds, scratchRoot).WithMemGuard(memGuard)
+	// See engine.RunContext.NodeRunCap's doc comment / LOWRAM.md: this is
+	// the single largest measured live-memory reduction available for a
+	// large-graph workflow like this one, and it's a real memory freed
+	// on every node run past the cap, not just a GC-pacing knob. Default
+	// lowered hard from the engine's own 500 to 12 -- this deployment
+	// only ever runs one always-on workflow with no need to keep a long
+	// in-memory step-by-step history; the terminal status/error and the
+	// last few steps (what actually matters for diagnosing a failure)
+	// are still always kept.
+	run := runner.New(st, st, eng, st, creds, scratchRoot).
+		WithMemGuard(memGuard).
+		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12))
 
 	// Async execution (spec sections M/N): bounded worker pool on top
 	// of the same Runner -- MaxConcurrentExecutions caps simultaneous
@@ -404,18 +452,22 @@ func registerWebhookRoute(whServer *webhook.Server, token string, run *runner.Ru
 // silently overriding an explicit choice.
 func configureGoRuntimeForLowRAM() {
 	if os.Getenv("GOMEMLIMIT") == "" {
-		ceilingMB := envInt("MICROFLOW_HEAP_CEILING_MB", 220)
+		ceilingMB := envInt("MICROFLOW_HEAP_CEILING_MB", 90)
 		// A little headroom above the soft ceiling MemGuard throttles at,
 		// so SetMemoryLimit (which the runtime treats as closer to a hard
-		// cap for GC pacing purposes) doesn't fight MemGuard's own 220MB
+		// cap for GC pacing purposes) doesn't fight MemGuard's own
 		// throttle point.
 		debug.SetMemoryLimit(int64(ceilingMB+30) * 1024 * 1024)
 	}
 	if os.Getenv("GOGC") == "" {
-		// Lower than the default 100: trades a bit of extra CPU for GC
-		// for a smaller average heap, which matters more than CPU on a
-		// 512MB box running FFmpeg/TTS alongside the Go process.
-		debug.SetGCPercent(50)
+		// Lower than the default 100 (and lower than the previous
+		// 512MB-target's 50): trades more CPU for GC for a smaller
+		// average heap, which matters more than CPU on a ~170MB total
+		// budget running FFmpeg/python3/edge-tts child processes
+		// alongside the Go process. SetMemoryLimit above is the real
+		// backstop; this just makes the GC work proactively instead of
+		// only reacting once close to that limit.
+		debug.SetGCPercent(30)
 	}
 }
 

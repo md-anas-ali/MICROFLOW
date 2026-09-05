@@ -88,6 +88,23 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 	for _, it := range flatten(input) {
 		exprCtx := rc.ExprContext(it.JSON)
 
+		// legacyArgs holds the args re-synthesized from the legacy
+		// "command" string's remaining tokens (see below). It's a
+		// plain local variable -- deliberately NOT written back onto
+		// node.Parameters, which is shared engine.RunContext-wide
+		// state on the *model.Node loaded for this workflow. Two
+		// concurrent executions of the same workflow (e.g. two
+		// webhook calls, or a webhook racing a schedule -- see the
+		// Runner.WithConcurrencyLimit fix that now also bounds those)
+		// hitting this same executeCommand node used to read and
+		// write that shared map with no synchronization: an
+		// unsynchronized concurrent map write in Go is not just "may
+		// pick up the wrong args", it can crash the whole process
+		// with "fatal error: concurrent map writes". Keeping this
+		// per-call and per-item local removes that shared-state
+		// surface entirely.
+		var legacyArgs []string
+
 		logical := node.ParamString("binary", "")
 		if logical == "" {
 			// fall back to first token of the legacy n8n "command" string
@@ -102,7 +119,7 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 			}
 			logical = filepath.Base(fields[0])
 			// re-synthesize args from the remainder for the legacy path
-			node.Parameters["__resolvedArgs"] = fields[1:]
+			legacyArgs = fields[1:]
 		}
 
 		path, ok := e.AllowedBinaries[logical]
@@ -120,8 +137,8 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 				}
 				args = append(args, resolved)
 			}
-		} else if fallback, ok := node.Parameters["__resolvedArgs"].([]string); ok {
-			args = fallback
+		} else if legacyArgs != nil {
+			args = legacyArgs
 		}
 
 		// Back off first if we're already over the RAM ceiling (rule 19):

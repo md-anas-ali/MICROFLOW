@@ -237,6 +237,27 @@ var allowLoopbackForTests = false
 // workflow (or an injected expression) from pivoting the server into
 // hitting internal infrastructure. AI/image APIs are public hosts and
 // are unaffected.
+// isBlockedIP is the single definition of "not a public address" used
+// by both guardSSRF's early check and SafeDialContext's connect-time
+// check below -- keeping one definition means the two can't quietly
+// drift apart.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// guardSSRF is a fast, early check against the URL as written: it
+// rejects a disallowed scheme immediately, and rejects an obviously
+// blocked address when the URL already contains a literal IP (or
+// "localhost") -- before any expression evaluation cost or network
+// activity. It deliberately does NOT resolve hostnames: doing a
+// resolve-then-discard check here and a separate resolve-then-dial
+// later would leave a DNS-rebinding gap (a hostname that answers with
+// a public IP for this check and a private one moments later at
+// connect time). That resolution -- the check that actually matters
+// for hostnames -- lives in SafeDialContext instead, which resolves
+// once and dials the exact IP it validated, so there's no window
+// between checking and connecting for the answer to change.
 func guardSSRF(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -249,15 +270,66 @@ func guardSSRF(rawURL string) error {
 		return nil
 	}
 	host := u.Hostname()
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-			return fmt.Errorf("requests to private/loopback addresses are blocked")
-		}
+	if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
+		return fmt.Errorf("requests to private/loopback addresses are blocked")
 	}
 	if host == "localhost" {
 		return fmt.Errorf("requests to localhost are blocked")
 	}
 	return nil
+}
+
+// SafeDialContext is the DialContext every httpRequest node's
+// *http.Transport must use (wired in cmd/server/main.go). It closes
+// the gap guardSSRF's URL-string check can't: a hostname (as opposed
+// to a literal IP) that resolves to a private/loopback/link-local
+// address. Previously nothing resolved the hostname at all, so
+// "http://internal-service.local/..." or a DNS-rebinding domain
+// sailed straight through guardSSRF and Go's default dialer would
+// happily connect it to an internal address.
+//
+// It resolves the host exactly once via the standard resolver, checks
+// every returned address (a hostname can have several -- all must be
+// public), and then dials the specific IP it just validated -- not
+// the hostname again -- so a second, different DNS answer between the
+// lookup and the connect (the classic rebinding attack) can't slip a
+// private address in underneath the check.
+func SafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("safe dial: %w", err)
+	}
+
+	if allowLoopbackForTests {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+
+	// A literal IP in the dial address (guardSSRF already rejected
+	// obviously-blocked literals, but re-check here too since this is
+	// the actual enforcement point and callers other than the
+	// httpRequest node could reuse this dialer).
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return nil, fmt.Errorf("safe dial: %s is a private/loopback/link-local address", ip)
+		}
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("safe dial: resolve %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("safe dial: no addresses found for %q", host)
+	}
+	for _, resolved := range ips {
+		if isBlockedIP(resolved.IP) {
+			return nil, fmt.Errorf("safe dial: %q resolved to blocked address %s", host, resolved.IP)
+		}
+	}
+
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
 func flattenHeader(h http.Header) map[string]any {

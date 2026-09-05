@@ -9,8 +9,10 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -65,15 +67,22 @@ type RunContext struct {
 	// callers/tests that don't wire one still work unchanged.
 	MemGuard *MemGuard
 
-	// maxNodeRunsInMemory bounds how many NodeRunResult entries are kept
-	// live in rc.Execution.NodeRuns during a run, so a workflow with a
-	// long retry/loop pattern (up to MaxSteps steps) never accumulates
+	// NodeRunCap bounds how many NodeRunResult entries are kept live in
+	// rc.Execution.NodeRuns during a run, so a workflow with a long
+	// retry/loop pattern (up to MaxSteps steps) never accumulates
 	// thousands of full input/output JSON snapshots in RAM before the
 	// DB-side truncation in internal/store even gets a chance to run
 	// (rule 18: don't let logs/JSON pile up in memory). Older entries are
 	// dropped once the cap is exceeded; the most recent entries (which is
-	// what an error/status needs) are always kept.
-	nodeRunCap int
+	// what an error/status needs) are always kept. Zero/unset falls back
+	// to 500 in appendNodeRun. On a tight RAM budget this is one of the
+	// biggest real (live, GC-tuning-proof) memory line items for a
+	// large-graph workflow: every entry holds a full redacted copy of
+	// that node's input AND output JSON, for every node the run has
+	// executed so far -- set it low (e.g. 10-20) via
+	// MICROFLOW_NODE_RUN_CAP for a single always-on production workflow
+	// that doesn't need a long in-memory step-by-step history.
+	NodeRunCap int
 
 	// Redactor scrubs secret-shaped values (API keys, tokens, passwords
 	// -- see redact.go) out of anything stored in Execution.NodeRuns,
@@ -104,13 +113,34 @@ type RunContext struct {
 // fires OnNodeRun (if set) so live progress (SSE) reflects every node
 // transition, not just the terminal execution state.
 func (rc *RunContext) appendNodeRun(result model.NodeRunResult) {
-	limit := rc.nodeRunCap
+	limit := rc.NodeRunCap
 	if limit <= 0 {
 		limit = 500
 	}
+	if os.Getenv("MICROFLOW_DEBUG_NODE_RUN_SIZE") != "" {
+		ib, _ := json.Marshal(result.Input)
+		ob, _ := json.Marshal(result.Output)
+		fmt.Fprintf(os.Stderr, "NODE_RUN_SIZE node=%q input=%dB output=%dB\n", result.NodeName, len(ib), len(ob))
+	}
 	rc.Execution.NodeRuns = append(rc.Execution.NodeRuns, result)
 	if extra := len(rc.Execution.NodeRuns) - limit; extra > 0 {
-		rc.Execution.NodeRuns = rc.Execution.NodeRuns[extra:]
+		// Deliberately a fresh copy, NOT rc.Execution.NodeRuns[extra:].
+		// Re-slicing from the front keeps pointing into the SAME backing
+		// array, which means every "dropped" older entry's Input/Output
+		// (full JSON maps, potentially holding large base64
+		// image/video/file payloads read via $readFileBase64) stays
+		// reachable -- and therefore un-collectible -- through that
+		// array for as long as append() keeps reusing its remaining
+		// capacity, which can be a long time. Copying into a new,
+		// exactly-sized slice drops the last reference to the old array
+		// immediately, so the trimmed entries' data becomes real garbage
+		// on this very call instead of an invisible leak that no amount
+		// of GOGC/GOMEMLIMIT tuning can free (this was the single
+		// largest live-memory contributor measured for a ~140-node
+		// workflow -- see LOWRAM.md).
+		trimmed := make([]model.NodeRunResult, limit)
+		copy(trimmed, rc.Execution.NodeRuns[extra:])
+		rc.Execution.NodeRuns = trimmed
 	}
 	if rc.OnNodeRun != nil {
 		rc.OnNodeRun(result)

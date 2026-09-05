@@ -217,6 +217,15 @@ type Manager struct {
 // (running + waiting in line for a worker) may exist at once before
 // Start starts rejecting new work with ErrQueueFull (rule 19:
 // "reject excess work safely if necessary, NEVER intentionally OOM").
+//
+// Manager shares r's execution semaphore (see Runner.WithConcurrencyLimit)
+// rather than keeping a private one, so maxConcurrent is a real
+// process-wide cap: scheduler/webhook runs going straight through
+// r.RunFromNode compete for the exact same slots as executions
+// started here. If the caller hasn't already called
+// r.WithConcurrencyLimit (e.g. existing callers built before this
+// fix), NewManager sets it up using maxConcurrent so behavior is
+// unchanged for anyone who only uses the async path.
 func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
@@ -224,9 +233,12 @@ func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
 	if maxQueued < maxConcurrent {
 		maxQueued = maxConcurrent
 	}
+	if r.sem == nil {
+		r.WithConcurrencyLimit(maxConcurrent)
+	}
 	return &Manager{
 		r:         r,
-		sem:       make(chan struct{}, maxConcurrent),
+		sem:       r.sem,
 		maxQueued: int32(maxQueued),
 		states:    map[string]*runState{},
 		all:       newBroadcaster(),

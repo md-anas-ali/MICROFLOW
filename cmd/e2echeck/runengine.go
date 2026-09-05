@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/pprof"
 	"sort"
+	"strconv"
 	"time"
 
 	"microflow/internal/engine"
@@ -17,6 +20,18 @@ import (
 
 func lookPath(name string) (string, error) {
 	return exec.LookPath(name)
+}
+
+func envIntOr(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func runEngine(res *parser.ParseResult, startNode string) {
@@ -64,6 +79,15 @@ func runEngine(res *parser.ParseResult, startNode string) {
 	registry := nodes.DefaultRegistry(deps)
 
 	eng := engine.New(registry)
+	// MaxSteps ceiling explained below; MaxConcurrentHeavy left at
+	// engine.New's own default for this harness (irrelevant here since
+	// e2echeck's http/command stand-ins are effectively instant).
+
+	var peakSampler *heapPeakSampler
+	if profPath := os.Getenv("MICROFLOW_DEBUG_HEAP_PROFILE"); profPath != "" {
+		peakSampler = startHeapPeakSampler(profPath)
+		defer peakSampler.stopAndReport()
+	}
 	// Keep this bounded well below the engine's own 5000-step ceiling so
 	// a genuine infinite retry loop in THIS run (e.g. every AI call
 	// looking "invalid" to the workflow's own validator, forever
@@ -77,6 +101,10 @@ func runEngine(res *parser.ParseResult, startNode string) {
 		Execution:  &model.Execution{ID: "e2echeck-1", WorkflowID: wf.ID, Mode: "manual"},
 		StaticData: newFakeStaticData(),
 		ScratchDir: scratch,
+		// Mirrors cmd/server/main.go's MICROFLOW_NODE_RUN_CAP so this
+		// harness measures the same real-world memory profile a
+		// production run would have (see LOWRAM.md).
+		NodeRunCap: envIntOr("MICROFLOW_NODE_RUN_CAP", 12),
 	}
 
 	// 90s was a reasonable cap for a smoke test that only exercises one
@@ -108,6 +136,54 @@ func runEngine(res *parser.ParseResult, startNode string) {
 
 	printNodeRunSummary(rc)
 	printHTTPLog(mt)
+}
+
+// heapPeakSampler polls runtime.MemStats in the background and, whenever
+// it observes a new peak HeapAlloc, overwrites a heap profile at path
+// with a fresh pprof.WriteHeapProfile snapshot -- so by the time the run
+// finishes, the on-disk profile reflects allocations live at (very close
+// to) the actual peak, not just whatever's left resident at exit after
+// GC has already reclaimed the interesting objects. Temporary profiling
+// aid, gated behind MICROFLOW_DEBUG_HEAP_PROFILE -- not part of the
+// normal build/runtime path.
+type heapPeakSampler struct {
+	path string
+	stop chan struct{}
+	done chan struct{}
+	peak uint64
+}
+
+func startHeapPeakSampler(path string) *heapPeakSampler {
+	s := &heapPeakSampler{path: path, stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(s.done)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		var ms runtime.MemStats
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				runtime.ReadMemStats(&ms)
+				if ms.HeapAlloc > s.peak {
+					s.peak = ms.HeapAlloc
+					if f, err := os.Create(s.path); err == nil {
+						pprof.WriteHeapProfile(f)
+						f.Close()
+					}
+				}
+			}
+		}
+	}()
+	return s
+}
+
+func (s *heapPeakSampler) stopAndReport() {
+	close(s.stop)
+	<-s.done
+	fmt.Fprintf(os.Stderr, "Peak sampled HeapAlloc: %d bytes (%.1f MB) -- profile written to %s\n",
+		s.peak, float64(s.peak)/1024/1024, s.path)
 }
 
 func printNodeRunSummary(rc *engine.RunContext) {

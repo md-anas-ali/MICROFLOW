@@ -42,6 +42,38 @@ type Runner struct {
 	// creates so node executors (HTTP/command/code) can back off new
 	// heavy work while the process is over its soft RAM ceiling.
 	MemGuard *engine.MemGuard
+	// NodeRunCap is attached to every RunContext this Runner creates
+	// (see engine.RunContext.NodeRunCap). Zero/unset falls back to the
+	// engine's own 500 default; set low via WithNodeRunCap for a
+	// tight-RAM single-workflow deployment.
+	NodeRunCap int
+	// sem, if non-nil, bounds how many engine.Run executions may be in
+	// flight at once *across every trigger path* -- manual/async via
+	// Manager, and direct RunFromNode calls from the scheduler and
+	// webhook server. Set via WithConcurrencyLimit, or implicitly
+	// shared in by NewManager if it wasn't set first. nil (the
+	// zero value) means unbounded, which only bare Runners built
+	// without a Manager (e.g. in tests) should ever run with in a
+	// real deployment.
+	sem chan struct{}
+}
+
+// WithConcurrencyLimit creates the Runner's shared execution
+// semaphore, bounding how many workflow runs -- regardless of trigger
+// type -- may execute at once. This closes a low-RAM-deployment gap:
+// MICROFLOW_MAX_CONCURRENT_EXECUTIONS previously only gated the async
+// HTTP execute path (Manager's own private semaphore), so a webhook
+// and a schedule (or two webhooks) firing at the same moment could
+// each start a full workflow run -- including FFmpeg/TTS/JS-VM work --
+// in parallel, with nothing to stop it. Call this before constructing
+// a Manager on top of the same Runner; NewManager will reuse this
+// semaphore instead of making its own if one is already set.
+func (r *Runner) WithConcurrencyLimit(maxConcurrent int) *Runner {
+	if maxConcurrent < 1 {
+		maxConcurrent = 1
+	}
+	r.sem = make(chan struct{}, maxConcurrent)
+	return r
 }
 
 func New(workflows WorkflowLoader, execs ExecutionSaver, eng *engine.Engine, staticData engine.StaticDataStore, creds engine.CredentialResolver, scratchRoot string) *Runner {
@@ -64,6 +96,15 @@ func (r *Runner) WithMemGuard(g *engine.MemGuard) *Runner {
 	return r
 }
 
+// WithNodeRunCap sets the per-run in-memory execution-history cap (see
+// engine.RunContext.NodeRunCap's doc comment) attached to every future
+// RunFromNode call's RunContext. Optional -- zero/unset behaves exactly
+// as before (falls back to the engine's own 500 default).
+func (r *Runner) WithNodeRunCap(n int) *Runner {
+	r.NodeRunCap = n
+	return r
+}
+
 // RunFromNode loads workflowID, starts execution at startNode with the
 // given mode ("manual" | "schedule" | "webhook" | "error") and seed
 // input, persists the resulting execution record (win or lose), and
@@ -82,6 +123,23 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	}
 	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
+
+	// Bound this run by the shared execution semaphore (see
+	// WithConcurrencyLimit's doc comment) so scheduler/webhook runs
+	// count against the same MICROFLOW_MAX_CONCURRENT_EXECUTIONS
+	// limit as the async HTTP path, instead of bypassing it entirely.
+	// A Runner with no semaphore configured (r.sem == nil) runs
+	// unbounded, same as before this fix -- only bare Runners built
+	// without ever calling WithConcurrencyLimit/NewManager hit this.
+	if r.sem != nil {
+		select {
+		case r.sem <- struct{}{}:
+		case <-runCtx.Done():
+			return nil, fmt.Errorf("runner: %w waiting for a free execution slot", runCtx.Err())
+		}
+		defer func() { <-r.sem }()
+	}
+
 	return r.runOnce(runCtx, wf, newID(), startNode, mode, seed, nil)
 }
 
@@ -117,8 +175,9 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		// and every run's redaction reflects the credentials actually in
 		// use for it. Never touches the live values node executors use --
 		// see RunContext.Redactor's doc comment.
-		Redactor:  engine.NewSecretRedactorFromEnv(),
-		OnNodeRun: onNodeRun,
+		Redactor:   engine.NewSecretRedactorFromEnv(),
+		OnNodeRun:  onNodeRun,
+		NodeRunCap: r.NodeRunCap,
 	}
 
 	ex, runErr := r.Engine.Run(ctx, rc, startNode, seed)

@@ -23,15 +23,20 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
-// Open connects using DATABASE_URL and a small pool (default max 4
-// connections -- generous for this workload, cheap in RAM; override via
-// MICROFLOW_DB_MAX_CONNS if needed).
+// Open connects using DATABASE_URL and a small pool (default max 2
+// connections -- this deployment only ever runs one workflow with
+// MaxConcurrentExecutions=1, so one connection for the run itself plus
+// one spare for the periodic history-cleanup/API-status queries is
+// already generous; override via MICROFLOW_DB_MAX_CONNS if needed).
+// Each pgx connection holds its own read/write buffers, so on a ~170MB
+// total budget this is a real, if small, RAM line item -- not just a
+// connection-count knob.
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("store: invalid DATABASE_URL: %w", err)
 	}
-	maxConns := int32(4)
+	maxConns := int32(2)
 	if v := os.Getenv("MICROFLOW_DB_MAX_CONNS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			maxConns = int32(n)
