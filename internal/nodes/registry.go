@@ -28,7 +28,7 @@ func DefaultRegistry(deps Deps) map[model.NodeType]engine.NodeExecutor {
 		model.TypeSplitOut:       &SplitOutExecutor{},
 		model.TypeSplitInBatches: &SplitInBatchesExecutor{},
 
-		model.TypeHTTPRequest:    &HTTPRequestExecutor{Client: deps.HTTPClient},
+		model.TypeHTTPRequest:    &HTTPRequestExecutor{Client: deps.HTTPClient, modelListCache: newGetResponseCache(modelListCacheTTL())},
 		model.TypeExecuteCommand: &ExecuteCommandExecutor{AllowedBinaries: deps.AllowedBinaries, ScratchRoot: deps.ScratchRoot},
 		model.TypeReadWriteFile:  &ReadWriteFileExecutor{ScratchRoot: deps.ScratchRoot},
 

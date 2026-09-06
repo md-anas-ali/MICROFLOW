@@ -136,11 +136,8 @@ func compare(left any, op string, right any) bool {
 // waiting on time.Sleep uses effectively no RAM/CPU.
 type WaitExecutor struct{}
 
-func (WaitExecutor) Execute(ctx context.Context, _ *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
-	seconds := 1.0
-	if v, ok := node.Parameters["amount"].(float64); ok {
-		seconds = v
-	}
+func (WaitExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
+	seconds := waitAmountSeconds(rc, node, input)
 	unit, _ := node.Parameters["unit"].(string)
 	mult := map[string]float64{"seconds": 1, "minutes": 60, "hours": 3600, "": 1}[unit]
 	if mult == 0 {
@@ -152,6 +149,62 @@ func (WaitExecutor) Execute(ctx context.Context, _ *engine.RunContext, node *mod
 		return nil, ctx.Err()
 	}
 	return input, nil
+}
+
+// waitAmountSeconds resolves the Wait node's "amount" parameter to a
+// concrete number of seconds. Two shapes are supported:
+//
+//   - a literal number (float64), as produced by a hand-authored
+//     workflow -- used as-is, unchanged from the previous behavior.
+//   - an expression string, e.g. "{{ $json.waitSeconds }}" -- this is
+//     how the sample workflow's retry loops (Model Controller ->
+//     Validate Attempt -> Loop Router -> Loop Wait) sync the wait
+//     delay to a value a Code node just computed (backoff that grows
+//     with repeated 429/timeout errors, short breather after a
+//     permanent-model blacklist, etc.). Previously this branch only
+//     ever matched the float64 case, so an expression string silently
+//     failed the type assertion and every such Wait node fell through
+//     to the 1-second default regardless of what the workflow's own
+//     retry logic computed -- the computed backoff was never actually
+//     applied. Evaluated against the first item's $json (a Wait node
+//     in a retry loop always receives exactly one in-flight item), via
+//     the same expr.EvalValue path every other expression-bearing
+//     parameter (http.go's url/body/headers, control.go's IF
+//     conditions) already goes through.
+//
+// Falls back to the previous 1-second default if "amount" is absent,
+// or if an expression string is present but fails to evaluate to a
+// usable number (missing field, upstream node didn't run, etc.) --
+// never blocks forever and never errors the run over a bad wait
+// duration.
+func waitAmountSeconds(rc *engine.RunContext, node *model.Node, input model.NodeOutput) float64 {
+	const defaultSeconds = 1.0
+	switch v := node.Parameters["amount"].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case string:
+		if v == "" {
+			return defaultSeconds
+		}
+		items := flatten(input)
+		var itemJSON map[string]any
+		if len(items) > 0 {
+			itemJSON = items[0].JSON
+		}
+		exprCtx := rc.ExprContext(itemJSON)
+		resolved, err := expr.EvalValue(v, exprCtx)
+		if err != nil {
+			return defaultSeconds
+		}
+		if f, ok := toFloat(resolved); ok && f >= 0 {
+			return f
+		}
+		return defaultSeconds
+	default:
+		return defaultSeconds
+	}
 }
 
 // SplitOutExecutor turns one item's array field into N items, e.g.

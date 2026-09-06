@@ -74,3 +74,68 @@ go build ./cmd/server → OK (binary builds)
   `internal/nodes/registry.go`) against the uploaded source.
 - `control_test.go`, `http_test.go` — new test files (drop into
   `internal/nodes/` alongside the diffed files).
+
+## 3. Applying the above (this was still outstanding) + one more real fix
+
+The diff and test files described above were present in this delivery
+but had **not actually been applied to the source tree** -- `http.go`,
+`control.go`, and `registry.go` still matched the diff's `orig/` side,
+while `control_test.go`/`http_test.go` already expected the patched
+behavior. Net effect: `go vet ./...` and `go test ./...` failed to
+compile (`undefined: isCacheableGETURL`), and neither the OpenRouter
+model-list cache nor the Wait-node expression fix were actually in
+effect at runtime -- every retry lap was still re-fetching/re-decoding
+the full model list per controller, and Loop Wait nodes were still
+sleeping a flat 1s instead of the computed backoff. Applied the diff
+for real (`patch -p1 < microflow-go-changes.diff`); both fixes are now
+live and covered by the tests above.
+
+**New bug found and fixed**: `internal/runner/async.go`'s
+`broadcaster.publish` trimmed its `replay` buffer with
+`b.replay = b.replay[extra:]` -- the exact same array-retention bug
+already identified and fixed in `engine.go`'s `appendNodeRun` (a
+re-slice keeps the whole backing array, and therefore every "dropped"
+Event's `*model.NodeRunResult` -- potentially several MB of QC-frame
+base64 data -- alive until Go's append() growth happens to reallocate),
+just not applied here too. This one is worse than the per-execution
+case: `Manager.all`, the process-wide "live executions monitor"
+broadcaster, is never evicted for the life of the server (unlike a
+per-execution broadcaster, which is at least fully freed after
+`finishedRetention`), so this pattern repeated on every node of every
+execution for as long as the process ran. Fixed the same way as
+`appendNodeRun`: copy into a fresh, exactly-sized slice on trim.
+Added `internal/runner/async_test.go` (2 new tests) asserting
+`cap(replay) == len(replay) == replayBufSize` after many publishes --
+the direct signal that distinguishes a real copy from a re-sliced view
+into a larger array.
+
+**FFmpeg**: measured (not estimated) the actual "Concat + BGM +
+Subtitle" filter graph as written in the workflow (color-grade +
+unsharp + split/blur/blend bloom + noise + vignette + subtitle burn,
+not just the simplified eq-only case LOWRAM.md benchmarked) against
+synthetic 720x1280/30fps clips matching the workflow's own encoder
+settings: peak `VmHWM` was ~163MB, vs. ~146MB for the eq-only case
+benchmarked previously -- both notably higher than LOWRAM.md's
+~97MB figure (different ffmpeg build/test machine; the earlier number
+undercounted this step regardless of which filters are included). No
+code or workflow change made here: even the fuller, real filter graph's
+measured peak still fits comfortably inside the 512MB budget alongside
+the Go engine and python3, so removing/simplifying any of these visual
+effects (bloom, vignette, noise, subtitle styling) was not needed to
+hit budget and would have cost a real feature for no measured benefit.
+Recorded here so the next person doesn't have to re-derive it: if a
+future workflow edit adds more filter stages to this same pass, re-run
+this measurement rather than assuming the old eq-only number still
+holds.
+
+### Verification (this pass)
+```
+gofmt -l .            → clean
+go build ./...        → OK
+go vet ./...          → clean (previously broken)
+go test ./...         → ok, incl. previously-orphaned tests + 2 new
+                         async_test.go tests
+go build -race ./...  → OK
+go test -race ./...   → OK
+go build ./cmd/server → OK (binary builds)
+```

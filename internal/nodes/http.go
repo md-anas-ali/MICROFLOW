@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"microflow/internal/engine"
@@ -21,6 +23,27 @@ import (
 // grammar check, and outbound notification webhooks.
 type HTTPRequestExecutor struct {
 	Client *http.Client
+
+	// modelListCache is a small, short-TTL cache for the one repeated
+	// GET the sample workflow makes many times per run: OpenRouter's
+	// /models endpoint, hit once per retry-loop iteration by FIVE
+	// separate "Fetch OpenRouter Models (...)" nodes (script/fact/image
+	// prompt/QC/semantic controllers) even though the JS-side queue
+	// they feed is itself cached and only rebuilt once per lap (see
+	// Model Controller's wf.liveModelQueue). Without this, a long retry
+	// sequence re-fetches and re-decodes the same ~100-300KB model-list
+	// JSON on every single loop iteration, across all five controllers,
+	// each holding its own freshly-allocated copy at once -- exactly
+	// the "large API response duplicated/retained in memory" pattern
+	// the RAM budget can't afford. Scoped deliberately narrow (GET only,
+	// one specific host+path) rather than a general response cache: the
+	// cached value is a shared, read-only decoded JSON blob returned to
+	// every caller for the TTL window, so caching anything mutated
+	// downstream would be unsafe -- this endpoint's response is neither
+	// mutated nor request-specific, so sharing it is safe. Nil-safe:
+	// nil falls back to always fetching (used by tests/other callers
+	// that don't wire one).
+	modelListCache *getResponseCache
 }
 
 const maxResponseBytes = 25 * 1024 * 1024 // 25MB cap so one response can't blow the 512MB budget
@@ -39,6 +62,94 @@ func defaultUserAgent() string {
 		return v
 	}
 	return "MicroFlow-Workflow-Automation/1.0 (+https://github.com/microflow/microflow; contact: set MICROFLOW_USER_AGENT to your own contact info)"
+}
+
+// getResponseCache is a tiny, bounded, short-TTL cache for GET response
+// bodies, used only for the narrow OpenRouter /models case described on
+// HTTPRequestExecutor.modelListCache above. Deliberately NOT a general
+// HTTP cache: capacity and TTL are both small on purpose so a stale or
+// wrong entry self-heals within seconds, and the whole thing costs at
+// most a few hundred KB even if every distinct model-list URL some
+// workflow might use gets its own entry.
+type getResponseCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	entries map[string]cachedResponse
+}
+
+type cachedResponse struct {
+	value     map[string]any
+	expiresAt time.Time
+}
+
+// maxCachedGETEntries bounds how many distinct URLs this cache holds at
+// once -- a hard cap so a workflow hitting many different GET endpoints
+// can never turn this into an unbounded map (rule: nothing unbounded).
+const maxCachedGETEntries = 8
+
+func newGetResponseCache(ttl time.Duration) *getResponseCache {
+	return &getResponseCache{ttl: ttl, entries: make(map[string]cachedResponse, maxCachedGETEntries)}
+}
+
+func (c *getResponseCache) get(url string) (map[string]any, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[url]
+	if !ok || time.Now().After(e.expiresAt) {
+		if ok {
+			delete(c.entries, url) // expired -- drop it now rather than let it sit until the next miss
+		}
+		return nil, false
+	}
+	return e.value, true
+}
+
+func (c *getResponseCache) set(url string, value map[string]any) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[url]; !exists && len(c.entries) >= maxCachedGETEntries {
+		// Simple bounded eviction: this cache only ever holds a handful
+		// of well-known, hand-picked URLs (see isCacheableGETURL), so an
+		// exact LRU isn't worth the bookkeeping -- just refuse new keys
+		// once full rather than growing without bound.
+		return
+	}
+	c.entries[url] = cachedResponse{value: value, expiresAt: time.Now().Add(c.ttl)}
+}
+
+// isCacheableGETURL reports whether url is one of the specific,
+// known-safe-to-cache read-only endpoints this executor short-TTL
+// caches. Currently just OpenRouter's model list (see
+// HTTPRequestExecutor.modelListCache) -- kept as an explicit allowlist,
+// not a general "any GET" rule, so caching can never silently apply to
+// an endpoint whose response is request-specific or expected to change
+// between calls in ways a workflow depends on.
+func isCacheableGETURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.Host == "openrouter.ai" && u.Path == "/api/v1/models"
+}
+
+// modelListCacheTTL is the OpenRouter model-list cache lifetime.
+// Operator-overridable; defaults short (20s) so a change in what
+// OpenRouter currently lists as free is picked up quickly -- this
+// exists to collapse redundant re-fetches within a single burst of
+// retry-loop iterations, not to serve genuinely stale data.
+func modelListCacheTTL() time.Duration {
+	if v := os.Getenv("MICROFLOW_MODEL_LIST_CACHE_TTL_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 20 * time.Second
 }
 
 func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
@@ -63,6 +174,16 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 		method, _ := node.Parameters["method"].(string)
 		if method == "" {
 			method = "GET"
+		}
+
+		// Cache hit for a known read-only, non-request-specific GET (see
+		// isCacheableGETURL/modelListCache doc) -- skip the network call,
+		// the heavy-work gate, and re-decoding a large JSON body entirely.
+		if method == "GET" && e.modelListCache != nil && isCacheableGETURL(resolvedURL) {
+			if cached, ok := e.modelListCache.get(resolvedURL); ok {
+				out = append(out, model.Item{JSON: cached})
+				continue
+			}
 		}
 
 		var body io.Reader
@@ -231,6 +352,15 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 		} else {
 			result["body"] = string(respBody)
 		}
+
+		// Populate the cache only on a real 2xx success for the same
+		// narrow, known-safe URL checked above -- never cache an error
+		// body (a transient 429/5xx must be retried for real next time,
+		// not served stale-but-successful from cache).
+		if method == "GET" && e.modelListCache != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && isCacheableGETURL(resolvedURL) {
+			e.modelListCache.set(resolvedURL, result)
+		}
+
 		out = append(out, model.Item{JSON: result})
 	}
 	return model.NodeOutput{out}, nil

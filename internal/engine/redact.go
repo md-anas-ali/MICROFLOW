@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -12,6 +13,41 @@ import (
 // RedactedPlaceholder replaces any secret value the redactor catches,
 // wherever it's about to be persisted, logged, or shown in the API/UI.
 const RedactedPlaceholder = "***REDACTED***"
+
+// maxStoredValueBytes caps how large a single string value is allowed
+// to be once it's copied into a *stored* form (Execution.NodeRuns, the
+// API response, the frontend inspector, SSE). This is the gap that let
+// real memory usage badly overshoot every other cap in this file:
+// NodeRunCap (engine.go) and the Manager's mirrored history
+// (runner/async.go) both bound how many node-run ENTRIES are kept, but
+// neither bounded how big any single entry's Input/Output could be.
+// This workflow's own nodes can legitimately produce large single
+// values -- an HTTP response body up to maxResponseBytes (25MB, see
+// internal/nodes/http.go), or a $readFileBase64 read up to
+// maxReadFileBase64Bytes (5MB, see internal/nodes/code.go) -- and each
+// one gets a full redacted deep copy made for storage on top of the
+// live copy the executor already holds. A handful of such values
+// retained across NodeRunCap entries (each counted twice, once as
+// Input and once as Output) is enough on its own to blow well past a
+// 512MB container, independent of everything else in this file. This
+// cap only affects the stored/redacted copy -- the live JSON node
+// executors and expressions ($node[...], $('Node').item.json) actually
+// operate on is untouched, exactly like every other redaction in this
+// file.
+const maxStoredValueBytes = 64 * 1024 // 64KB per stored string value
+
+// truncateForStorage shortens s to maxStoredValueBytes if it's larger,
+// appending a marker that says how much was cut so the truncation
+// itself is never mistaken for the real (shorter) value. Called before
+// RedactString rather than after, so the (comparatively expensive,
+// allocation-heavy) secret-scrubbing pass never has to scan a
+// multi-megabyte string in the first place.
+func truncateForStorage(s string) string {
+	if len(s) <= maxStoredValueBytes {
+		return s
+	}
+	return fmt.Sprintf("%s... [truncated %d of %d bytes for storage]", s[:maxStoredValueBytes], len(s)-maxStoredValueBytes, len(s))
+}
 
 // secretKeyPattern matches JSON object keys / map keys that name a
 // secret by convention (geminiApiKey, openrouterApiKey, youtubeDataApiKey,
@@ -91,11 +127,18 @@ func (r *SecretRedactor) noteValue(v string) {
 	r.mu.Unlock()
 }
 
-// RedactString scrubs every previously-noted secret value out of s.
+// RedactString scrubs every previously-noted secret value out of s,
+// after first truncating s if it's larger than maxStoredValueBytes (see
+// that constant's doc comment -- every call site here feeds a value
+// that ends up stored/displayed, e.g. result.Error in engine.go and a
+// Code node's console.log message in nodes/code.go, so this is the one
+// choke point that protects all of them, not just the JSON-walking
+// path in redactAny).
 func (r *SecretRedactor) RedactString(s string) string {
 	if r == nil || s == "" {
 		return s
 	}
+	s = truncateForStorage(s)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for v := range r.values {

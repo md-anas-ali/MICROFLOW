@@ -114,7 +114,24 @@ func (b *broadcaster) publish(ev Event) {
 	}
 	b.replay = append(b.replay, ev)
 	if extra := len(b.replay) - replayBufSize; extra > 0 {
-		b.replay = b.replay[extra:]
+		// Deliberately a fresh copy, NOT b.replay[extra:] -- the same
+		// array-retention bug already fixed in engine.go's
+		// appendNodeRun (see its comment for the full mechanism): a
+		// plain re-slice keeps pointing into the SAME backing array,
+		// so every "dropped" older Event -- each carrying a full
+		// *model.NodeRunResult, potentially holding several MB of
+		// base64 image/frame data read via $readFileBase64 (e.g. the
+		// QC vision request's frames) -- stays reachable, and
+		// therefore un-collectible, through that array for as long as
+		// append() keeps reusing its remaining capacity. This matters
+		// more here than a per-execution buffer would: m.all (the
+		// process-wide "live executions monitor" broadcaster) is
+		// never evicted for the life of the server, so this call path
+		// repeats for every node of every execution for as long as
+		// the process runs, not just for one run's lifetime.
+		trimmed := make([]Event, replayBufSize)
+		copy(trimmed, b.replay[extra:])
+		b.replay = trimmed
 	}
 	for _, ch := range b.subs {
 		select {
@@ -359,9 +376,36 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 
 	onNodeRun := func(result model.NodeRunResult) {
 		rs.mu.Lock()
+		// Bug fix: this is a SEPARATE copy of node-run history from
+		// rc.Execution.NodeRuns (engine.go's appendNodeRun) -- the
+		// Manager keeps its own so GET/SSE readers can see live
+		// progress via a defensive snapshot without touching the
+		// engine's RunContext directly. It was never given the same
+		// two fixes appendNodeRun already got, which defeated them in
+		// practice for every execution run through this async path
+		// (the manual "Execute" button/API -- see api/server.go's
+		// handleExecuteAsync):
+		//   1. Hardcoded cap of 500 instead of the operator-configured
+		//      NodeRunCap (MICROFLOW_NODE_RUN_CAP, default 12 in this
+		//      deployment's low-RAM tuning) -- so this copy held up to
+		//      ~40x more full node input/output JSON (including any
+		//      base64 media payloads) than the budget LOWRAM.md
+		//      measured and tuned for.
+		//   2. `rs.ex.NodeRuns[extra:]` re-slices instead of copying,
+		//      which keeps the dropped entries' Input/Output reachable
+		//      through the same backing array for as long as append()
+		//      keeps reusing its remaining capacity -- exactly the
+		//      leak already identified and fixed in
+		//      engine.go's appendNodeRun, just not mirrored here.
+		limit := m.r.NodeRunCap
+		if limit <= 0 {
+			limit = 500
+		}
 		rs.ex.NodeRuns = append(rs.ex.NodeRuns, result)
-		if extra := len(rs.ex.NodeRuns) - 500; extra > 0 {
-			rs.ex.NodeRuns = rs.ex.NodeRuns[extra:]
+		if extra := len(rs.ex.NodeRuns) - limit; extra > 0 {
+			trimmed := make([]model.NodeRunResult, limit)
+			copy(trimmed, rs.ex.NodeRuns[extra:])
+			rs.ex.NodeRuns = trimmed
 		}
 		rs.mu.Unlock()
 
