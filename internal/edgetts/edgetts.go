@@ -115,15 +115,6 @@ func Synthesize(ctx context.Context, text string, opts Options) ([]byte, error) 
 	headers.Set("User-Agent", userAgent)
 	headers.Set("Pragma", "no-cache")
 	headers.Set("Cache-Control", "no-cache")
-	headers.Set("Accept-Language", "en-US,en;q=0.9")
-	headers.Set("Accept-Encoding", "gzip, deflate, br")
-	// Edge's current client sends a stable per-connection MUID cookie.
-	// Supplying it avoids the 403 handshake seen by some regions/edges.
-	muid, err := randomHexID(32)
-	if err != nil {
-		return nil, fmt.Errorf("edgetts: generate muid: %w", err)
-	}
-	headers.Set("Cookie", "muid="+muid+";")
 
 	conn, err := wsDial(ctx, wsHost, wsPath+query, headers)
 	if err != nil {
@@ -169,7 +160,7 @@ func sendSSML(conn *wsConn, text, voice, rate string) error {
 	)
 	msg := "X-RequestId:" + reqID + "\r\n" +
 		"Content-Type:application/ssml+xml\r\n" +
-		"X-Timestamp:" + timestamp() + "Z\r\n" +
+		"X-Timestamp:" + timestamp() + "\r\n" +
 		"Path:ssml\r\n\r\n" + ssml
 	return conn.writeText(msg)
 }
@@ -192,17 +183,40 @@ func escapeSSML(s string) string {
 // text control messages), then raw audio bytes for the rest of the
 // frame.
 func collectAudio(ctx context.Context, conn *wsConn) ([]byte, error) {
-	var audio []byte
-	deadline, hasDeadline := ctx.Deadline()
-	if !hasDeadline {
-		deadline = time.Now().Add(30 * time.Second)
-	}
-	for {
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("edgetts: timed out waiting for turn.end")
+	// BUG FIX: conn.readMessage() below blocks on the raw network
+	// socket with no native context support. The previous code only
+	// checked ctx's deadline *before* each readMessage() call, which
+	// does nothing if the very first read blocks (e.g. the server
+	// accepts the TCP/TLS connection but then stalls or never
+	// responds) -- the caller-supplied timeout (see cmd/edgetts's
+	// --timeout flag, and the 20s default it passes into
+	// context.WithTimeout) was silently NOT enforced, so a stalled
+	// connection could hang here indefinitely. Combined with
+	// ExecuteCommandExecutor's HeavyWorkGate (rule 20, at most one
+	// heavy process at a time), a single hung TTS call could block
+	// every other FFmpeg step behind it for the full 5-minute
+	// executeCommand timeout instead of failing fast into the
+	// workflow's silent-audio fallback as designed. Closing the
+	// underlying connection when ctx is done unblocks the pending
+	// read immediately, regardless of whether ctx has a deadline or
+	// was cancelled manually.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.conn.Close()
+		case <-stopWatch:
 		}
+	}()
+
+	var audio []byte
+	for {
 		msg, err := conn.readMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("edgetts: timed out waiting for turn.end: %w", ctx.Err())
+			}
 			return nil, fmt.Errorf("edgetts: read: %w", err)
 		}
 		switch msg.opcode {
