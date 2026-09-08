@@ -85,15 +85,16 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
 
 FROM alpine:3.19
 
+RUN apk add --no-cache ffmpeg python3 ca-certificates bash
+COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
+
 # Verify the vendored Edge TTS runtime at image build time.
 RUN PYTHONPATH=/opt/microflow/pytts-deps /usr/bin/python3 -c 'import edge_tts; print("edge-tts", getattr(edge_tts, "__version__", "unknown"))'
 COPY scripts/edge_tts/edge_tts_min.py /usr/local/bin/edge-tts
 RUN chmod +x /usr/local/bin/edge-tts
 COPY scripts/edge_tts/tts-selftest.sh /usr/local/bin/tts-selftest.sh
 RUN chmod +x /usr/local/bin/tts-selftest.sh
-RUN apk add --no-cache ffmpeg python3 ca-certificates bash
 COPY --from=build /out/microflow-server /usr/local/bin/microflow-server
-COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
 COPY internal/store/schema.sql /app/internal/store/schema.sql
 WORKDIR /app
 
