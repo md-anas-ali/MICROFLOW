@@ -7,7 +7,7 @@ This is a stripped-down copy of MicroFlow kept to only what
 
 - `cmd/server` — the engine + HTTP API + embedded web UI.
 - `scripts/edge_tts/edge_tts_min.py` — a minimal-RAM CLI wrapper
-  around the real, online `edge-tts==4.0.11` PyPI package. Required:
+  around the real, online `edge-tts==7.2.8` PyPI package. Required:
   the workflow's "TTS (Edge->Silent)" node shells out to a bare
   `edge-tts` command, so this must be reachable on `PATH` as
   `edge-tts` (see `Dockerfile`, which installs it as a tiny shell

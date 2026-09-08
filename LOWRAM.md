@@ -47,7 +47,7 @@ noted next to it) -- nothing here is estimated or assumed.
 4. **`Dockerfile`** (updated again -- see the top-of-file superseded
    note above): originally built `cmd/edgetts`, a pure-Go stand-in for
    the `edge-tts` CLI; now installs `scripts/edge_tts/edge_tts_min.py`
-   (backed by the real `edge-tts==4.0.11` package) as the literal
+   (backed by the real `edge-tts==7.2.8` package) as the literal
    command `edge-tts` on PATH instead, since the workflow's "TTS
    (Edge->Silent)" node's script calls the bare shell command
    `edge-tts` directly, not through MicroFlow's own config.
@@ -92,7 +92,7 @@ beyond stdlib: **~9.4 MB**.
 
 **edge-tts**: **superseded -- see below.** This section originally
 measured the repo's own pure-Go replacement (`cmd/edgetts`), which has
-since been removed and replaced with the real `edge-tts==4.0.11` PyPI
+since been removed and replaced with the real `edge-tts==7.2.8` PyPI
 package on explicit instruction, because that Go code had never
 actually been run against Microsoft's live endpoint (see its own doc
 comment, preserved in git history) -- a real reliability risk for a
@@ -116,7 +116,7 @@ exists in this repo.
 > (TLS handshake to the real endpoint fails in this
 > network-restricted sandbox before steady state).
 
-**Current `edge-tts==4.0.11` status:** the wrapper is now wired to the
+**Current `edge-tts==7.2.8` status:** the wrapper is now wired to the
 actual 4.0.11 API (`Communicate(text, voice, rate=...)` +
 `Communicate.stream()`), with streaming file output. The sandbox used
 for this repository has no route to Microsoft's live TTS endpoint, so

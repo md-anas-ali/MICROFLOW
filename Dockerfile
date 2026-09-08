@@ -2,7 +2,7 @@
 # workflow (see LOWRAM.md for the measured numbers and honest limits of
 # this tuning).
 #
-# TTS ENGINE: real, online Microsoft Edge TTS via the `edge-tts==4.0.11`
+# TTS ENGINE: real, online Microsoft Edge TTS via the `"edge-tts==7.2.8"`
 # PyPI package (see scripts/edge_tts/edge_tts_min.py and
 # scripts/edge_tts/README.md). This deliberately replaces an earlier
 # pure-Go reimplementation of the same undocumented Microsoft protocol
@@ -11,7 +11,7 @@
 # never had network access to it either; see LOWRAM.md's history) and
 # reverse-engineered protocol details like the Sec-MS-GEC anti-abuse
 # token are exactly the kind of thing Microsoft can silently change.
-# edge-tts==4.0.11 is the actual upstream project every "Edge TTS"
+# "edge-tts==7.2.8" is the actual upstream project every "Edge TTS"
 # integration in the wild is built on, so it degrades the same way
 # everyone else's does, not in some bespoke way only this repo hits.
 #
@@ -53,7 +53,7 @@
 # base back to `debian:bookworm-slim` with `apt-get install -y
 # --no-install-recommends ffmpeg python3 ca-certificates`, and for
 # stage 2 use `python:3.11-slim-bookworm` with `pip install
-# --no-cache-dir --target=... edge-tts==4.0.11` (manylinux wheels for
+# --no-cache-dir --target=... "edge-tts==7.2.8"` (manylinux wheels for
 # aiohttp cover glibc too, so this swap doesn't reintroduce a compiler
 # requirement).
 
@@ -63,7 +63,7 @@ COPY . .
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
 RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
 
-# Fetches edge-tts==4.0.11 and its one direct dependency (aiohttp) as
+# Fetches "edge-tts==7.2.8" and its one direct dependency (aiohttp) as
 # prebuilt wheels ONLY (--only-binary=:all: below turns a missing
 # wheel into a hard build failure instead of silently compiling, per
 # the caveat above). aiohttp's own transitive deps (multidict, yarl,
@@ -75,7 +75,7 @@ RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
 # -- no pip/setuptools/wheel need to exist in the runtime image at all.
 FROM python:3.11-alpine3.19 AS pytts
 RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
-      --target=/pytts-deps "edge-tts==4.0.11" "aiohttp==3.14.3" \
+      --target=/pytts-deps "edge-tts==7.2.8" "aiohttp==3.14.3" \
  && find /pytts-deps -name "*.dist-info" -type d -exec rm -rf {} + \
  && find /pytts-deps -name "__pycache__" -type d -exec rm -rf {} + \
  && find /pytts-deps -name "*.egg-info" -type d -exec rm -rf {} + \
@@ -84,11 +84,18 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
  && rm -rf /pytts-deps/edge_playback
 
 FROM alpine:3.19
+
+# Verify the vendored Edge TTS runtime at image build time.
+RUN PYTHONPATH=/opt/microflow/pytts-deps /usr/bin/python3 -c 'import edge_tts; print("edge-tts", getattr(edge_tts, "__version__", "unknown"))'
+COPY scripts/edge_tts/edge_tts_min.py /usr/local/bin/edge-tts
+RUN chmod +x /usr/local/bin/edge-tts
+COPY scripts/edge_tts/tts-selftest.sh /usr/local/bin/tts-selftest.sh
+RUN chmod +x /usr/local/bin/tts-selftest.sh
 RUN apk add --no-cache ffmpeg python3 ca-certificates bash
 COPY --from=build /out/microflow-server /usr/local/bin/microflow-server
 COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
 # Keep the exact `edge-tts` command used by the supplied n8n workflow, but
-# delegate to the real edge-tts==4.0.11 package CLI.
+# delegate to the real "edge-tts==7.2.8" package CLI.
 RUN printf '#!/bin/sh\\nexec /usr/bin/python3 -m edge_tts "$@"\\n' \
       > /usr/local/bin/edge-tts \
  && chmod +x /usr/local/bin/edge-tts
@@ -116,7 +123,9 @@ ENV MICROFLOW_HEAP_CEILING_MB=40 \
     PYTHONDONTWRITEBYTECODE=1 \
     MICROFLOW_TTS_MAX_CHARS=20000 \
     MICROFLOW_TTS_LOCK_PATH=/tmp/microflow-edge-tts.lock \
-    MICROFLOW_TTS_LOCK_WAIT_SECONDS=25
+    MICROFLOW_TTS_LOCK_WAIT_SECONDS=25 \
+    MICROFLOW_TTS_TIMEOUT_SECONDS=45 \
+    MICROFLOW_TTS_MAX_ATTEMPTS=2
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/microflow-server"]

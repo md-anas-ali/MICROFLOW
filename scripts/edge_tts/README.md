@@ -1,18 +1,42 @@
-# MICROFLOW Edge TTS
+# Microsoft Edge TTS
 
-MICROFLOW follows the workflow's existing TTS setup exactly:
+MicroFlow uses **Microsoft Edge TTS only** through the Python `edge-tts` package.
 
-```text
-edge-tts --rate=+18% --voice en-US-AndrewNeural --file /tmp/tts_text_<N>.txt --write-media /tmp/scene_<N>.mp3
+## Runtime
+
+- Python: 3.11
+- `edge-tts`: **7.2.8**
+- `aiohttp`: 3.14.3
+- Default voice: `en-US-AndrewNeural`
+- Default rate: `+18%`
+- Concurrency: 1
+- No GPU
+- No paid API key
+
+## Command contract
+
+```sh
+edge-tts --rate=+18% --voice=en-US-AndrewNeural --file INPUT --write-media OUTPUT
 ```
 
-The workflow writes the scene voice text to a temporary UTF-8 file, calls the
-real `edge-tts==4.0.11` CLI, validates that an audio file was produced, and
-falls back to generated silent MP3 audio if Microsoft Edge TTS fails.
+The launcher keeps this contract while adding a single-flight lock, bounded timeout, retry, and output validation.
 
-The Docker image installs `edge-tts==4.0.11`; `/usr/local/bin/edge-tts` is a
-small launcher for the package's real CLI (`python3 -m edge_tts`). No custom
-Microsoft TTS protocol implementation is used.
+## Important
 
-The exact TTS node is kept compatible with the supplied n8n workflow, including
-the voice, +18% rate, text-file input, output path, and silent fallback.
+Edge TTS is an online Microsoft service. The container must have outbound internet access.
+
+`edge-tts` 4.0.11 is intentionally not used. The project is pinned to 7.2.8 because older releases can fail against Microsoft's current Edge TTS service.
+
+## Self-test
+
+Inside the built container:
+
+```sh
+/usr/local/bin/tts-selftest.sh
+```
+
+A successful test ends with:
+
+```text
+PASS: Edge TTS generated a valid non-empty MP3.
+```

@@ -1,3 +1,14 @@
+# Changes
+
+## Edge TTS fix — 2026-09-08
+
+- Upgraded `edge-tts` from 4.0.11 to 7.2.8.
+- Kept Microsoft Edge TTS as the only TTS engine.
+- Added a real launcher with single-flight locking, bounded timeout, retry, and non-empty output validation.
+- Added `/usr/local/bin/tts-selftest.sh` for live MP3 generation + `ffprobe` validation.
+- Kept the existing workflow command contract and `en-US-AndrewNeural` voice.
+- Added explicit TTS timeout/retry environment variables.
+
 # MicroFlow — OpenRouter fix + low-RAM pass
 
 ## 1. OpenRouter "User not found" fix
