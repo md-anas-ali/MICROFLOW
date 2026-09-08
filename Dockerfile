@@ -1,67 +1,109 @@
 # Low-RAM deployment image for MicroFlow, tuned for a single always-on
 # workflow (see LOWRAM.md for the measured numbers and honest limits of
-# this tuning, including which numbers below are re-used from that
-# measurement pass vs. new and NOT independently re-measured in this
-# sandbox -- there is no Docker/network access here to build and
-# profile this exact image, only to read/reason about it).
+# this tuning).
 #
-# Things this image does that a naive `go build` + `pip install
-# edge-tts` + `debian` setup would not:
+# TTS ENGINE: real, online Microsoft Edge TTS via the `edge-tts==4.0.11`
+# PyPI package (see scripts/edge_tts/edge_tts_min.py and
+# scripts/edge_tts/README.md). This deliberately replaces an earlier
+# pure-Go reimplementation of the same undocumented Microsoft protocol
+# that used to live at internal/edgetts/cmd/edgetts -- that code was
+# never exercised against the live service (this repo's own sandbox has
+# never had network access to it either; see LOWRAM.md's history) and
+# reverse-engineered protocol details like the Sec-MS-GEC anti-abuse
+# token are exactly the kind of thing Microsoft can silently change.
+# edge-tts==4.0.11 is the actual upstream project every "Edge TTS"
+# integration in the wild is built on, so it degrades the same way
+# everyone else's does, not in some bespoke way only this repo hits.
 #
-#   1. Builds cmd/edgetts (a pure-Go, dependency-free replacement for
-#      the subset of the Python `edge-tts` CLI this workflow's "TTS
-#      (Edge->Silent)" node actually calls) and installs it ON PATH AS
-#      `edge-tts` itself -- the node's script calls the bare command
-#      `edge-tts`, not a MicroFlow-configured path, so this only works
-#      if the binary on PATH named `edge-tts` IS the Go one. This
-#      removes an entire nested Python+asyncio+aiohttp+websockets
-#      process (and the whole python3-pip/venv layer needed to install
-#      it) from every TTS call.
-#   2. Strips both Go binaries (-s -w -trimpath).
-#   3. Uses Alpine (musl libc) instead of Debian for both the build and
-#      runtime stage, not just a "slim" Debian variant. This is a
-#      genuine step further than the previous pass: musl's allocator
-#      has a much smaller per-process memory-arena overhead than
-#      glibc's, which matters for two long-lived-per-run processes in
-#      this workflow (python3, ffmpeg) that are NOT part of the Go heap
-#      and so aren't touched by any of the Go-side tuning below at all.
-#      CAVEAT (being honest per LOWRAM.md's own rule about not claiming
-#      unmeasured numbers): this was not build-tested in this pass --
-#      Alpine's `ffmpeg` package has historically shipped with a broad
-#      codec set including libx264, but verify `ffmpeg -encoders | grep
-#      264` in the built image before relying on it, since Alpine
-#      package contents do shift between versions. If it's missing
-#      libx264, switch the base back to `debian:bookworm-slim` with
-#      `apt-get install -y --no-install-recommends ffmpeg python3
-#      ca-certificates` (the previous, verified-working combination)
-#      and drop the `apk` lines for `apt-get` ones.
+# The workflow's own "TTS (Edge->Silent)" node calls the bare shell
+# command `edge-tts`, not a MicroFlow-configured path (see
+# internal/nodes/command.go's doc comment) -- so, same as before, this
+# only works if whatever is on PATH as `edge-tts` behaves like the CLI
+# the workflow expects (`--rate --voice --file --write-media`). Here
+# that's a thin wrapper script (~150 lines, see the README next to it)
+# invoking the real edge_tts.Communicate class directly, not edge-tts's
+# own bundled CLI -- see that README for exactly why (single-flight
+# concurrency lock, no SubMaker/subtitle bookkeeping, hard input-length
+# ceiling, guaranteed no partial output file on failure).
 #
-# python3 itself is NOT removable: all 13 executeCommand nodes in this
-# workflow invoke `python3 -c <script>` as their orchestration layer
-# (which then shells out to ffmpeg/ffprobe) -- that's how the workflow
-# is built, not something MicroFlow chooses, so a minimal python3 is
-# still required in the runtime image.
+# python3 itself is NOT a new cost introduced by this: all 13
+# executeCommand nodes in this workflow already invoke `python3 -c
+# <script>` as their orchestration layer (which then shells out to
+# ffmpeg/ffprobe), so a python3 interpreter was already required in
+# this image before edge-tts entered the picture at all. What IS new
+# is the edge_tts + aiohttp package install (see stage 2 below) --
+# that overhead is real and is reported honestly in
+# scripts/edge_tts/README.md's measurements, not hidden.
+#
+# Alpine (musl libc) is used for all three stages so the prebuilt
+# `musllinux_1_2` wheels for aiohttp (and its transitive deps:
+# multidict, yarl, frozenlist, propcache) apply directly -- confirmed
+# available on PyPI for cp311/musllinux_1_2_x86_64 as of this writing,
+# so stage 2 needs no C compiler at all, just pip + network. If a
+# future aiohttp/edge-tts release ever lacks a musllinux wheel for the
+# Python version this pins, that stage will fail loudly at `docker
+# build` time (not silently fall back to a slow compile), which is the
+# safer failure mode here.
+#
+# CAVEAT carried over from the previous pass (being honest per
+# LOWRAM.md's own rule about not claiming unmeasured numbers): Alpine's
+# `ffmpeg` package has historically shipped with a broad codec set
+# including libx264, but verify `ffmpeg -encoders | grep 264` in the
+# built image before relying on it. If it's missing libx264, switch the
+# base back to `debian:bookworm-slim` with `apt-get install -y
+# --no-install-recommends ffmpeg python3 ca-certificates`, and for
+# stage 2 use `python:3.11-slim-bookworm` with `pip install
+# --no-cache-dir --target=... edge-tts==4.0.11` (manylinux wheels for
+# aiohttp cover glibc too, so this swap doesn't reintroduce a compiler
+# requirement).
 
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY . .
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
-RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server \
- && go build -ldflags="-s -w" -o /out/edge-tts ./cmd/edgetts
+RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
+
+# Fetches edge-tts==4.0.11 and its one direct dependency (aiohttp) as
+# prebuilt wheels ONLY (--only-binary=:all: below turns a missing
+# wheel into a hard build failure instead of silently compiling, per
+# the caveat above). aiohttp's own transitive deps (multidict, yarl,
+# frozenlist, propcache, aiosignal, aiohappyeyeballs, idna, attrs,
+# typing_extensions) are pulled in automatically by pip's resolver --
+# nothing here is hand-picked or trimmed beyond what edge-tts actually
+# imports. --target installs into a plain directory (not a venv), so
+# the final stage only needs to COPY that directory and set PYTHONPATH
+# -- no pip/setuptools/wheel need to exist in the runtime image at all.
+FROM python:3.11-alpine3.19 AS pytts
+RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
+      --target=/pytts-deps "edge-tts==4.0.11" "aiohttp==3.14.3" \
+ && find /pytts-deps -name "*.dist-info" -type d -exec rm -rf {} + \
+ && find /pytts-deps -name "__pycache__" -type d -exec rm -rf {} + \
+ && find /pytts-deps -name "*.egg-info" -type d -exec rm -rf {} + \
+ # edge_playback pulls in nothing extra by itself but isn't reachable
+ # from this deployment's CLI-only usage -- drop it, it's dead weight.
+ && rm -rf /pytts-deps/edge_playback
 
 FROM alpine:3.19
 RUN apk add --no-cache ffmpeg python3 ca-certificates
 COPY --from=build /out/microflow-server /usr/local/bin/microflow-server
+COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
+COPY scripts/edge_tts/edge_tts_min.py /opt/microflow/edge_tts_min.py
 # Installed as the literal name `edge-tts` -- see the header comment
-# above for why the exact name on PATH matters here.
-COPY --from=build /out/edge-tts /usr/local/bin/edge-tts
+# above for why the exact name on PATH matters here. A tiny shell
+# shim (not a symlink to the .py file) so the script keeps working
+# regardless of whether its own shebang line matches this image's
+# python3 path.
+RUN printf '#!/bin/sh\nexec /usr/bin/python3 /opt/microflow/edge_tts_min.py "$@"\n' \
+      > /usr/local/bin/edge-tts \
+ && chmod +x /usr/local/bin/edge-tts
 COPY internal/store/schema.sql /app/internal/store/schema.sql
 WORKDIR /app
 
 # See LOWRAM.md for what these defaults were actually measured against
-# and where the real ceiling for this workflow currently sits, and for
-# which of the values below are carried over from that measurement
-# pass vs. tightened further without a fresh measurement to back them.
+# and where the real ceiling for this workflow currently sits, and
+# scripts/edge_tts/README.md for the TTS-specific numbers.
+# TTS wrapper controls: single-flight is always 1; the wait setting
+# only bounds how long a second caller waits before falling back.
 ENV MICROFLOW_HEAP_CEILING_MB=40 \
     GOGC=15 \
     GOMAXPROCS=1 \
@@ -73,7 +115,12 @@ ENV MICROFLOW_HEAP_CEILING_MB=40 \
     MICROFLOW_SCRATCH_DIR=/tmp/microflow \
     MICROFLOW_FFMPEG_PATH=/usr/bin/ffmpeg \
     MICROFLOW_PYTHON_PATH=/usr/bin/python3 \
-    MICROFLOW_EDGE_TTS_PATH=/usr/local/bin/edge-tts
+    MICROFLOW_EDGE_TTS_PATH=/usr/local/bin/edge-tts \
+    PYTHONPATH=/opt/microflow/pytts-deps \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MICROFLOW_TTS_MAX_CHARS=20000 \
+    MICROFLOW_TTS_LOCK_PATH=/tmp/microflow-edge-tts.lock \
+    MICROFLOW_TTS_LOCK_WAIT_SECONDS=25
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/microflow-server"]

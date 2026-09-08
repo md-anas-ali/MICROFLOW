@@ -139,3 +139,104 @@ go build -race ./...  → OK
 go test -race ./...   → OK
 go build ./cmd/server → OK (binary builds)
 ```
+
+## 3. Edge TTS: replaced pure-Go reimplementation with real `edge-tts==4.0.11`, extreme-min-RAM redesign
+
+**Removed:**
+- `internal/edgetts/` (`edgetts.go`, `ws.go`) -- the pure-Go,
+  dependency-free reimplementation of Microsoft's undocumented Edge
+  "read aloud" websocket protocol. Its own doc comment noted it had
+  never been exercised against the live endpoint in any sandbox this
+  repo was developed in.
+- `cmd/edgetts/` -- the CLI wrapping that package.
+
+**Added:**
+- `scripts/edge_tts/edge_tts_min.py` -- minimal CLI wrapper around the
+  real `edge_tts.Communicate` class from `edge-tts==4.0.11`. Same CLI
+  contract as before (`--rate --voice --file --write-media --timeout`),
+  so the workflow's "TTS (Edge->Silent)" node needed zero changes.
+  Adds: a blocking cross-process `flock`-based single-flight lock
+  (concurrency is always exactly 1, regardless of Go server worker
+  count), a hard input-length ceiling (`MICROFLOW_TTS_MAX_CHARS`,
+  default 20000), streamed chunk-by-chunk writes to a `.part` file with
+  atomic rename on success (never a partial/corrupt file at the real
+  output path), and full cleanup on every failure path (network error,
+  invalid voice, timeout, malformed output).
+- `scripts/edge_tts/README.md` -- design rationale (why a short-lived
+  subprocess was chosen over a persistent worker for this workflow's
+  call pattern) and the full measured-RSS writeup, including what
+  could and couldn't be verified without real network access to
+  Microsoft's endpoint in this sandbox.
+
+**Changed:**
+- `Dockerfile` -- new middle build stage installs `edge-tts==4.0.11` +
+  `aiohttp` from prebuilt `musllinux` wheels only (no compiler needed;
+  `--only-binary=:all:` turns a missing wheel into a hard build
+  failure rather than a silent slow compile) into a plain `--target`
+  directory, copied into the final Alpine stage and referenced via
+  `PYTHONPATH` -- no pip/setuptools ships in the runtime image. The
+  `edge-tts` command on `PATH` is now a tiny `/bin/sh` shim execing
+  `python3 edge_tts_min.py`, in the same spot the Go binary used to be.
+- `LOWRAM.md` -- old edge-tts measurement section marked superseded
+  (kept, not deleted, for history) and replaced with the new measured
+  numbers plus an updated "worst moment" arithmetic that accounts for
+  the TTS subprocess's larger (measured, not assumed) footprint.
+- `README.md` -- points at the new script/README instead of `cmd/edgetts`.
+
+**Not changed:** `cmd/server/main.go`'s `MICROFLOW_EDGE_TTS_PATH`
+default and the `AllowedBinaries["edge-tts"]` config surface --
+unaffected by this swap, since the workflow invokes the bare `edge-tts`
+command from PATH either way, not through that config.
+
+### Verification (this pass)
+```
+go build ./...   → OK (after removing internal/edgetts, cmd/edgetts)
+go vet ./...     → clean
+go test ./...    → ok, all pre-existing tests still pass
+```
+Python side (functional, in a throwaway venv -- see
+`scripts/edge_tts/README.md` for full detail and caveats):
+- empty-file / oversized-input rejection: correct, exits 1, no import
+  of edge_tts/aiohttp paid for on these paths.
+- real network attempt to Microsoft's endpoint: sandbox's own egress
+  proxy returns `403 host_not_allowed` (confirmed via `curl -D-`), same
+  network restriction the previous LOWRAM.md pass hit -- could not
+  get a full successful synthesis in this sandbox.
+- 5 sequential attempts: peak RSS stable (~36.2-36.3MB each), no growth.
+- 2 overlapping attempts: `flock` correctly serializes them; a caller
+  that can't get the lock in time fails with a clear, distinct error
+  message (fixed a real bug here: `asyncio.TimeoutError` is an alias
+  of the builtin `TimeoutError` on Python 3.11+, which was swallowing
+  the lock-specific message before this was caught and fixed).
+- synthesis timeout and full happy-path file-lifecycle (write/rename/
+  cleanup): verified via a mocked `Communicate.run` (real endpoint
+  unreachable here), both correct.
+- no leftover output/`.part`/lock-growth files after any test above.
+
+No Docker/network access in this sandbox to build and profile the
+actual container image -- see the Dockerfile's own header comment and
+`scripts/edge_tts/README.md` for exactly what that leaves unverified
+(cold-start on the real Alpine/musl/Python 3.11 combination, and peak
+RSS while actually receiving real audio data from Microsoft).
+
+
+## 4. Edge-TTS wrapper API correction after archive review
+
+A post-delivery review of the attached archive found that the first
+`edge_tts_min.py` draft called `Communicate()` without its required text
+argument and used a non-existent/incorrect `run()`/tuple-chunk contract.
+That meant the claimed "real connection attempt" measurements were not
+valid successful TTS measurements.
+
+This has now been corrected to the actual `edge-tts==4.0.11` API:
+`Communicate(text, voice, rate=rate)` followed by
+`async for chunk in communicate.stream()`, writing only
+`chunk["data"]` when `chunk["type"] == "audio"`. The input reader was
+also changed to read at most `MAX_CHARS + 1` characters, making the
+input limit a real memory bound rather than loading an arbitrarily large
+file before rejecting it.
+
+The live Microsoft endpoint remains unreachable from this sandbox, so
+no successful live-audio RSS figure is claimed after this correction.
+The existing import-process measurements remain documented separately
+from actual TTS-process peak RSS.

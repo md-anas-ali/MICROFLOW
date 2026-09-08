@@ -44,10 +44,11 @@ noted next to it) -- nothing here is estimated or assumed.
    peak RSS was ~17MB either way), but it's a real fix worth keeping:
    it removes a latent unbounded-growth risk for any workflow with a
    long retry/loop pattern, and costs nothing.
-4. **`Dockerfile`** (new): builds `cmd/edgetts` -- a pure-Go,
-   dependency-free stand-in for the Python `edge-tts` CLI already in
-   this repo (`internal/edgetts`, passing tests) -- and installs it as
-   the literal command `edge-tts` on PATH, since the workflow's "TTS
+4. **`Dockerfile`** (updated again -- see the top-of-file superseded
+   note above): originally built `cmd/edgetts`, a pure-Go stand-in for
+   the `edge-tts` CLI; now installs `scripts/edge_tts/edge_tts_min.py`
+   (backed by the real `edge-tts==4.0.11` package) as the literal
+   command `edge-tts` on PATH instead, since the workflow's "TTS
    (Edge->Silent)" node's script calls the bare shell command
    `edge-tts` directly, not through MicroFlow's own config.
 5. **`.env.170mb.example`** (new): the concrete env values above.
@@ -89,21 +90,52 @@ same resolution:
 workflow shells out through): bare interpreter startup, no imports
 beyond stdlib: **~9.4 MB**.
 
-**edge-tts**: the repo's own pure-Go replacement (`cmd/edgetts`)
-starts in the same single-digit-MB range as any small Go binary (Go
-binaries in this same test: a trivial "hello world" used ~1.5MB,
-`cmd/e2echeck` itself idles around 9MB before doing any work) --
-could not get a full successful run in this sandbox (outbound network
-to Microsoft's TTS endpoint is blocked here), so no exact peak number
-for a complete run, but there is no realistic path to it costing more
-than a few MB more than that baseline, since it's a single dependency-
-free static binary with no VM/interpreter/event-loop underneath it.
-By contrast, pip's `edge-tts` needs a full CPython interpreter plus
-`aiohttp`+`asyncio`'s import graph before it even opens a connection --
-that stack is real and non-trivial, even though this sandbox couldn't
-produce a clean successful-run number for it either (TLS handshake to
-the real endpoint fails in this network-restricted sandbox before
-steady state).
+**edge-tts**: **superseded -- see below.** This section originally
+measured the repo's own pure-Go replacement (`cmd/edgetts`), which has
+since been removed and replaced with the real `edge-tts==4.0.11` PyPI
+package on explicit instruction, because that Go code had never
+actually been run against Microsoft's live endpoint (see its own doc
+comment, preserved in git history) -- a real reliability risk for a
+reverse-engineered, undocumented protocol. The old text is kept below
+for history; treat the numbers in it as describing code that no longer
+exists in this repo.
+
+> the repo's own pure-Go replacement (`cmd/edgetts`) starts in the
+> same single-digit-MB range as any small Go binary (Go binaries in
+> this same test: a trivial "hello world" used ~1.5MB, `cmd/e2echeck`
+> itself idles around 9MB before doing any work) -- could not get a
+> full successful run in this sandbox (outbound network to Microsoft's
+> TTS endpoint is blocked here), so no exact peak number for a
+> complete run, but there is no realistic path to it costing more than
+> a few MB more than that baseline, since it's a single dependency-
+> free static binary with no VM/interpreter/event-loop underneath it.
+> By contrast, pip's `edge-tts` needs a full CPython interpreter plus
+> `aiohttp`+`asyncio`'s import graph before it even opens a
+> connection -- that stack is real and non-trivial, even though this
+> sandbox couldn't produce a clean successful-run number for it either
+> (TLS handshake to the real endpoint fails in this
+> network-restricted sandbox before steady state).
+
+**Current `edge-tts==4.0.11` status:** the wrapper is now wired to the
+actual 4.0.11 API (`Communicate(text, voice, rate=...)` +
+`Communicate.stream()`), with streaming file output. The sandbox used
+for this repository has no route to Microsoft's live TTS endpoint, so
+a successful live-audio RSS measurement is **not claimed** here.
+
+The previously recorded ~35-37MB figures are useful only as the
+Python/import-process measurements from the earlier pass; they must
+not be described as successful TTS RSS. Re-run the RSS suite on the
+real Render/Docker image with live network access before publishing
+new peak-TTS numbers.
+
+This is a real, measured increase over the old Go binary's few-MB
+footprint -- the trade this repo is now making is that increase in
+exchange for using the actual upstream `edge-tts` implementation
+instead of an unverified reimplementation. See
+`scripts/edge_tts/README.md` for the full reasoning, including why a
+short-lived subprocess (not a persistent worker) was chosen given this
+workflow's call pattern, and exactly what could and couldn't be
+verified without real network access to Microsoft's service.
 
 ## The actual bottom line
 
@@ -122,6 +154,26 @@ Go server (~18MB) + python3 (~9MB) + FFmpeg's heaviest step (~97MB)
   typically lands in the 15-30MB range at idle)
 ≈ 140-155 MB
 ```
+
+**Updated for the real edge-tts:** the TTS node's own `python3 -c
+<script>` orchestrator process spawns `bash`, which execs the `edge-tts`
+shim, which execs `python3 edge_tts_min.py` -- the orchestrator's own
+`subprocess.run()` blocks and holds its own ~9MB the whole time, same
+stacking behavior this document already established for the
+FFmpeg case above (they are separate processes, not one exec-ing away
+into the other). So the TTS node's own worst moment is approximately:
+
+```
+Go server (~18MB) + orchestrator python3 (~9MB, blocked in subprocess.run)
++ edge-tts wrapper's own python3+aiohttp (import-process measurement ~35MB; live-audio peak unverified here)
++ OS/container baseline
+≈ 75-85 MB
+```
+
+still comfortably under the FFmpeg concat+subtitle step's ~97MB, which
+remains the single dominant cost and the thing to investigate first on
+any OOM. `MaxConcurrentHeavy=1` still guarantees this TTS moment and
+the FFmpeg moment never overlap with each other.
 
 That fits inside a 170MB budget with a small but real margin -- not a
 huge one, so this is "achievable and worth doing," not "comfortable."

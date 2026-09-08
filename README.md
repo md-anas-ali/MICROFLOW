@@ -6,10 +6,13 @@ This is a stripped-down copy of MicroFlow kept to only what
 ## What's inside
 
 - `cmd/server` — the engine + HTTP API + embedded web UI.
-- `cmd/edgetts` — a dependency-free Go replacement for the `edge-tts`
-  CLI. Required: the workflow's "TTS (Edge->Silent)" node shells out to
-  a bare `edge-tts` command, so this binary must be on `PATH` as
-  `edge-tts` (see `Dockerfile`).
+- `scripts/edge_tts/edge_tts_min.py` — a minimal-RAM CLI wrapper
+  around the real, online `edge-tts==4.0.11` PyPI package. Required:
+  the workflow's "TTS (Edge->Silent)" node shells out to a bare
+  `edge-tts` command, so this must be reachable on `PATH` as
+  `edge-tts` (see `Dockerfile`, which installs it as a tiny shell
+  shim). See `scripts/edge_tts/README.md` for why this replaced an
+  earlier pure-Go reimplementation, and for the measured RAM numbers.
 - `cmd/setcred` — one-shot CLI to provision Google OAuth credentials
   (client id/secret/refresh token) into the vault for every
   Gmail/Sheets/YouTube node in a saved workflow. This workflow uses
@@ -50,8 +53,8 @@ and provision Google credentials with `cmd/setcred` (see the comment
 at the top of `cmd/setcred/main.go`) or the "Connect with Google"
 button if `GOOGLE_OAUTH_CLIENT_ID`/`_SECRET`/`_REDIRECT_URL` are set.
 
-For the container build (which also builds `cmd/edgetts` and installs
-it as `edge-tts` on `PATH`, plus `ffmpeg`/`python3` which this
+For the container build (which also installs the `edge-tts` wrapper
+script on `PATH` as `edge-tts`, plus `ffmpeg`/`python3` which this
 workflow's `executeCommand` nodes shell out to), see `Dockerfile`.
 
 ## Low-RAM tuning
