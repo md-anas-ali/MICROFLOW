@@ -240,3 +240,4 @@ The live Microsoft endpoint remains unreachable from this sandbox, so
 no successful live-audio RSS figure is claimed after this correction.
 The existing import-process measurements remain documented separately
 from actual TTS-process peak RSS.
+\n\n## TTS workflow parity update\n\nThe Edge TTS integration now follows the supplied n8n workflow exactly: it invokes the real `edge-tts==4.0.11` CLI with `--file`, `--write-media`, `--voice en-US-AndrewNeural`, and `--rate=+18%`. The workflow's existing silent-MP3 fallback remains the failure path. The previous custom Python protocol wrapper is no longer used for TTS synthesis.\n

@@ -84,16 +84,12 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
  && rm -rf /pytts-deps/edge_playback
 
 FROM alpine:3.19
-RUN apk add --no-cache ffmpeg python3 ca-certificates
+RUN apk add --no-cache ffmpeg python3 ca-certificates bash
 COPY --from=build /out/microflow-server /usr/local/bin/microflow-server
 COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
-COPY scripts/edge_tts/edge_tts_min.py /opt/microflow/edge_tts_min.py
-# Installed as the literal name `edge-tts` -- see the header comment
-# above for why the exact name on PATH matters here. A tiny shell
-# shim (not a symlink to the .py file) so the script keeps working
-# regardless of whether its own shebang line matches this image's
-# python3 path.
-RUN printf '#!/bin/sh\nexec /usr/bin/python3 /opt/microflow/edge_tts_min.py "$@"\n' \
+# Keep the exact `edge-tts` command used by the supplied n8n workflow, but
+# delegate to the real edge-tts==4.0.11 package CLI.
+RUN printf '#!/bin/sh\\nexec /usr/bin/python3 -m edge_tts "$@"\\n' \
       > /usr/local/bin/edge-tts \
  && chmod +x /usr/local/bin/edge-tts
 COPY internal/store/schema.sql /app/internal/store/schema.sql
