@@ -94,11 +94,6 @@ RUN chmod +x /usr/local/bin/tts-selftest.sh
 RUN apk add --no-cache ffmpeg python3 ca-certificates bash
 COPY --from=build /out/microflow-server /usr/local/bin/microflow-server
 COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
-# Keep the exact `edge-tts` command used by the supplied n8n workflow, but
-# delegate to the real "edge-tts==7.2.8" package CLI.
-RUN printf '#!/bin/sh\\nexec /usr/bin/python3 -m edge_tts "$@"\\n' \
-      > /usr/local/bin/edge-tts \
- && chmod +x /usr/local/bin/edge-tts
 COPY internal/store/schema.sql /app/internal/store/schema.sql
 WORKDIR /app
 
