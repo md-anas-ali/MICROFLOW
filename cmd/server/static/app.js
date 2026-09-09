@@ -373,14 +373,7 @@
         if (openNodeIndexes.indexOf(index) >= 0) el.classList.add("open");
       });
       detailHost.querySelectorAll(".node-run-head").forEach((h) => h.addEventListener("click", () => h.parentElement.classList.toggle("open")));
-      detailHost.querySelectorAll("button[data-node-copy]").forEach((btn) => {
-        btn.addEventListener("click", async (ev) => {
-          ev.stopPropagation();
-          const index = Number(btn.dataset.nodeCopy);
-          const run = runs[index];
-          await copyNodeRun(run, btn);
-        });
-      });
+      wireNodeCopyButtons(detailHost, runs);
       const cancel = document.getElementById("detailCancel");
       if (cancel) cancel.addEventListener("click", async () => {
         cancel.disabled = true;
@@ -1708,6 +1701,16 @@
     const host = document.getElementById("execPanelHost");
     if (!host) return;
     const runs = ex.nodeRuns || [];
+
+    // Live SSE updates re-render this panel every time a node reports progress.
+    // Preserve the user's expanded/collapsed state by node name so an opened
+    // output never closes just because the execution received another event.
+    const openNodeNames = new Set();
+    host.querySelectorAll(".node-run.open").forEach((el) => {
+      const name = el.querySelector(".node-run-head .name");
+      if (name) openNodeNames.add(name.textContent);
+    });
+
     host.innerHTML =
       '<div class="exec-panel"><div class="exec-summary">' +
       '<span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + "</span>" +
@@ -1718,85 +1721,82 @@
       runs.map((run, index) => renderNodeRun(run, index)).join("") +
       "</div>";
 
+    host.querySelectorAll(".node-run").forEach((el) => {
+      const name = el.querySelector(".node-run-head .name");
+      if (name && openNodeNames.has(name.textContent)) el.classList.add("open");
+    });
     host.querySelectorAll(".node-run-head").forEach((h) => {
       h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
     });
+    wireNodeCopyButtons(host, runs);
+  }
+
+  function buildNodeCopyReport(r) {
+    if (!r) return "";
+    return [
+      "MICROFLOW NODE EXECUTION",
+      "=========================",
+      "Node Name: " + (r.nodeName || "(unnamed)"),
+      "Status: " + (r.status || "unknown"),
+      "Attempt: " + (r.attempt || 1),
+      "Started At: " + (r.startedAt || "None"),
+      "Duration: " + (r.durationMs == null ? "None" : r.durationMs + " ms"),
+      "",
+      "INPUT:",
+      JSON.stringify(r.input == null ? null : r.input, null, 2),
+      "",
+      "OUTPUT:",
+      JSON.stringify(r.output == null ? null : r.output, null, 2),
+      "",
+      "ERROR:",
+      r.error || "None",
+      "",
+      "LOGS:",
+      (r.logs && r.logs.length) ? r.logs.join("\\n") : "None",
+      "",
+      "METADATA:",
+      JSON.stringify(r.metadata == null ? {} : r.metadata, null, 2),
+      "",
+      "OPTIONS:",
+      JSON.stringify(r.options == null ? {} : r.options, null, 2)
+    ].join("\\n");
   }
 
   function renderNodeRun(r, index) {
-    const input = r && r.input != null ? r.input : null;
     const output = r && r.output != null ? r.output : null;
-    const metadata = (r && r.metadata != null) ? r.metadata : {};
-    const options = (r && r.options != null) ? r.options : {};
+    const outputText = JSON.stringify(output, null, 2);
     return (
-      '<div class="node-run">' +
+      '<div class="node-run open">' +
       '<div class="node-run-head"><span class="status-pill status-' + escapeHtml(r.status) + '">' + escapeHtml(r.status) + "</span>" +
       '<span class="name">' + escapeHtml(r.nodeName) + "</span>" +
-      '<span class="dur">' + fmtDurationMs(r.durationMs) + (r.attempt > 1 ? " \u00b7 attempt " + r.attempt : "") + "</span></div>" +
+      '<span class="dur">' + fmtDurationMs(r.durationMs) + (r.attempt > 1 ? " · attempt " + r.attempt : "") + "</span></div>" +
       '<div class="node-run-body">' +
-      '<div class="node-run-copy-row"><button type="button" class="btn btn-sm node-copy-btn" data-node-copy="' + index + '" title="Copy this node name, input, output, error, logs and execution details">\uD83D\uDCCB Copy Node Output</button></div>' +
-      '<div class="node-run-section"><strong>Node:</strong> ' + escapeHtml(r.nodeName || "(unnamed)") + '</div>' +
-      '<div class="node-run-section"><strong>Status:</strong> ' + escapeHtml(r.status || "unknown") + '</div>' +
-      (r.error ? '<div class="err-text"><strong>Error:</strong> ' + escapeHtml(r.error) + "</div>" : '<div class="node-run-section"><strong>Error:</strong> None</div>') +
-      (r.logs && r.logs.length ? "<div class=\"node-run-section\"><strong>Logs:</strong></div><pre>" + escapeHtml(r.logs.join("\n")) + "</pre>" : "") +
-      '<div class="node-run-section"><strong>Input:</strong></div><pre>' + escapeHtml(JSON.stringify(input, null, 2)) + "</pre>" +
-      '<div class="node-run-section"><strong>Output:</strong></div><pre>' + escapeHtml(JSON.stringify(output, null, 2)) + "</pre>" +
-      '<div class="node-run-section"><strong>Execution:</strong></div><pre>' + escapeHtml(JSON.stringify({
-        startedAt: r.startedAt || null,
-        durationMs: r.durationMs || 0,
-        attempt: r.attempt || 1,
-        metadata: metadata,
-        options: options
-      }, null, 2)) + "</pre>" +
+      '<div class="node-run-output-head"><strong>Output:</strong><sl-copy-button class="node-copy-btn" data-node-copy="' + index + '" size="small" title="Copy node name, output, error, logs, metadata and options"></sl-copy-button></div>' +
+      '<pre>' + escapeHtml(outputText) + "</pre>" +
       "</div></div>"
     );
   }
 
+  function wireNodeCopyButtons(root, runs) {
+    if (!root) return;
+    root.querySelectorAll("sl-copy-button[data-node-copy]").forEach((btn) => {
+      const index = Number(btn.dataset.nodeCopy);
+      const run = runs[index];
+      btn.value = buildNodeCopyReport(run);
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        // Shoelace performs the copy itself. The value contains the complete
+        // diagnostic report while the UI only displays the node output.
+        setTimeout(() => toast("✓ Node output copied", "success"), 0);
+      });
+    });
+  }
+
   async function copyNodeRun(r, btn) {
     if (!r) return;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Copying\u2026";
-    }
-    try {
-      const report = [
-        "MICROFLOW NODE EXECUTION",
-        "=========================",
-        "Node Name: " + (r.nodeName || "(unnamed)"),
-        "Status: " + (r.status || "unknown"),
-        "Attempt: " + (r.attempt || 1),
-        "Started At: " + (r.startedAt || "None"),
-        "Duration: " + (r.durationMs == null ? "None" : r.durationMs + " ms"),
-        "",
-        "INPUT:",
-        JSON.stringify(r.input == null ? null : r.input, null, 2),
-        "",
-        "OUTPUT:",
-        JSON.stringify(r.output == null ? null : r.output, null, 2),
-        "",
-        "ERROR:",
-        r.error || "None",
-        "",
-        "LOGS:",
-        (r.logs && r.logs.length) ? r.logs.join("\n") : "None",
-        "",
-        "METADATA:",
-        JSON.stringify(r.metadata == null ? {} : r.metadata, null, 2),
-        "",
-        "OPTIONS:",
-        JSON.stringify(r.options == null ? {} : r.options, null, 2)
-      ].join("\n");
-      const ok = await copyTextToClipboard(report);
-      if (!ok) throw new Error("clipboard write failed");
-      toast("\u2713 Node output copied", "success");
-    } catch (_) {
-      toast("\u2715 Could not copy node output", "error");
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "\uD83D\uDCCB Copy Node Output";
-      }
-    }
+    const report = buildNodeCopyReport(r);
+    const ok = await copyTextToClipboard(report);
+    if (!ok) toast("✕ Could not copy node output", "error");
   }
 
 

@@ -474,16 +474,15 @@ textarea.json-paste {
 
 
 /* Execution node output: keep the panel readable and make per-node copy easy. */
-.node-run-copy-row {
+.node-run-output-head {
   display: flex;
-  justify-content: flex-end;
-  margin-bottom: 8px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 4px;
 }
-.node-copy-btn {
-  white-space: nowrap;
-}
-.node-run-section {
-  margin: 6px 0 3px;
+.node-run-output-head sl-copy-button {
+  flex: 0 0 auto;
 }
 .node-run-body pre {
   max-height: 360px;
