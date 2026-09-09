@@ -1766,7 +1766,7 @@
     const output = r && r.output != null ? r.output : null;
     const outputText = JSON.stringify(output, null, 2);
     return (
-      '<div class="node-run open">' +
+      '<div class="node-run">' +
       '<div class="node-run-head"><span class="status-pill status-' + escapeHtml(r.status) + '">' + escapeHtml(r.status) + "</span>" +
       '<span class="name">' + escapeHtml(r.nodeName) + "</span>" +
       '<span class="dur">' + fmtDurationMs(r.durationMs) + (r.attempt > 1 ? " · attempt " + r.attempt : "") + "</span></div>" +
