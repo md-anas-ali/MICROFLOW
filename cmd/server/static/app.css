@@ -471,3 +471,21 @@ textarea.json-paste {
   .execution-layout { grid-template-columns: 1fr; }
   .exec-detail-host { position:static; max-height:none; }
 }
+
+
+/* Execution node output: keep the panel readable and make per-node copy easy. */
+.node-run-copy-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+.node-copy-btn {
+  white-space: nowrap;
+}
+.node-run-section {
+  margin: 6px 0 3px;
+}
+.node-run-body pre {
+  max-height: 360px;
+  overflow: auto;
+}
