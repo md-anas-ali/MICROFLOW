@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -123,6 +124,78 @@ func (s *Store) ListWorkflows(ctx context.Context) ([]*model.Workflow, error) {
 		out = append(out, &wf)
 	}
 	return out, rows.Err()
+}
+
+// ErrWorkflowNotFound is returned by DeleteWorkflow when no workflow
+// with the given id exists (the API maps this to HTTP 404).
+var ErrWorkflowNotFound = errors.New("store: workflow not found")
+
+// ErrWorkflowHasActiveExecutions is returned by DeleteWorkflow when the
+// workflow still has a queued/running/waiting execution (the API maps
+// this to HTTP 409). Deleting the workflow row out from under a live
+// execution would either fail loudly mid-run (once ON DELETE CASCADE
+// removes workflow_static_data -- see WithLock, which requires that
+// row to exist) or, worse, succeed while a goroutine is still reading/
+// writing it -- rule 13: prevent race condition and data corruption.
+var ErrWorkflowHasActiveExecutions = errors.New("store: workflow has a running or queued execution and cannot be deleted")
+
+// DeleteWorkflow removes a workflow and everything scoped to it
+// (workflow_static_data, executions, credentials, schedules -- all
+// declared ON DELETE CASCADE in schema.sql, so one statement here is
+// enough; no N+1 cleanup queries needed) in a single transaction.
+//
+// Safety, matching this package's existing WithLock pattern:
+//  1. SELECT ... FOR UPDATE locks the workflow row first, so a
+//     concurrent SaveWorkflow/DeleteWorkflow/WithLock call for the same
+//     id serializes against this one instead of racing it.
+//  2. With that lock held, count executions still in flight
+//     (status IN queued/running/waiting AND finished_at IS NULL --
+//     the same predicate MarkInterruptedExecutions uses at startup).
+//     Any match aborts the whole transaction via
+//     ErrWorkflowHasActiveExecutions -- the row lock means no new
+//     execution row can be inserted for this workflow between this
+//     check and the DELETE below.
+//  3. Only then DELETE FROM workflows, relying on the FK cascades for
+//     the rest.
+//
+// This is the durable half of the delete-safety check; the API layer
+// also consults runner.Runner.IsWorkflowActive for a fast in-memory
+// check that additionally covers scheduler/webhook-triggered runs,
+// which (unlike Manager-started runs) write no Postgres row at all
+// until they finish -- see runner.RunFromNode/runOnce.
+func (s *Store) DeleteWorkflow(ctx context.Context, id string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	err = tx.QueryRow(ctx, `SELECT true FROM workflows WHERE id=$1 FOR UPDATE`, id).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrWorkflowNotFound
+		}
+		return err
+	}
+
+	var activeCount int
+	err = tx.QueryRow(ctx, `
+		SELECT count(*) FROM executions
+		WHERE workflow_id = $1 AND finished_at IS NULL
+		  AND status IN ('queued', 'running', 'waiting')
+	`, id).Scan(&activeCount)
+	if err != nil {
+		return err
+	}
+	if activeCount > 0 {
+		return ErrWorkflowHasActiveExecutions
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM workflows WHERE id=$1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // --- static data (engine.StaticDataStore) ---
