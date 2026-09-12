@@ -321,6 +321,13 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	}
 	m.publish(rs, Event{Type: EventExecutionCreated, ExecutionID: execID, Time: time.Now(), Status: model.StatusQueued})
 
+	// Marked active from the moment this execution is accepted (still
+	// queued) until runJob fully exits (finished, failed, or cancelled
+	// while queued) -- see Runner.IsWorkflowActive's doc comment. This
+	// covers the async HTTP execute path; RunFromNode marks its own
+	// synchronous scheduler/webhook runs the same way.
+	m.r.markActive(wf.ID)
+
 	go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs)
 
 	return execID, nil
@@ -345,6 +352,7 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState) {
 	defer rs.cancel()
 	defer atomic.AddInt32(&m.queued, -1)
+	defer m.r.unmarkActive(wf.ID)
 
 	select {
 	case m.sem <- struct{}{}:

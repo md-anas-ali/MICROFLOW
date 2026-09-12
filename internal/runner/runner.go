@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"microflow/internal/engine"
@@ -56,6 +57,58 @@ type Runner struct {
 	// without a Manager (e.g. in tests) should ever run with in a
 	// real deployment.
 	sem chan struct{}
+
+	// activeMu/activeRuns is a small in-process refcount of workflow
+	// IDs with a run currently in flight through this Runner --
+	// covers RunFromNode's whole call (scheduler/webhook, synchronous)
+	// and Manager's whole queued-through-finished lifecycle (async
+	// HTTP execute), not just the time engine.Run is actually
+	// executing. It exists solely so the workflow-delete endpoint can
+	// ask IsWorkflowActive before deleting (rule 13: never delete a
+	// workflow out from under a running execution). Deliberately not a
+	// new dependency/cache/worker -- just a mutex-guarded map, same
+	// footprint class as the maps already used throughout this
+	// package and internal/scheduler.
+	activeMu   sync.Mutex
+	activeRuns map[string]int
+}
+
+// markActive/unmarkActive/IsWorkflowActive back IsWorkflowActive; see
+// its doc comment and the activeRuns field comment above.
+func (r *Runner) markActive(workflowID string) {
+	r.activeMu.Lock()
+	if r.activeRuns == nil {
+		r.activeRuns = map[string]int{}
+	}
+	r.activeRuns[workflowID]++
+	r.activeMu.Unlock()
+}
+
+func (r *Runner) unmarkActive(workflowID string) {
+	r.activeMu.Lock()
+	if r.activeRuns[workflowID] <= 1 {
+		delete(r.activeRuns, workflowID)
+	} else {
+		r.activeRuns[workflowID]--
+	}
+	r.activeMu.Unlock()
+}
+
+// IsWorkflowActive reports whether workflowID currently has a run in
+// flight through this Runner -- queued or running, via any trigger
+// path (manual/async, scheduler, webhook). Used by the workflow-delete
+// endpoint as a fast, always-available check that also covers
+// scheduler/webhook-triggered synchronous runs, which (unlike
+// Manager-started runs) write no Postgres row at all until they
+// finish -- see RunFromNode/runOnce -- so a Postgres-only check would
+// miss them entirely. The store's own transactional check
+// (store.Store.DeleteWorkflow) remains the actual correctness
+// guarantee for the async/Manager path; this is a fast-fail
+// complement, not a replacement.
+func (r *Runner) IsWorkflowActive(workflowID string) bool {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	return r.activeRuns[workflowID] > 0
 }
 
 // WithConcurrencyLimit creates the Runner's shared execution
@@ -136,6 +189,12 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	if _, ok := wf.Nodes[startNode]; !ok {
 		return nil, fmt.Errorf("runner: workflow %q has no node named %q", workflowID, startNode)
 	}
+
+	// Marked active for this whole call (queued-for-a-slot included),
+	// not just while engine.Run is executing -- see IsWorkflowActive's
+	// doc comment for why this matters for scheduler/webhook runs.
+	r.markActive(wf.ID)
+	defer r.unmarkActive(wf.ID)
 
 	// Bound this run by the shared execution semaphore (see
 	// WithConcurrencyLimit's doc comment) so scheduler/webhook runs
