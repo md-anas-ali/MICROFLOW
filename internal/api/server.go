@@ -28,6 +28,12 @@ type WorkflowStore interface {
 	SaveWorkflow(ctx context.Context, wf *model.Workflow) error
 	LoadWorkflow(ctx context.Context, id string) (*model.Workflow, error)
 	ListWorkflows(ctx context.Context) ([]*model.Workflow, error)
+	// DeleteWorkflow removes a workflow and everything scoped to it.
+	// Implementations must be transactional/safe per rule 13 -- see
+	// store.Store.DeleteWorkflow's doc comment, including
+	// store.ErrWorkflowNotFound / store.ErrWorkflowHasActiveExecutions,
+	// which handleDeleteWorkflow maps to 404/409 respectively.
+	DeleteWorkflow(ctx context.Context, id string) error
 }
 
 // CredentialStore is the read side of vault.Store (internal/store's
@@ -123,6 +129,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/workflows/{id}", s.handleGet)
 	s.mux.HandleFunc("GET /api/workflows/{id}/export", s.handleExport)
 	s.mux.HandleFunc("POST /api/workflows/{id}/execute", s.handleExecute)
+	s.mux.HandleFunc("DELETE /api/workflows/{id}", s.handleDeleteWorkflow)
 
 	// Async execution follow-up endpoints (spec sections M/N). Always
 	// registered; each handler 501s cleanly if WithAsync was never
@@ -214,6 +221,58 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, wf)
+}
+
+// errWorkflowActive is the 409 body for both the fast in-memory check
+// below and store.ErrWorkflowHasActiveExecutions, so a client sees the
+// identical message regardless of which layer caught it.
+var errWorkflowActive = errors.New("workflow has a running or queued execution and cannot be deleted")
+
+// handleDeleteWorkflow implements DELETE /api/workflows/{id}: removes
+// the workflow and everything scoped to it (static data, executions,
+// credentials, schedules -- all ON DELETE CASCADE, see schema.sql).
+//
+// Safety is two-layered (rule 13: never delete out from under a live
+// execution):
+//  1. runner.Runner.IsWorkflowActive -- a fast, always-available
+//     in-memory check that also catches scheduler/webhook-triggered
+//     synchronous runs, which write no Postgres row until they finish
+//     (see runner.RunFromNode/runOnce). Checked first so the common
+//     case (an active workflow) fails fast without a DB round trip.
+//  2. store.Store.DeleteWorkflow's own transactional check (row lock +
+//     executions count inside the same transaction as the delete) --
+//     the actual correctness guarantee against a run that starts in
+//     the gap between step 1 and the DELETE statement.
+//
+// A single DELETE is naturally idempotent-safe against a double-click/
+// duplicate request: the first call's transaction removes the row: a
+// concurrent or repeated call either blocks on the row lock and then
+// sees no row (404), or -- if it arrives after the first has already
+// committed -- goes straight to 404. No separate dedup/lock needed.
+func (s *Server) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("workflow id is required"))
+		return
+	}
+
+	if s.run != nil && s.run.IsWorkflowActive(id) {
+		writeErr(w, http.StatusConflict, errWorkflowActive)
+		return
+	}
+
+	err := s.workflows.DeleteWorkflow(r.Context(), id)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
+	case errors.Is(err, store.ErrWorkflowNotFound):
+		writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
+	case errors.Is(err, store.ErrWorkflowHasActiveExecutions):
+		writeErr(w, http.StatusConflict, errWorkflowActive)
+	default:
+		// Generic on purpose -- never echo raw DB internals to a client.
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to delete workflow"))
+	}
 }
 
 // handleExport converts the saved workflow back to n8n's JSON export
