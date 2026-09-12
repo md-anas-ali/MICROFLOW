@@ -561,6 +561,7 @@
           ? '<td class="wf-actions">' +
             '<button class="btn btn-sm" data-act="execute" data-id="' + escapeHtml(w.id) + '">Execute</button>' +
             '<button class="btn btn-sm" data-act="export" data-id="' + escapeHtml(w.id) + '">Export</button>' +
+            '<button class="btn btn-sm btn-danger" data-act="delete" data-id="' + escapeHtml(w.id) + '" data-name="' + escapeHtml(w.name || "(untitled)") + '">Delete</button>' +
             "</td>"
           : "") +
         "</tr>"
@@ -603,6 +604,42 @@
         }
       });
     });
+    viewEl.querySelectorAll('button[data-act="delete"]').forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        deleteWorkflow(btn.dataset.id, btn.dataset.name, btn, {
+          onSuccess: () => renderWorkflowsList(),
+        });
+      });
+    });
+  }
+
+  // deleteWorkflow is the single place that calls DELETE
+  // /api/workflows/{id}, shared by the list's row action and the
+  // editor's toolbar button. Handles confirmation, double-click
+  // protection (disabling the button — browsers don't dispatch click
+  // events on a disabled button, same guarantee this file already
+  // relies on for Execute/Save), and the 409 "still running" /
+  // 404 "already gone" cases with a clear message either way.
+  function deleteWorkflow(id, name, btn, opts) {
+    opts = opts || {};
+    if (btn.disabled) return; // extra guard against a stray re-entrant call
+    if (!confirm('Delete workflow "' + (name || "(untitled)") + '"? This cannot be undone.')) return;
+
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = "Deleting\u2026";
+
+    apiJSON("/api/workflows/" + encodeURIComponent(id), { method: "DELETE" })
+      .then(() => {
+        toast("Workflow deleted", "success");
+        if (opts.onSuccess) opts.onSuccess();
+      })
+      .catch((e) => {
+        toast("Delete failed: " + e.message, "error");
+        btn.disabled = false;
+        btn.textContent = originalText;
+      });
   }
 
   function exportWorkflow(id) {
@@ -1084,6 +1121,7 @@
       '<button id="btnExecute" class="btn">\u25B6 Execute</button>' +
       '<button id="btnExport" class="btn">Export</button>' +
       '<button id="btnSave" class="btn btn-primary">Save</button>' +
+      '<button id="btnDeleteWorkflow" class="btn btn-danger">Delete</button>' +
       "</div>" +
       '<div class="editor-hint">Drag a node to move it \u00b7 drag from the right dot to the left dot on another node to connect \u00b7 click a connection line to delete it \u00b7 Delete/Backspace removes the selected node.</div>' +
       '<div class="editor-body">' +
@@ -1552,6 +1590,12 @@
     document.getElementById("btnExport").addEventListener("click", () => exportWorkflow(editorState.workflow.id));
     document.getElementById("btnSave").addEventListener("click", saveCurrentWorkflow);
     document.getElementById("btnExecute").addEventListener("click", executeCurrentWorkflow);
+    document.getElementById("btnDeleteWorkflow").addEventListener("click", (ev) => {
+      const btn = ev.currentTarget;
+      deleteWorkflow(editorState.workflow.id, editorState.workflow.name, btn, {
+        onSuccess: () => { location.hash = "#/workflows"; },
+      });
+    });
   }
 
   async function saveCurrentWorkflow() {
