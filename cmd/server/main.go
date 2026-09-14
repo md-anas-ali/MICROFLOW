@@ -151,17 +151,19 @@ func main() {
 
 	// Env vars the workflow's Code nodes are allowed to read via $env
 	// (security rule 11/22: never expose the whole process environment,
-	// only names an operator has explicitly opted in). These five are
+	// only names an operator has explicitly opted in). These six are
 	// what the sample workflow's Code nodes actually reference (AI
 	// provider keys for the multi-model fallback chain, the YouTube
 	// Data API key, the app's referer URL for API calls that require
-	// one, and the failure-notification webhook).
+	// one, the failure-notification webhook, and the Google Sheets
+	// URL used by Code nodes instead of a hardcoded Spreadsheet ID).
 	codeEnvAllowlist := []string{
 		"OPENROUTER_API_KEY",
 		"GEMINI_API_KEY",
 		"YOUTUBE_DATA_API_KEY",
 		"APP_REFERER_URL",
 		"NOTIFY_WEBHOOK_URL",
+		"GOOGLE_SHEETS_URL",
 	}
 
 	registry := nodes.DefaultRegistry(nodes.Deps{
