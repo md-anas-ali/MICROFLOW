@@ -151,12 +151,16 @@ func main() {
 
 	// Env vars the workflow's Code nodes are allowed to read via $env
 	// (security rule 11/22: never expose the whole process environment,
-	// only names an operator has explicitly opted in). These six are
-	// what the sample workflow's Code nodes actually reference (AI
+	// only names an operator has explicitly opted in). The original six
+	// are what the sample workflow's Code nodes actually reference (AI
 	// provider keys for the multi-model fallback chain, the YouTube
 	// Data API key, the app's referer URL for API calls that require
 	// one, the failure-notification webhook, and the Google Sheets
 	// URL used by Code nodes instead of a hardcoded Spreadsheet ID).
+	// The rest are additional AI-provider/API credentials an operator
+	// may opt a workflow into (Together, Fireworks, SambaNova,
+	// DeepInfra, Hugging Face, Groq, Cerebras, Cloudflare) -- none of
+	// these are referenced by the sample workflow itself.
 	codeEnvAllowlist := []string{
 		"OPENROUTER_API_KEY",
 		"GEMINI_API_KEY",
@@ -164,6 +168,15 @@ func main() {
 		"APP_REFERER_URL",
 		"NOTIFY_WEBHOOK_URL",
 		"GOOGLE_SHEETS_URL",
+		"TOGETHER_API_KEY",
+		"FIREWORKS_API_KEY",
+		"SAMBANOVA_API_KEY",
+		"DEEPINFRA_API_KEY",
+		"HF_TOKEN",
+		"GROQ_API_KEY",
+		"CEREBRAS_API_KEY",
+		"CLOUDFLARE_API_TOKEN",
+		"CLOUDFLARE_ACCOUNT_ID",
 	}
 
 	registry := nodes.DefaultRegistry(nodes.Deps{
