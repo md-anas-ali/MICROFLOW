@@ -935,7 +935,7 @@
         100
       ],
       "parameters": {
-        "documentId": "1St7QXSs1fCA_C3Mct6t0opBFDUcj7znkWXaUxVOARpM",
+        "documentId": "AUTO_FROM_GOOGLE_SHEETS_URL_ENV",
         "operation": "append",
         "range": "QC Log!A:Z"
       },
@@ -1616,7 +1616,7 @@
         100
       ],
       "parameters": {
-        "documentId": "1St7QXSs1fCA_C3Mct6t0opBFDUcj7znkWXaUxVOARpM",
+        "documentId": "AUTO_FROM_GOOGLE_SHEETS_URL_ENV",
         "range": "UsedTopics!A:Z"
       },
       "waitBetweenTries": 1000,
@@ -1633,7 +1633,7 @@
         500
       ],
       "parameters": {
-        "documentId": "1St7QXSs1fCA_C3Mct6t0opBFDUcj7znkWXaUxVOARpM",
+        "documentId": "AUTO_FROM_GOOGLE_SHEETS_URL_ENV",
         "operation": "append",
         "range": "UsedTopics!A:Z"
       },
@@ -1975,7 +1975,7 @@
         100
       ],
       "parameters": {
-        "documentId": "1St7QXSs1fCA_C3Mct6t0opBFDUcj7znkWXaUxVOARpM",
+        "documentId": "AUTO_FROM_GOOGLE_SHEETS_URL_ENV",
         "operation": "update",
         "range": "UsedTopics!A:Z"
       },
