@@ -9,12 +9,73 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"regexp"
+	"strings"
 
 	"microflow/internal/engine"
 	"microflow/internal/expr"
 	"microflow/internal/model"
 	"microflow/internal/vault"
 )
+
+// --- Google Sheets: automatic spreadsheet ID from GOOGLE_SHEETS_URL ---
+//
+// The spreadsheet ID is no longer read from the node's "documentId"
+// parameter (which required editing the workflow/hardcoding an ID
+// per-deployment). Instead it is derived once per call from the single
+// GOOGLE_SHEETS_URL environment variable, so switching spreadsheets is
+// just changing that one env var -- no code or workflow JSON edits.
+//
+// Accepts any normal Sheets URL, including one with a trailing
+// "/edit", extra path segments, or query params like "?usp=sharing" /
+// "?usp=drivesdk" / "#gid=0". Also accepts a bare spreadsheet ID
+// directly, for flexibility.
+
+// validSpreadsheetID matches the character set Google uses for
+// spreadsheet IDs. Real IDs are ~44 chars; 20 is a conservative floor
+// that rejects obvious typos/empty values without being brittle to
+// Google changing the exact length.
+var validSpreadsheetID = regexp.MustCompile(`^[a-zA-Z0-9_-]{20,}$`)
+
+// extractSpreadsheetIDFromURL pulls the ID out of a
+// ".../spreadsheets/d/<ID>/..." URL. Returns "" if the URL doesn't
+// contain that marker.
+func extractSpreadsheetIDFromURL(rawURL string) string {
+	const marker = "/d/"
+	i := strings.Index(rawURL, marker)
+	if i == -1 {
+		return ""
+	}
+	rest := rawURL[i+len(marker):]
+	end := len(rest)
+	for _, sep := range []string{"/", "?", "#"} {
+		if j := strings.Index(rest, sep); j != -1 && j < end {
+			end = j
+		}
+	}
+	return rest[:end]
+}
+
+// resolveSpreadsheetID reads GOOGLE_SHEETS_URL and returns the
+// spreadsheet ID to use for every Sheets operation. Returns a clear,
+// actionable error if the variable is missing or doesn't contain a
+// recognizable/valid ID.
+func resolveSpreadsheetID() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("GOOGLE_SHEETS_URL"))
+	if raw == "" {
+		return "", errors.New(`GOOGLE_SHEETS_URL is not set -- set it to your Google Sheets URL, e.g. "https://docs.google.com/spreadsheets/d/<ID>/edit?usp=sharing"`)
+	}
+	id := extractSpreadsheetIDFromURL(raw)
+	if id == "" {
+		// Allow a bare spreadsheet ID (no URL wrapper) too.
+		id = raw
+	}
+	if !validSpreadsheetID.MatchString(id) {
+		return "", fmt.Errorf("GOOGLE_SHEETS_URL does not contain a valid spreadsheet ID (got %q) -- expected a URL like \"https://docs.google.com/spreadsheets/d/<ID>/edit\"", raw)
+	}
+	return id, nil
+}
 
 // All three executors below assume the credential vault (internal/vault)
 // hands back a valid, already-refreshed OAuth2 access token under the
@@ -81,7 +142,10 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 		return nil, fmt.Errorf("googleSheets %q: credential error: %w", node.Name, err)
 	}
 	token := creds["accessToken"]
-	spreadsheetID := node.ParamString("documentId", "")
+	spreadsheetID, err := resolveSpreadsheetID()
+	if err != nil {
+		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
+	}
 	sheetRange := node.ParamString("range", "A1:Z1000")
 	operation, _ := node.Parameters["operation"].(string) // "read" | "append" | "update"
 
