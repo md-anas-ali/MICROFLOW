@@ -484,7 +484,7 @@ func (s *Store) SaveExecutionCheckpoint(ctx context.Context, cp *model.Execution
 		}
 	}
 	if len(payload) > maxBytes {
-		return fmt.Errorf("execution checkpoint %q: %w: %d > %d bytes", cp.ExecutionID, ErrCheckpointTooLarge, len(payload), maxBytes)
+		return fmt.Errorf("execution checkpoint %q: %w: %d > %d bytes", cp.ExecutionID, model.ErrCheckpointTooLarge, len(payload), maxBytes)
 	}
 	cp.UpdatedAt = time.Now()
 	_, err = s.pool.Exec(ctx, `
