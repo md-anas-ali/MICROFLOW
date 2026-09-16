@@ -30,6 +30,14 @@ type ExecutionSaver interface {
 	SaveExecution(ctx context.Context, ex *model.Execution) error
 }
 
+// ExecutionDeleter is implemented by durable stores that should discard the
+// terminal execution row immediately. This is intentionally separate from
+// ExecutionSaver so lightweight test/live implementations do not need a
+// database-specific cleanup method.
+type ExecutionDeleter interface {
+	DeleteExecution(ctx context.Context, executionID string) error
+}
+
 type Runner struct {
 	Workflows   WorkflowLoader
 	Execs       ExecutionSaver
@@ -43,6 +51,9 @@ type Runner struct {
 	// creates so node executors (HTTP/command/code) can back off new
 	// heavy work while the process is over its soft RAM ceiling.
 	MemGuard *engine.MemGuard
+	// Recovery is the durable PostgreSQL-backed checkpoint store. Optional for tests.
+	Recovery CheckpointStore
+
 	// NodeRunCap is attached to every RunContext this Runner creates
 	// (see engine.RunContext.NodeRunCap). Zero/unset falls back to the
 	// engine's own 500 default; set low via WithNodeRunCap for a
@@ -168,6 +179,12 @@ func (r *Runner) WithMemGuard(g *engine.MemGuard) *Runner {
 // engine.RunContext.NodeRunCap's doc comment) attached to every future
 // RunFromNode call's RunContext. Optional -- zero/unset behaves exactly
 // as before (falls back to the engine's own 500 default).
+// WithRecovery attaches the durable checkpoint store used by crash/restart recovery.
+func (r *Runner) WithRecovery(s CheckpointStore) *Runner {
+	r.Recovery = s
+	return r
+}
+
 func (r *Runner) WithNodeRunCap(n int) *Runner {
 	r.NodeRunCap = n
 	return r
@@ -228,7 +245,7 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 	runCtx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
 
-	return r.runOnce(runCtx, wf, newID(), startNode, mode, seed, nil)
+	return r.runOnce(runCtx, wf, newID(), startNode, mode, seed, nil, nil)
 }
 
 // runOnce is the single place that actually builds a RunContext, calls
@@ -239,7 +256,7 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 // onNodeRun, if non-nil, is wired to RunContext.OnNodeRun for live
 // per-node progress (SSE); RunFromNode's callers (scheduler/webhook)
 // don't need it and pass nil.
-func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, onNodeRun func(model.NodeRunResult)) (*model.Execution, error) {
+func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, onNodeRun func(model.NodeRunResult), resume *model.ExecutionCheckpoint) (*model.Execution, error) {
 	scratchDir := filepath.Join(r.ScratchRoot, execID)
 	// Bug fix: this per-execution directory was never actually created --
 	// it was only ever used as exec.Cmd.Dir for executeCommand nodes
@@ -251,9 +268,20 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		return nil, fmt.Errorf("runner: create scratch dir for execution %q: %w", execID, err)
 	}
 
+	startAt := time.Now()
+	execution := &model.Execution{ID: execID, WorkflowID: wf.ID, Mode: mode, Status: model.StatusRunning, StartedAt: startAt}
+	if resume != nil {
+		if !resume.StartedAt.IsZero() {
+			execution.StartedAt = resume.StartedAt
+		}
+		execution.Status = resume.State.Status
+		if execution.Status == "" {
+			execution.Status = model.StatusRunning
+		}
+	}
 	rc := &engine.RunContext{
 		Workflow:    wf,
-		Execution:   &model.Execution{ID: execID, WorkflowID: wf.ID, Mode: mode, Status: model.StatusRunning},
+		Execution:   execution,
 		StaticData:  r.StaticData,
 		Credentials: r.Credentials,
 		ScratchDir:  scratchDir,
@@ -268,7 +296,48 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		NodeRunCap: r.NodeRunCap,
 	}
 
-	ex, runErr := r.Engine.Run(ctx, rc, startNode, seed)
+	// Persist the execution row before the first checkpoint. The checkpoint
+	// table has a foreign key to executions, and this also makes synchronous
+	// scheduler/webhook runs visible/recoverable before their first node.
+	if resume == nil && r.Recovery != nil {
+		if err := r.Execs.SaveExecution(context.Background(), execution); err != nil {
+			return nil, fmt.Errorf("runner: persist initial execution %q: %w", execID, err)
+		}
+	} else if resume != nil {
+		if err := r.Execs.SaveExecution(context.Background(), execution); err != nil {
+			return nil, fmt.Errorf("runner: persist recovered execution %q: %w", execID, err)
+		}
+	}
+
+	var resumeState *model.ExecutionCheckpointState
+	if resume != nil {
+		resumeState = &resume.State
+	}
+	if r.Recovery != nil {
+		hash, hashErr := workflowHash(wf)
+		if hashErr != nil {
+			return nil, fmt.Errorf("runner: workflow hash: %w", hashErr)
+		}
+		checkpointFn := func(state model.ExecutionCheckpointState) error {
+			checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cp := &model.ExecutionCheckpoint{
+				ExecutionID: execID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
+				Mode: mode, StartedAt: execution.StartedAt, State: state, UpdatedAt: time.Now(),
+			}
+			if resume != nil {
+				cp.LeaseOwner = resume.LeaseOwner
+				cp.LeaseUntil = time.Now().Add(recoveryLease())
+			}
+			if err := r.Recovery.SaveExecutionCheckpoint(checkCtx, cp); err != nil {
+				return err
+			}
+			log.Printf("checkpoint saved execution=%s status=%s steps=%d", execID, state.Status, state.Steps)
+			return nil
+		}
+		rc.Checkpoint = checkpointFn
+	}
+	ex, runErr := r.Engine.RunWithCheckpoint(ctx, rc, startNode, seed, resumeState)
 
 	// Always persist, even on failure -- the execution panel/history
 	// needs the error/status either way (rule: execution panel shows
@@ -276,9 +345,50 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 	if saveErr := r.Execs.SaveExecution(context.Background(), ex); saveErr != nil {
 		log.Printf("runner: failed to persist execution %s: %v", execID, saveErr)
 	}
+	if r.Recovery != nil && ex != nil {
+		if ex.Status == model.StatusSuccess || ex.Status == model.StatusError || ex.Status == model.StatusCancelled {
+			if err := r.Recovery.DeleteExecutionCheckpoint(context.Background(), execID); err != nil {
+				log.Printf("checkpoint delete execution=%s failed: %v", execID, err)
+			} else {
+				log.Printf("checkpoint deleted execution=%s", execID)
+			}
+		}
+	}
+	// Execution history is intentionally ephemeral on this low-storage deployment.
+	// Keep the in-memory result long enough for the live response/event stream, but
+	// remove the durable terminal row immediately so PostgreSQL cannot grow from
+	// completed executions. The checkpoint FK is ON DELETE CASCADE as a final
+	// safety net.
+	if ex != nil && (ex.Status == model.StatusSuccess || ex.Status == model.StatusError || ex.Status == model.StatusCancelled) {
+		if d, ok := r.Execs.(ExecutionDeleter); ok {
+			if err := d.DeleteExecution(context.Background(), execID); err != nil {
+				log.Printf("execution cleanup execution=%s failed: %v", execID, err)
+			} else {
+				log.Printf("execution cleanup deleted execution=%s", execID)
+			}
+		}
+	}
 	cleanupScratch(scratchDir)
 
 	return ex, runErr
+}
+
+// SaveInitialCheckpoint records the minimal starting state before an async
+// execution is handed to the worker pool. This closes the crash window between
+// POST /execute and the first node execution.
+func (r *Runner) SaveInitialCheckpoint(ctx context.Context, wf *model.Workflow, ex *model.Execution, startNode string, seed model.NodeOutput) error {
+	if r.Recovery == nil {
+		return nil
+	}
+	hash, err := workflowHash(wf)
+	if err != nil {
+		return err
+	}
+	return r.Recovery.SaveExecutionCheckpoint(ctx, &model.ExecutionCheckpoint{
+		ExecutionID: ex.ID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
+		Mode: ex.Mode, StartedAt: ex.StartedAt,
+		State: model.ExecutionCheckpointState{Version: checkpointVersion, Pending: []model.CheckpointQueueItem{{NodeName: startNode, Input: seed}}, Status: ex.Status},
+	})
 }
 
 // FirstTriggerNode picks a start node when the caller doesn't specify

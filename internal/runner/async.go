@@ -85,8 +85,9 @@ const (
 	// finishedRetention bounds how long a finished execution's
 	// in-memory record (and its event replay buffer) is kept before
 	// eviction, so the registry can't grow without bound over a long
-	// server lifetime (rule 13). The durable copy in Postgres (written
-	// by runOnce's SaveExecution) is unaffected -- GET falls back to it.
+	// server lifetime (rule 13). Terminal durable rows are deleted
+	// immediately by Runner cleanup, so this is only a short-lived
+	// live-view retention window.
 	finishedRetention = 10 * time.Minute
 )
 
@@ -220,9 +221,10 @@ type Manager struct {
 	queued    int32
 	maxQueued int32
 
-	mu     sync.Mutex
-	states map[string]*runState
-	all    *broadcaster // process-wide stream for the live executions monitor
+	mu       sync.Mutex
+	states   map[string]*runState
+	stopping bool
+	all      *broadcaster // process-wide stream for the live executions monitor
 }
 
 // NewManager wires an async Manager around an existing *Runner (same
@@ -270,6 +272,12 @@ func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
 // spec's async execute contract (section M): the HTTP request that
 // calls Start MUST NOT wait for workflow completion.
 func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string, seed model.NodeOutput) (string, error) {
+	m.mu.Lock()
+	stopping := m.stopping
+	m.mu.Unlock()
+	if stopping {
+		return "", errors.New("runner: manager is shutting down")
+	}
 	wf, err := m.r.Workflows.LoadWorkflow(ctx, workflowID)
 	if err != nil {
 		return "", fmt.Errorf("runner: load workflow %q: %w", workflowID, err)
@@ -319,6 +327,21 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	if saveErr := m.r.Execs.SaveExecution(context.Background(), rs.snapshot()); saveErr != nil {
 		log.Printf("runner: manager: failed to persist queued execution %s: %v", execID, saveErr)
 	}
+	if m.r.Recovery != nil {
+		if err := m.r.SaveInitialCheckpoint(context.Background(), wf, rs.snapshot(), startNode, seed); err != nil {
+			rs.cancel()
+			m.mu.Lock()
+			delete(m.states, execID)
+			m.mu.Unlock()
+			atomic.AddInt32(&m.queued, -1)
+			rs.mu.Lock()
+			rs.ex.Status = model.StatusError
+			rs.ex.Error = fmt.Errorf("initial checkpoint: %w", err).Error()
+			rs.mu.Unlock()
+			_ = m.r.Execs.SaveExecution(context.Background(), rs.snapshot())
+			return "", fmt.Errorf("runner: initial checkpoint: %w", err)
+		}
+	}
 	m.publish(rs, Event{Type: EventExecutionCreated, ExecutionID: execID, Time: time.Now(), Status: model.StatusQueued})
 
 	// Marked active from the moment this execution is accepted (still
@@ -328,7 +351,7 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	// synchronous scheduler/webhook runs the same way.
 	m.r.markActive(wf.ID)
 
-	go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs)
+	go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs, nil)
 
 	return execID, nil
 }
@@ -349,7 +372,7 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 // actually started -- the run itself was healthy and made normal
 // progress, it simply never had a real Timeout's worth of time to
 // work with. The clock now only starts once the run can really begin.
-func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState) {
+func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState, resume *model.ExecutionCheckpoint) {
 	defer rs.cancel()
 	defer atomic.AddInt32(&m.queued, -1)
 	defer m.r.unmarkActive(wf.ID)
@@ -361,6 +384,23 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 		return
 	}
 	defer func() { <-m.sem }()
+
+	// Graceful server shutdown must NOT turn an otherwise recoverable queued
+	// execution into a user-style cancellation. A job that was still waiting
+	// for a worker slot keeps its durable queued status + checkpoint; the
+	// process can exit and startup recovery will claim it later.
+	m.mu.Lock()
+	stopping := m.stopping
+	m.mu.Unlock()
+	if stopping {
+		rs.mu.Lock()
+		rs.done = true
+		rs.mu.Unlock()
+		m.mu.Lock()
+		delete(m.states, execID)
+		m.mu.Unlock()
+		return
+	}
 
 	// Re-check: Cancel() may have fired while this job was waiting for
 	// a worker slot.
@@ -430,7 +470,7 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 		}
 	}
 
-	final, runErr := m.r.runOnce(ctx, wf, execID, startNode, mode, seed, onNodeRun)
+	final, runErr := m.r.runOnce(ctx, wf, execID, startNode, mode, seed, onNodeRun, resume)
 
 	rs.mu.Lock()
 	if final != nil {
@@ -466,9 +506,164 @@ func (m *Manager) finishCancelled(execID string, rs *runState, reason string) {
 	if err := m.r.Execs.SaveExecution(context.Background(), ex); err != nil {
 		log.Printf("runner: manager: failed to persist cancelled execution %s: %v", execID, err)
 	}
+	if d, ok := m.r.Execs.(ExecutionDeleter); ok {
+		if err := d.DeleteExecution(context.Background(), execID); err != nil {
+			log.Printf("runner: manager: execution cleanup %s failed: %v", execID, err)
+		} else {
+			log.Printf("runner: manager: execution cleanup deleted %s", execID)
+		}
+	}
+	if m.r.Recovery != nil {
+		if err := m.r.Recovery.DeleteExecutionCheckpoint(context.Background(), execID); err != nil {
+			log.Printf("checkpoint delete execution=%s failed: %v", execID, err)
+		}
+	}
 	m.publish(rs, Event{Type: EventExecutionCancelled, ExecutionID: execID, Time: time.Now(), Status: model.StatusCancelled, Error: reason})
 	rs.bcast.close()
 	m.scheduleEviction(execID)
+}
+
+// StartRecoveryLoop continuously drains recoverable checkpoints in small batches.
+// A single goroutine is used regardless of the number of executions, and the
+// manager's existing queue/semaphore remain the only execution infrastructure.
+func (m *Manager) StartRecoveryLoop(ctx context.Context) {
+	if m.r.Recovery == nil {
+		return
+	}
+	go func() {
+		owner := newID()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			if err := m.recoverBatch(ctx, owner); err != nil {
+				log.Printf("recovery: batch failed: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (m *Manager) recoverBatch(ctx context.Context, owner string) error {
+	available := int(m.maxQueued - atomic.LoadInt32(&m.queued))
+	if available < 1 {
+		return nil
+	}
+	batch := recoveryBatchSize(available)
+	claimCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cps, err := m.r.Recovery.ClaimRecoverableExecutionCheckpoints(claimCtx, owner, batch, recoveryLease())
+	if err != nil {
+		return err
+	}
+	for _, cp := range cps {
+		if err := m.recoverOne(ctx, owner, cp); err != nil {
+			log.Printf("recovery: execution=%s failed: %v", cp.ExecutionID, err)
+			if errors.Is(err, ErrInvalidCheckpoint) || errors.Is(err, ErrCheckpointTooLarge) {
+				_ = m.r.Recovery.DeleteExecutionCheckpoint(context.Background(), cp.ExecutionID)
+				_ = m.markRecoveryFailure(cp, err)
+			} else {
+				// Keep the lease/checkpoint for transient DB/workflow-load errors;
+				// the bounded recovery loop will retry after the lease expires.
+				log.Printf("recovery: execution=%s retained for retry", cp.ExecutionID)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) recoverOne(ctx context.Context, owner string, cp *model.ExecutionCheckpoint) error {
+	if cp == nil {
+		return ErrInvalidCheckpoint
+	}
+	wf, err := m.r.Workflows.LoadWorkflow(ctx, cp.WorkflowID)
+	if err != nil {
+		return fmt.Errorf("load workflow: %w", err)
+	}
+	if err := validateCheckpoint(cp, wf, m.r.ScratchRoot); err != nil {
+		return err
+	}
+	if cp.ExecutionID == "" || cp.WorkflowID != wf.ID {
+		return ErrInvalidCheckpoint
+	}
+	if cp.State.Status == model.StatusSuccess {
+		_ = m.r.Execs.SaveExecution(context.Background(), &model.Execution{ID: cp.ExecutionID, WorkflowID: cp.WorkflowID, Mode: cp.Mode, Status: model.StatusSuccess, StartedAt: cp.StartedAt})
+		if d, ok := m.r.Execs.(ExecutionDeleter); ok {
+			_ = d.DeleteExecution(context.Background(), cp.ExecutionID)
+		}
+		_ = m.r.Recovery.DeleteExecutionCheckpoint(context.Background(), cp.ExecutionID)
+		return nil
+	}
+	if len(cp.State.Pending) == 0 {
+		return fmt.Errorf("%w: active checkpoint has no pending work", ErrInvalidCheckpoint)
+	}
+
+	m.mu.Lock()
+	if _, exists := m.states[cp.ExecutionID]; exists {
+		m.mu.Unlock()
+		_ = m.r.Recovery.ClearExecutionCheckpointLease(context.Background(), cp.ExecutionID, owner)
+		return nil
+	}
+	m.mu.Unlock()
+
+	if n := atomic.AddInt32(&m.queued, 1); n > m.maxQueued {
+		atomic.AddInt32(&m.queued, -1)
+		return ErrQueueFull
+	}
+	queueCtx, cancel := context.WithCancel(context.Background())
+	rs := &runState{ex: &model.Execution{ID: cp.ExecutionID, WorkflowID: cp.WorkflowID, Mode: cp.Mode, Status: model.StatusQueued, StartedAt: cp.StartedAt}, cancel: cancel, bcast: newBroadcaster()}
+	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		atomic.AddInt32(&m.queued, -1)
+		cancel()
+		return errors.New("runner: manager is shutting down")
+	}
+	m.states[cp.ExecutionID] = rs
+	m.mu.Unlock()
+	m.r.markActive(wf.ID)
+	go m.runJob(queueCtx, wf, cp.ExecutionID, "", cp.Mode, nil, rs, cp)
+	log.Printf("recovery: execution=%s resumed from step=%d status=%s", cp.ExecutionID, cp.State.Steps, cp.State.Status)
+	return nil
+}
+
+func (m *Manager) markRecoveryFailure(cp *model.ExecutionCheckpoint, err error) error {
+	if cp == nil {
+		return nil
+	}
+	now := time.Now()
+	if saveErr := m.r.Execs.SaveExecution(context.Background(), &model.Execution{ID: cp.ExecutionID, WorkflowID: cp.WorkflowID, Mode: cp.Mode, Status: model.StatusError, StartedAt: cp.StartedAt, FinishedAt: &now, Error: fmt.Sprintf("recovery failed: %v", err)}); saveErr != nil {
+		return saveErr
+	}
+	if d, ok := m.r.Execs.(ExecutionDeleter); ok {
+		_ = d.DeleteExecution(context.Background(), cp.ExecutionID)
+	}
+	return nil
+}
+
+// Shutdown stops accepting new work and gives already-running executions a
+// chance to finish. It deliberately does NOT call Cancel(): a server SIGTERM
+// is not a user cancellation, and the latest durable checkpoint must remain
+// recoverable after the process exits. Queued jobs that notice the stopping
+// flag leave their queued execution row/checkpoint untouched for startup
+// recovery.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	m.mu.Lock()
+	m.stopping = true
+	m.mu.Unlock()
+	for {
+		if atomic.LoadInt32(&m.queued) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (m *Manager) scheduleEviction(execID string) {
