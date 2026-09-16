@@ -156,7 +156,7 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 			row := jsonToRow(it.JSON)
 			body, _ := json.Marshal(map[string]any{"values": [][]any{row}})
 			url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s:append?valueInputOption=USER_ENTERED", spreadsheetID, sheetRange)
-			if err := googleAPICall(ctx, "POST", url, token, body, nil); err != nil {
+			if err := googleAPICall(ctx, "POST", url, token, body, nil, rc.CurrentOperationID); err != nil {
 				return nil, fmt.Errorf("googleSheets %q append: %w", node.Name, err)
 			}
 			out = append(out, it)
@@ -166,7 +166,7 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 			row := jsonToRow(it.JSON)
 			body, _ := json.Marshal(map[string]any{"values": [][]any{row}})
 			url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s?valueInputOption=USER_ENTERED", spreadsheetID, sheetRange)
-			if err := googleAPICall(ctx, "PUT", url, token, body, nil); err != nil {
+			if err := googleAPICall(ctx, "PUT", url, token, body, nil, rc.CurrentOperationID); err != nil {
 				return nil, fmt.Errorf("googleSheets %q update: %w", node.Name, err)
 			}
 			out = append(out, it)
@@ -176,7 +176,7 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 			Values [][]any `json:"values"`
 		}
 		url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s", spreadsheetID, sheetRange)
-		if err := googleAPICall(ctx, "GET", url, token, nil, &resp); err != nil {
+		if err := googleAPICall(ctx, "GET", url, token, nil, &resp, rc.CurrentOperationID); err != nil {
 			return nil, fmt.Errorf("googleSheets %q read: %w", node.Name, err)
 		}
 		if len(resp.Values) > 0 {
@@ -222,7 +222,7 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 				return nil, fmt.Errorf("youTube %q: setThumbnail needs binary image data", node.Name)
 			}
 			url := fmt.Sprintf("https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=%v", videoID)
-			if err := uploadBinaryFile(ctx, url, token, ref.FileName, ref.MimeType); err != nil {
+			if err := uploadBinaryFile(ctx, url, token, ref.FileName, ref.MimeType, rc.CurrentOperationID); err != nil {
 				return nil, fmt.Errorf("youTube %q: %w", node.Name, err)
 			}
 			out = append(out, model.Item{JSON: map[string]any{"videoId": videoID, "thumbnailSet": true}})
@@ -245,7 +245,7 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 			},
 			"status": map[string]any{"privacyStatus": node.ParamString("privacyStatus", "private")},
 		}
-		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet)
+		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet, rc.CurrentOperationID)
 		if err != nil {
 			return nil, fmt.Errorf("youTube %q upload: %w", node.Name, err)
 		}
@@ -289,7 +289,7 @@ func (e *GmailExecutor) Execute(ctx context.Context, rc *engine.RunContext, node
 		raw := buildRFC2822(fmt.Sprintf("%v", to), fmt.Sprintf("%v", subject), fmt.Sprintf("%v", message))
 		body, _ := json.Marshal(map[string]any{"raw": raw})
 		url := "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
-		if err := googleAPICall(ctx, "POST", url, token, body, nil); err != nil {
+		if err := googleAPICall(ctx, "POST", url, token, body, nil, rc.CurrentOperationID); err != nil {
 			return nil, fmt.Errorf("gmail %q: %w", node.Name, err)
 		}
 		out = append(out, model.Item{JSON: map[string]any{"sent": true, "to": to}})
@@ -299,7 +299,7 @@ func (e *GmailExecutor) Execute(ctx context.Context, rc *engine.RunContext, node
 
 // --- shared helpers ---
 
-func googleAPICall(ctx context.Context, method, url, token string, body []byte, into any) error {
+func googleAPICall(ctx context.Context, method, url, token string, body []byte, into any, operationID string) error {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -310,6 +310,9 @@ func googleAPICall(ctx context.Context, method, url, token string, body []byte, 
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	if operationID != "" {
+		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		// Network-level failures (DNS, connection reset, timeout) are
@@ -343,7 +346,7 @@ func googleAPICall(ctx context.Context, method, url, token string, body []byte, 
 	return nil
 }
 
-func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType string) error {
+func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType, operationID string) error {
 	f, err := openForUpload(filePath)
 	if err != nil {
 		return err
@@ -355,6 +358,9 @@ func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType string
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", mimeType)
+	if operationID != "" {
+		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -367,7 +373,7 @@ func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType string
 	return nil
 }
 
-func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string, metadata map[string]any) (string, error) {
+func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string, metadata map[string]any, operationID string) (string, error) {
 	f, err := openForUpload(filePath)
 	if err != nil {
 		return "", err
@@ -403,6 +409,9 @@ func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string,
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "multipart/related; boundary="+mw.Boundary())
+	if operationID != "" {
+		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

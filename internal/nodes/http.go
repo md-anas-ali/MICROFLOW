@@ -205,6 +205,18 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 			return nil, err
 		}
 		req.Header.Set("User-Agent", defaultUserAgent())
+		// Stable per-node operation ID: providers that support idempotency can
+		// reconcile a retried request after a process crash. The custom header
+		// is harmless for APIs that ignore it; it does not claim exactly-once
+		// semantics for providers that do not implement idempotency.
+		if rc.CurrentOperationID != "" {
+			req.Header.Set("X-MicroFlow-Operation-ID", rc.CurrentOperationID)
+			if method == "POST" || method == "PUT" || method == "PATCH" {
+				if use, _ := node.Parameters["useIdempotencyKey"].(bool); use {
+					req.Header.Set("Idempotency-Key", rc.CurrentOperationID)
+				}
+			}
+		}
 		if headers, ok := node.Parameters["headers"].(map[string]any); ok {
 			// Header values go through the same {{ ... }} expression
 			// evaluator as url/body above. Previously this branch set

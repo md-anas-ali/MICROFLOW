@@ -3,6 +3,7 @@ package nodes
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,12 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		cmd := exec.CommandContext(cctx, path, args...)
 		cmd.Dir = rc.ScratchDir
+		if rc.CurrentOperationID != "" {
+			// Expose the same deterministic operation identity to allowed helper
+			// binaries (Edge-TTS/FFmpeg/python3/etc.) without changing their argv.
+			// A helper can use it to make its own output/idempotency decision.
+			cmd.Env = append(os.Environ(), "MICROFLOW_OPERATION_ID="+rc.CurrentOperationID)
+		}
 
 		stdout := newBoundedWriter(maxCaptureBytes)
 		stderr := newBoundedWriter(maxCaptureBytes)

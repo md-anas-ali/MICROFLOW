@@ -137,14 +137,26 @@ func compare(left any, op string, right any) bool {
 type WaitExecutor struct{}
 
 func (WaitExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
-	seconds := waitAmountSeconds(rc, node, input)
-	unit, _ := node.Parameters["unit"].(string)
-	mult := map[string]float64{"seconds": 1, "minutes": 60, "hours": 3600, "": 1}[unit]
-	if mult == 0 {
-		mult = 1
+	var waitUntil time.Time
+	if !rc.ResumeWaitUntil.IsZero() {
+		waitUntil = rc.ResumeWaitUntil
+		rc.ResumeWaitUntil = time.Time{}
+	} else {
+		seconds := waitAmountSeconds(rc, node, input)
+		unit, _ := node.Parameters["unit"].(string)
+		mult := map[string]float64{"seconds": 1, "minutes": 60, "hours": 3600, "": 1}[unit]
+		if mult == 0 {
+			mult = 1
+		}
+		waitUntil = time.Now().Add(time.Duration(seconds * mult * float64(time.Second)))
+		if rc.BeforeWait != nil {
+			if err := rc.BeforeWait(waitUntil); err != nil {
+				return nil, fmt.Errorf("wait %q: checkpoint before wait: %w", node.Name, err)
+			}
+		}
 	}
 	select {
-	case <-time.After(time.Duration(seconds*mult) * time.Second):
+	case <-time.After(time.Until(waitUntil)):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
