@@ -18,7 +18,12 @@ import (
 
 const checkpointVersion = 1
 
-var ErrCheckpointTooLarge = errors.New("execution checkpoint exceeds configured size limit")
+// ErrCheckpointTooLarge re-exports model.ErrCheckpointTooLarge under the
+// runner package so existing errors.Is(err, ErrCheckpointTooLarge) call
+// sites in this package keep working, while store/postgres.go (which
+// produces the error) and this package (which checks for it) share the
+// same identity via model.
+var ErrCheckpointTooLarge = model.ErrCheckpointTooLarge
 var ErrInvalidCheckpoint = errors.New("invalid execution checkpoint")
 
 // CheckpointStore is the narrow persistence contract used by Runner/Manager.
