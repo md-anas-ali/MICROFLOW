@@ -68,3 +68,43 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at  TIMESTAMPTZ,
     enabled      BOOLEAN NOT NULL DEFAULT true
 );
+
+-- One latest-only checkpoint per execution. The payload is the small,
+-- engine-derived resume state; no checkpoint history is retained.
+CREATE TABLE IF NOT EXISTS execution_checkpoints (
+    execution_id   TEXT PRIMARY KEY REFERENCES executions(id) ON DELETE CASCADE,
+    workflow_id    TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    workflow_hash  TEXT NOT NULL,
+    workflow_updated_at TIMESTAMPTZ,
+    mode           TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    version        INT NOT NULL DEFAULT 1,
+    payload        JSONB NOT NULL,
+    payload_bytes  INT NOT NULL,
+    lease_owner    TEXT,
+    lease_until    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT execution_checkpoints_payload_size CHECK (payload_bytes BETWEEN 1 AND 4194304)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_checkpoints_workflow ON execution_checkpoints(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_execution_checkpoints_recovery ON execution_checkpoints(status, updated_at);
+
+-- Idempotent upgrade for installations that created the checkpoint table before
+-- started_at was added. Existing rows receive their durable execution start time.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'execution_checkpoints'
+          AND column_name = 'started_at'
+    ) THEN
+        ALTER TABLE execution_checkpoints ADD COLUMN started_at TIMESTAMPTZ;
+        UPDATE execution_checkpoints c
+        SET started_at = e.started_at
+        FROM executions e
+        WHERE e.id = c.execution_id;
+        ALTER TABLE execution_checkpoints ALTER COLUMN started_at SET NOT NULL;
+    END IF;
+END $$;

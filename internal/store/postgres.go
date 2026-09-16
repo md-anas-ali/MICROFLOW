@@ -328,6 +328,15 @@ func (s *Store) MarkInterruptedExecutions(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// DeleteExecution permanently removes one terminal execution immediately.
+// The execution_checkpoints row is removed by its ON DELETE CASCADE FK as a
+// final safety net; callers also explicitly delete checkpoints for clear logs.
+// This keeps PostgreSQL storage flat even when executions are created frequently.
+func (s *Store) DeleteExecution(ctx context.Context, executionID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM executions WHERE id=$1`, executionID)
+	return err
+}
+
 func (s *Store) DeleteExecutionsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
 		DELETE FROM executions
@@ -453,4 +462,165 @@ func (s *Store) ListCredentials(ctx context.Context, workflowID string) ([]Crede
 		out = append(out, ci)
 	}
 	return out, rows.Err()
+}
+
+// SaveExecutionCheckpoint upserts the single latest checkpoint for an
+// execution. The JSON representation is bounded before it reaches Postgres.
+func (s *Store) SaveExecutionCheckpoint(ctx context.Context, cp *model.ExecutionCheckpoint) error {
+	if cp == nil || cp.ExecutionID == "" || cp.WorkflowID == "" {
+		return errors.New("store: invalid execution checkpoint")
+	}
+	if cp.State.Version == 0 {
+		cp.State.Version = 1
+	}
+	payload, err := json.Marshal(cp.State)
+	if err != nil {
+		return err
+	}
+	maxBytes := 512 * 1024
+	if v := os.Getenv("MICROFLOW_MAX_CHECKPOINT_BYTES"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil && n >= 64*1024 && n <= 4*1024*1024 {
+			maxBytes = n
+		}
+	}
+	if len(payload) > maxBytes {
+		return fmt.Errorf("execution checkpoint %q: %w: %d > %d bytes", cp.ExecutionID, ErrCheckpointTooLarge, len(payload), maxBytes)
+	}
+	cp.UpdatedAt = time.Now()
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO execution_checkpoints
+		(execution_id, workflow_id, workflow_hash, workflow_updated_at, mode, status, version, payload, payload_bytes, lease_owner, lease_until, started_at, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),now())
+		ON CONFLICT (execution_id) DO UPDATE SET
+		workflow_id=EXCLUDED.workflow_id,
+		workflow_hash=EXCLUDED.workflow_hash,
+		workflow_updated_at=EXCLUDED.workflow_updated_at,
+		mode=EXCLUDED.mode,
+		status=EXCLUDED.status,
+		version=EXCLUDED.version,
+		payload=EXCLUDED.payload,
+		payload_bytes=EXCLUDED.payload_bytes,
+		lease_owner=EXCLUDED.lease_owner,
+		lease_until=EXCLUDED.lease_until,
+		started_at=EXCLUDED.started_at,
+		updated_at=now()
+	`, cp.ExecutionID, cp.WorkflowID, cp.WorkflowHash, cp.WorkflowUpdatedAt, cp.Mode, cp.State.Status, cp.State.Version, payload, len(payload), nullableString(cp.LeaseOwner), nullableTime(cp.LeaseUntil), cp.StartedAt)
+	return err
+}
+
+func (s *Store) DeleteExecutionCheckpoint(ctx context.Context, executionID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM execution_checkpoints WHERE execution_id=$1`, executionID)
+	return err
+}
+
+func nullableString(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+func nullableTime(v time.Time) any {
+	if v.IsZero() {
+		return nil
+	}
+	return v
+}
+
+// ClaimRecoverableExecutionCheckpoints atomically leases a bounded batch of
+// active checkpoints. FOR UPDATE SKIP LOCKED makes duplicate startup workers
+// harmless; an expired lease can be reclaimed after a crashed worker.
+func (s *Store) ClaimRecoverableExecutionCheckpoints(ctx context.Context, owner string, limit int, lease time.Duration) ([]*model.ExecutionCheckpoint, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 16 {
+		limit = 16
+	}
+	if lease <= 0 {
+		lease = time.Hour
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH candidates AS (
+			SELECT c.execution_id
+			FROM execution_checkpoints c
+			JOIN executions e ON e.id=c.execution_id
+			WHERE e.status IN ('queued','running','waiting')
+			  AND e.finished_at IS NULL
+			  AND (c.lease_until IS NULL OR c.lease_until < now())
+			ORDER BY c.updated_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		)
+		UPDATE execution_checkpoints c
+		SET lease_owner=$2, lease_until=now()+$3::interval, updated_at=now()
+		FROM candidates x
+		WHERE c.execution_id=x.execution_id
+		RETURNING c.execution_id,c.workflow_id,c.workflow_hash,c.workflow_updated_at,c.mode,c.started_at,c.version,c.payload,c.updated_at,c.lease_owner,c.lease_until
+	`, limit, owner, fmt.Sprintf("%d seconds", int(lease.Seconds())))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*model.ExecutionCheckpoint, 0, limit)
+	for rows.Next() {
+		var cp model.ExecutionCheckpoint
+		var payload []byte
+		if err := rows.Scan(&cp.ExecutionID, &cp.WorkflowID, &cp.WorkflowHash, &cp.WorkflowUpdatedAt, &cp.Mode, &cp.StartedAt, &cp.State.Version, &payload, &cp.UpdatedAt, &cp.LeaseOwner, &cp.LeaseUntil); err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 {
+			return nil, fmt.Errorf("store: empty checkpoint payload for %q", cp.ExecutionID)
+		}
+		if len(payload) > checkpointMaxBytesForStore() {
+			return nil, fmt.Errorf("store: checkpoint %q exceeds configured size", cp.ExecutionID)
+		}
+		if err := json.Unmarshal(payload, &cp.State); err != nil {
+			return nil, fmt.Errorf("store: decode checkpoint %q: %w", cp.ExecutionID, err)
+		}
+		out = append(out, &cp)
+	}
+	return out, rows.Err()
+}
+
+func checkpointMaxBytesForStore() int {
+	const def = 512 * 1024
+	if v := os.Getenv("MICROFLOW_MAX_CHECKPOINT_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 64*1024 && n <= 4*1024*1024 {
+			return n
+		}
+	}
+	return def
+}
+
+func (s *Store) ClearExecutionCheckpointLease(ctx context.Context, executionID, owner string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE execution_checkpoints SET lease_owner=NULL, lease_until=NULL WHERE execution_id=$1 AND lease_owner=$2`, executionID, owner)
+	return err
+}
+
+// CleanupOrphanedExecutionCheckpoints removes only a small bounded batch of
+// checkpoints that are no longer recoverable. It never scans/deletes the whole
+// table in one operation.
+func (s *Store) CleanupOrphanedExecutionCheckpoints(ctx context.Context, batch int, cutoff time.Time) (int64, error) {
+	if batch < 1 {
+		batch = 20
+	}
+	if batch > 100 {
+		batch = 100
+	}
+	tag, err := s.pool.Exec(ctx, `
+		WITH doomed AS (
+			SELECT c.execution_id
+			FROM execution_checkpoints c
+			LEFT JOIN executions e ON e.id=c.execution_id
+			LEFT JOIN workflows w ON w.id=c.workflow_id
+			WHERE e.id IS NULL OR w.id IS NULL
+			   OR e.status IN ('success','error','cancelled')
+			   OR (c.updated_at < $1 AND e.status NOT IN ('queued','running','waiting'))
+			ORDER BY c.updated_at ASC
+			LIMIT $2
+		)
+		DELETE FROM execution_checkpoints c USING doomed d WHERE c.execution_id=d.execution_id
+	`, cutoff, batch)
+	return tag.RowsAffected(), err
 }
