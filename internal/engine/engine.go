@@ -9,6 +9,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -104,6 +106,21 @@ type RunContext struct {
 	// non-blocking per-execution broadcaster (drop-oldest under
 	// backpressure), never a direct network write. Nil is a safe no-op.
 	OnNodeRun func(model.NodeRunResult)
+
+	// Checkpoint persists the exact engine state needed for restart recovery.
+	Checkpoint func(model.ExecutionCheckpointState) error
+
+	// BeforeWait persists the current Wait node and its wake-up deadline
+	// immediately before the wait begins.
+	BeforeWait func(time.Time) error
+
+	// ResumeWaitUntil is populated from a recovered checkpoint so a restarted
+	// Wait node sleeps only for its remaining duration.
+	ResumeWaitUntil time.Time
+
+	// CurrentOperationID is deterministic for the current node execution step.
+	// Side-effecting executors may forward it to APIs that support idempotency.
+	CurrentOperationID string
 }
 
 // appendNodeRun records one node's result, trimming the oldest entries
@@ -193,10 +210,7 @@ func New(registry map[model.NodeType]NodeExecutor) *Engine {
 	}
 }
 
-type queueItem struct {
-	nodeName string
-	input    model.NodeOutput
-}
+type queueItem = model.CheckpointQueueItem
 
 // Run executes wf starting from the given trigger node with the given
 // seed input, following connections as a work queue. It returns a
@@ -204,16 +218,68 @@ type queueItem struct {
 // per-node input/output/error/logs/duration) whether or not the run
 // ultimately errors.
 func (e *Engine) Run(ctx context.Context, rc *RunContext, startNode string, seed model.NodeOutput) (*model.Execution, error) {
+	return e.RunWithCheckpoint(ctx, rc, startNode, seed, nil)
+}
+
+// RunWithCheckpoint executes a fresh workflow or restores the exact work
+// queue, retry counters and expression context from a durable checkpoint.
+// It deliberately does not serialize the entire RunContext.
+func (e *Engine) RunWithCheckpoint(ctx context.Context, rc *RunContext, startNode string, seed model.NodeOutput, resume *model.ExecutionCheckpointState) (*model.Execution, error) {
 	rc.Execution.Status = model.StatusRunning
-	rc.Execution.StartedAt = time.Now()
+	if rc.Execution.StartedAt.IsZero() {
+		rc.Execution.StartedAt = time.Now()
+	}
 	rc.HeavyWorkGate = make(chan struct{}, e.MaxConcurrentHeavy)
 
-	queue := []queueItem{{nodeName: startNode, input: seed}}
+	queue := []queueItem{{NodeName: startNode, Input: seed}}
 	steps := 0
-	// perNodeAttempts survives across the whole run so a node's own
-	// RetryOnFail/MaxTries budget (not the workflow's manual retry-loop
-	// pattern, which is just ordinary graph traversal) is enforced.
 	perNodeAttempts := map[string]int{}
+	resumeOperationID := ""
+	if resume != nil {
+		queue = append([]queueItem(nil), resume.Pending...)
+		steps = resume.Steps
+		for k, v := range resume.NodeAttempts {
+			perNodeAttempts[k] = v
+		}
+		if len(resume.NodeOutputs) > 0 {
+			rc.nodeOutputs = make(map[string]map[string]any, len(resume.NodeOutputs))
+			for k, v := range resume.NodeOutputs {
+				rc.nodeOutputs[k] = v
+			}
+		}
+		if resume.Wait != nil {
+			rc.ResumeWaitUntil = resume.Wait.Until
+		}
+		if len(resume.Pending) > 0 {
+			resumeOperationID = resume.Pending[0].OperationID
+		}
+	}
+
+	checkpoint := func(status model.ExecutionStatus, pending []queueItem, last string, wait *model.CheckpointWait) error {
+		if rc.Checkpoint == nil {
+			return nil
+		}
+		return rc.Checkpoint(model.ExecutionCheckpointState{
+			Version:       1,
+			LastCompleted: last,
+			Pending:       append([]queueItem(nil), pending...),
+			NodeOutputs:   rc.snapshotNodeOutputs(),
+			NodeAttempts:  cloneAttempts(perNodeAttempts),
+			Steps:         steps,
+			Status:        status,
+			Wait:          wait,
+		})
+	}
+
+	// The starting queue is itself a valid checkpoint. This makes an accepted
+	// async execution recoverable even when the process dies before node 1.
+	if resume == nil {
+		if err := checkpoint(model.StatusQueued, queue, "", nil); err != nil {
+			rc.Execution.Status = model.StatusError
+			rc.Execution.Error = fmt.Errorf("engine: initial checkpoint: %w", err).Error()
+			return rc.Execution, fmt.Errorf("engine: initial checkpoint: %w", err)
+		}
+	}
 
 	var runErr error
 
@@ -237,9 +303,9 @@ runLoop:
 		item := queue[0]
 		queue = queue[1:]
 
-		node, ok := rc.Workflow.Nodes[item.nodeName]
+		node, ok := rc.Workflow.Nodes[item.NodeName]
 		if !ok {
-			log.Printf("engine: connection references unknown node %q, skipping", item.nodeName)
+			log.Printf("engine: connection references unknown node %q, skipping", item.NodeName)
 			continue
 		}
 		if node.Disabled || node.Type == model.TypeStickyNote {
@@ -254,31 +320,51 @@ runLoop:
 
 		perNodeAttempts[node.Name]++
 		attempt := perNodeAttempts[node.Name]
-		maxTries := 1
-		if node.RetryOnFail && node.MaxTries > 1 {
-			maxTries = node.MaxTries
+		if resumeOperationID != "" && item.OperationID != "" {
+			rc.CurrentOperationID = item.OperationID
+		} else {
+			rc.CurrentOperationID = deterministicOperationID(rc.Execution.ID, steps, node.Name)
+		}
+		// The current node is now the durable recovery boundary. Persist it
+		// with its incremented attempt and stable operation ID before any
+		// external side effect can happen. A crash after the side effect but
+		// before node success will therefore re-enter the same logical operation
+		// instead of inventing a new operation ID. Exactly-once still depends on
+		// the downstream API supporting idempotency/reconciliation.
+		currentItem := item
+		currentItem.OperationID = rc.CurrentOperationID
+		startPending := make([]queueItem, 0, len(queue)+1)
+		startPending = append(startPending, currentItem)
+		startPending = append(startPending, queue...)
+		if err := checkpoint(model.StatusRunning, startPending, lastCompletedNode(rc.Execution), nil); err != nil {
+			runErr = fmt.Errorf("engine: checkpoint before node %q: %w", node.Name, err)
+			rc.Execution.Status = model.StatusError
+			break runLoop
+		}
+		resumeOperationID = ""
+		if node.Type == model.TypeWait {
+			rc.BeforeWait = func(until time.Time) error {
+				pending := make([]queueItem, 0, len(queue)+1)
+				pending = append(pending, currentItem)
+				pending = append(pending, queue...)
+				return checkpoint(model.StatusWaiting, pending, "", &model.CheckpointWait{Until: until})
+			}
+		} else {
+			rc.BeforeWait = nil
 		}
 
 		started := time.Now()
 		var out model.NodeOutput
 		var nodeErr error
-		for a := 1; a <= maxTries; a++ {
-			out, nodeErr = exec.Execute(ctx, rc, node, item.input)
+		for a := 1; a <= maxNodeTries(node); a++ {
+			out, nodeErr = exec.Execute(ctx, rc, node, item.Input)
 			if nodeErr == nil {
 				break
 			}
-			// A permanent (config/credential) error can't be fixed by
-			// retrying the identical request again -- e.g. an HTTP
-			// 401/403 from a missing/invalid API key. Stop immediately
-			// instead of burning the rest of the MaxTries budget (and
-			// their backoff waits) on attempts guaranteed to fail the
-			// same way; this also makes the resulting error message
-			// arrive faster and stay unambiguous (transient vs
-			// permanent), per the "clear configuration error" goal.
 			if IsPermanent(nodeErr) {
 				break
 			}
-			if a < maxTries {
+			if a < maxNodeTries(node) {
 				time.Sleep(retryBackoff(node.WaitBetweenTriesMs, a))
 			}
 		}
@@ -286,7 +372,7 @@ runLoop:
 
 		result := model.NodeRunResult{
 			NodeName:  node.Name,
-			Input:     rc.Redactor.RedactOutput(item.input),
+			Input:     rc.Redactor.RedactOutput(item.Input),
 			StartedAt: started,
 			Duration:  duration,
 			Attempt:   attempt,
@@ -294,15 +380,6 @@ runLoop:
 
 		if nodeErr != nil {
 			if ctx.Err() != nil {
-				// The node failed because the run itself was
-				// cancelled/timed out (its Execute call got ctx.Err()
-				// back), not because of an ordinary node-level error --
-				// report the correct terminal state instead of
-				// StatusError, and don't apply continueOnFail/onError
-				// (those are for real business-logic failures, not "the
-				// whole run stopped"). Rule H/P: cancellation must
-				// produce the correct terminal state, not be
-				// misreported.
 				result.Status = model.StatusCancelled
 				result.Error = rc.Redactor.RedactString(nodeErr.Error())
 				rc.appendNodeRun(result)
@@ -313,19 +390,6 @@ runLoop:
 			result.Status = model.StatusError
 			result.Error = rc.Redactor.RedactString(nodeErr.Error())
 			if node.ContinueOnFail {
-				// Match n8n's actual continueOnFail/onError behavior:
-				// the failure doesn't just vanish -- it becomes a
-				// pass-through item carrying the error, which flows on
-				// (a) the node's normal output, mixed in with regular
-				// items, for onError=continueRegularOutput (or the
-				// legacy bare continueOnFail:true), or (b) the node's
-				// dedicated second/error output branch, for
-				// onError=continueErrorOutput. Previously this branch
-				// just swallowed the error and stopped -- nothing
-				// flowed downstream at all, which silently truncated
-				// any workflow relying on a real error/fallback branch
-				// (exactly the "silent failure" class of bug flagged
-				// for fix) even though the run reported StatusSuccess.
 				errItem := model.Item{JSON: map[string]any{"error": nodeErr.Error()}}
 				errOut := model.NodeOutput{{errItem}}
 				branchIdx := 0
@@ -336,6 +400,11 @@ runLoop:
 				result.Output = rc.Redactor.RedactOutput(errOut)
 				rc.appendNodeRun(result)
 				enqueueFromBranch(&queue, rc.Workflow, node.Name, branchIdx, []model.Item{errItem})
+				if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
+					runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
+					rc.Execution.Status = model.StatusError
+					break runLoop
+				}
 				continue
 			}
 			rc.appendNodeRun(result)
@@ -358,14 +427,24 @@ runLoop:
 				continue
 			}
 			queue = append(queue, queueItem{
-				nodeName: conn.TargetName,
-				input:    model.NodeOutput{branchItems},
+				NodeName: conn.TargetName,
+				Input:    model.NodeOutput{branchItems},
 			})
+		}
+		if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
+			runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
+			rc.Execution.Status = model.StatusError
+			break runLoop
 		}
 	}
 
 	if runErr == nil && rc.Execution.Status == model.StatusRunning {
 		rc.Execution.Status = model.StatusSuccess
+		if err := checkpoint(model.StatusSuccess, nil, lastCompletedNode(rc.Execution), nil); err != nil {
+			// Terminal execution state is still persisted by Runner; startup
+			// orphan cleanup will remove a stale checkpoint if needed.
+			log.Printf("engine: terminal checkpoint failed: %v", err)
+		}
 	}
 	now := time.Now()
 	rc.Execution.FinishedAt = &now
@@ -373,6 +452,54 @@ runLoop:
 		rc.Execution.Error = runErr.Error()
 	}
 	return rc.Execution, runErr
+}
+
+func maxNodeTries(node *model.Node) int {
+	if node == nil || !node.RetryOnFail || node.MaxTries <= 1 {
+		return 1
+	}
+	return node.MaxTries
+}
+
+func (rc *RunContext) snapshotNodeOutputs() map[string]map[string]any {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if len(rc.nodeOutputs) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(rc.nodeOutputs))
+	for k, v := range rc.nodeOutputs {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAttempts(in map[string]int) map[string]int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func deterministicOperationID(executionID string, step int, nodeName string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(executionID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(fmt.Sprintf("%d", step)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(nodeName))
+	return hex.EncodeToString(h.Sum(nil))[:24]
+}
+
+func lastCompletedNode(ex *model.Execution) string {
+	if ex == nil || len(ex.NodeRuns) == 0 {
+		return ""
+	}
+	return ex.NodeRuns[len(ex.NodeRuns)-1].NodeName
 }
 
 // enqueueFromBranch appends one queue item per connection leaving
@@ -390,7 +517,7 @@ func enqueueFromBranch(queue *[]queueItem, wf *model.Workflow, nodeName string, 
 		if conn.SourceIndex != branchIdx {
 			continue
 		}
-		*queue = append(*queue, queueItem{nodeName: conn.TargetName, input: model.NodeOutput{items}})
+		*queue = append(*queue, queueItem{NodeName: conn.TargetName, Input: model.NodeOutput{items}})
 		n++
 	}
 	return n
