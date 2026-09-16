@@ -91,12 +91,28 @@ func main() {
 			log.Printf("execution history cleanup: deleted %d execution(s) older than 12h", deleted)
 		}
 	}
-	if interrupted, err := st.MarkInterruptedExecutions(ctx); err != nil {
-		log.Printf("interrupted execution recovery failed: %v", err)
-	} else if interrupted > 0 {
-		log.Printf("execution recovery: marked %d interrupted execution(s) cancelled", interrupted)
-	}
 	cleanupExecutionHistory()
+	recoveryTTLHours := envInt("MICROFLOW_RECOVERY_TTL_HOURS", 168)
+	if recoveryTTLHours < 24 {
+		recoveryTTLHours = 24
+	}
+	if recoveryTTLHours > 24*30 {
+		recoveryTTLHours = 24 * 30
+	}
+	cleanupRecoveryState := func() {
+		cutoff := time.Now().Add(-time.Duration(recoveryTTLHours) * time.Hour)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		deleted, cleanupErr := st.CleanupOrphanedExecutionCheckpoints(cleanupCtx, 20, cutoff)
+		if cleanupErr != nil {
+			log.Printf("recovery orphan cleanup failed: %v", cleanupErr)
+			return
+		}
+		if deleted > 0 {
+			log.Printf("recovery orphan cleanup: deleted %d checkpoint(s)", deleted)
+		}
+	}
+	cleanupRecoveryState()
 	go func() {
 		ticker := time.NewTicker(12 * time.Hour)
 		defer ticker.Stop()
@@ -106,6 +122,18 @@ func main() {
 				return
 			case <-ticker.C:
 				cleanupExecutionHistory()
+			}
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanupRecoveryState()
 			}
 		}
 	}()
@@ -265,6 +293,7 @@ func main() {
 	// queued behind another run under MICROFLOW_MAX_CONCURRENT_EXECUTIONS
 	// no longer counts against it.
 	run := runner.New(st, st, eng, st, creds, scratchRoot).
+		WithRecovery(st).
 		WithMemGuard(memGuard).
 		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12)).
 		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
@@ -289,6 +318,7 @@ func main() {
 		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
 		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 2),
 	)
+	execManager.StartRecoveryLoop(ctx)
 
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
 	// (not the OAuthResolver) is passed so per-node credential writes go
@@ -349,7 +379,13 @@ func main() {
 
 	sch := scheduler.New(func(ctx context.Context, workflowID, nodeName string) {
 		seed := model.NodeOutput{{{JSON: map[string]any{"triggeredAt": time.Now().Format(time.RFC3339)}}}}
-		ex, runErr := run.RunFromNode(ctx, workflowID, nodeName, "schedule", seed)
+		// Scheduler jobs are server-owned work, not HTTP-request work. Do not
+		// cancel an already-running scheduled execution merely because the
+		// scheduler loop's shutdown context was cancelled; its durable
+		// checkpoint must survive a graceful process exit for automatic restart
+		// recovery. The process itself is still allowed to exit normally.
+		runCtx := context.WithoutCancel(ctx)
+		ex, runErr := run.RunFromNode(runCtx, workflowID, nodeName, "schedule", seed)
 		if runErr != nil {
 			log.Printf("schedule run %s/%s failed: %v", workflowID, nodeName, runErr)
 			return
@@ -372,6 +408,11 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	shutdownManagerCtx, cancelManager := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelManager()
+	if err := execManager.Shutdown(shutdownManagerCtx); err != nil {
+		log.Printf("execution manager shutdown: %v", err)
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
