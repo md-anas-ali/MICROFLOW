@@ -1,6 +1,16 @@
 package model
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrCheckpointTooLarge is returned by a CheckpointStore implementation when
+// a checkpoint's serialized state exceeds the configured size limit. It
+// lives in model (rather than store or runner) so both the persistence
+// layer that detects the condition and the runner that reacts to it via
+// errors.Is can share one sentinel value.
+var ErrCheckpointTooLarge = errors.New("execution checkpoint exceeds configured size limit")
 
 // CheckpointQueueItem is the minimal persisted representation of one
 // in-flight engine work item. It deliberately contains only the node name
