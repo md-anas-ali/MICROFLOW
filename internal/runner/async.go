@@ -579,6 +579,20 @@ func (m *Manager) recoverOne(ctx context.Context, owner string, cp *model.Execut
 	if cp == nil {
 		return ErrInvalidCheckpoint
 	}
+	// An execution this process is still running (or has just finished and
+	// still holds in m.states) must never be recovered: a fresh run holds no
+	// checkpoint lease, so the claim query returns it. Resuming it would start
+	// a duplicate run of the same execution ID, and the invalid/success
+	// branches below would delete the live execution row -- the next checkpoint
+	// insert then violates execution_checkpoints_execution_id_fkey. This must
+	// be checked before validation/cleanup, not after.
+	m.mu.Lock()
+	_, tracked := m.states[cp.ExecutionID]
+	m.mu.Unlock()
+	if tracked || m.r.IsExecutionLive(cp.ExecutionID) {
+		_ = m.r.Recovery.ClearExecutionCheckpointLease(context.Background(), cp.ExecutionID, owner)
+		return nil
+	}
 	wf, err := m.r.Workflows.LoadWorkflow(ctx, cp.WorkflowID)
 	if err != nil {
 		return fmt.Errorf("load workflow: %w", err)

@@ -82,6 +82,40 @@ type Runner struct {
 	// package and internal/scheduler.
 	activeMu   sync.Mutex
 	activeRuns map[string]int
+
+	// liveExecMu/liveExecs is the in-process set of execution IDs that
+	// runOnce is executing right now, for EVERY trigger path (async
+	// Manager, scheduler, webhook, recovered runs). Manager.states only
+	// knows about async/recovered runs, so without this the recovery loop
+	// cannot tell a live scheduler/webhook run from a crashed one (both
+	// have a non-terminal executions row and no checkpoint lease) and would
+	// resume or fail-and-delete an execution that is still running.
+	liveExecMu sync.Mutex
+	liveExecs  map[string]struct{}
+}
+
+func (r *Runner) markExecutionLive(execID string) {
+	r.liveExecMu.Lock()
+	if r.liveExecs == nil {
+		r.liveExecs = map[string]struct{}{}
+	}
+	r.liveExecs[execID] = struct{}{}
+	r.liveExecMu.Unlock()
+}
+
+func (r *Runner) unmarkExecutionLive(execID string) {
+	r.liveExecMu.Lock()
+	delete(r.liveExecs, execID)
+	r.liveExecMu.Unlock()
+}
+
+// IsExecutionLive reports whether execID is currently being executed by
+// this process (see liveExecs).
+func (r *Runner) IsExecutionLive(execID string) bool {
+	r.liveExecMu.Lock()
+	_, ok := r.liveExecs[execID]
+	r.liveExecMu.Unlock()
+	return ok
 }
 
 // markActive/unmarkActive/IsWorkflowActive back IsWorkflowActive; see
@@ -257,6 +291,12 @@ func (r *Runner) RunFromNode(ctx context.Context, workflowID, startNode, mode st
 // per-node progress (SSE); RunFromNode's callers (scheduler/webhook)
 // don't need it and pass nil.
 func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, onNodeRun func(model.NodeRunResult), resume *model.ExecutionCheckpoint) (*model.Execution, error) {
+	// Registered before the execution row/first checkpoint exist and released
+	// only after the terminal cleanup below, so the recovery loop can never
+	// treat this still-running execution as an orphan (see liveExecs).
+	r.markExecutionLive(execID)
+	defer r.unmarkExecutionLive(execID)
+
 	scratchDir := filepath.Join(r.ScratchRoot, execID)
 	// Bug fix: this per-execution directory was never actually created --
 	// it was only ever used as exec.Cmd.Dir for executeCommand nodes
