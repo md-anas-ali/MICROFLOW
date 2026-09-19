@@ -3,8 +3,13 @@ package nodes
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +41,19 @@ type CodeExecutor struct {
 	// means no env vars are exposed -- same fail-closed default as
 	// ExecuteCommandExecutor.AllowedBinaries.
 	EnvAllowlist []string
+
+	// Client backs this.helpers.httpRequest (see newHTTPRequestHelper). It
+	// is the same *http.Client the httpRequest node uses (Deps.HTTPClient,
+	// whose transport dials through SafeDialContext), so scripts get the
+	// identical SSRF boundary and client-level timeout. Nil falls back to
+	// the same 30s default client HTTPRequestExecutor uses.
+	Client *http.Client
 }
+
+// codeNodeTimeout is the wall-clock limit for one Code-node script run. It
+// also caps every this.helpers.httpRequest call the script makes, so no
+// outbound request can outlive the script that issued it.
+const codeNodeTimeout = 10 * time.Second
 
 func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
 	src := node.ParamString("jsCode", node.ParamString("code", ""))
@@ -170,15 +187,27 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 			done := make(chan struct{})
 			var resultVal goja.Value
 			var runErr error
+			// n8n exposes `this.helpers.httpRequest(...)` to Code nodes;
+			// scripts (e.g. Model Controller's provider discovery) rely on
+			// it. Requests are bounded by helperCtx so none outlives the
+			// script's own wall-clock limit below.
+			helperCtx, cancelHelpers := context.WithTimeout(ctx, codeNodeTimeout)
+			defer cancelHelpers()
+			thisVal := vm.ToValue(map[string]any{
+				"helpers": map[string]any{
+					"httpRequest": e.newHTTPRequestHelper(helperCtx, rc, vm),
+				},
+			})
+
 			go func() {
 				defer close(done)
-				v, err := vm.RunString(wrapCode(src))
+				v, err := runCode(vm, src, thisVal)
 				resultVal, runErr = v, err
 			}()
 
 			select {
 			case <-done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(codeNodeTimeout):
 				vm.Interrupt("code node timeout (10s)")
 				<-done
 				return nil, fmt.Errorf("code node %q: execution timed out", node.Name)
@@ -236,9 +265,188 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 }
 
 // wrapCode makes the user's n8n-style code body (which ends with
-// `return [...]` or `return {...}`) into a callable IIFE.
+// `return [...]` or `return {...}`) into a function expression; runCode
+// calls it with `this` bound to the n8n-style context (this.helpers).
 func wrapCode(body string) string {
-	return "(function(){\n" + body + "\n})()"
+	return "(function(){\n" + body + "\n})"
+}
+
+// wrapAsyncCode is wrapCode for bodies that use top-level `await`, which n8n
+// Code nodes allow but a plain function body rejects as a syntax error.
+func wrapAsyncCode(body string) string {
+	return "(async function(){\n" + body + "\n})"
+}
+
+// runCode compiles and runs a Code-node body with the given `this`. Bodies
+// that compile as a plain function behave exactly as before. Only a body
+// that fails to compile that way is retried as an async function (top-level
+// await); goja drains its promise job queue before the call returns, so the
+// returned promise is already settled and is unwrapped here.
+func runCode(vm *goja.Runtime, src string, thisVal goja.Value) (goja.Value, error) {
+	async := false
+	prog, err := goja.Compile("", wrapCode(src), false)
+	if err != nil {
+		asyncProg, asyncErr := goja.Compile("", wrapAsyncCode(src), false)
+		if asyncErr != nil {
+			return nil, err // report the original syntax error
+		}
+		prog, async = asyncProg, true
+	}
+	fnVal, err := vm.RunProgram(prog)
+	if err != nil {
+		return nil, err
+	}
+	fn, ok := goja.AssertFunction(fnVal)
+	if !ok {
+		return nil, errors.New("code node: wrapped script is not callable")
+	}
+	res, err := fn(thisVal)
+	if err != nil || !async {
+		return res, err
+	}
+	p, ok := res.Export().(*goja.Promise)
+	if !ok {
+		return res, nil
+	}
+	switch p.State() {
+	case goja.PromiseStateFulfilled:
+		return p.Result(), nil
+	case goja.PromiseStateRejected:
+		return nil, fmt.Errorf("code node: unhandled rejection: %s", p.Result().String())
+	default:
+		return nil, errors.New("code node: async script did not settle (awaiting a promise that never resolves)")
+	}
+}
+
+// newHTTPRequestHelper implements this.helpers.httpRequest(options) for Code
+// nodes, mirroring the subset of n8n's helper that scripts here use:
+// { method, url, headers, body, timeout (ms), json }. It reuses the httpRequest
+// node's building blocks -- guardSSRF, the shared *http.Client (SafeDialContext),
+// the default User-Agent, the response size cap, MemGuard throttling and the
+// HeavyWorkGate -- rather than introducing a second HTTP stack.
+//
+// Like n8n's helper it returns the parsed body itself (an object OR a bare
+// array when json is true, else the body string) and throws on transport
+// errors and non-2xx statuses. Thrown messages never include the URL,
+// headers or response body, so a credential cannot leak through an error.
+// The call is synchronous; awaiting its result is fine.
+func (e CodeExecutor) newHTTPRequestHelper(ctx context.Context, rc *engine.RunContext, vm *goja.Runtime) func(goja.FunctionCall) goja.Value {
+	fail := func(format string, args ...any) {
+		panic(vm.NewGoError(fmt.Errorf("httpRequest: "+format, args...)))
+	}
+	return func(call goja.FunctionCall) goja.Value {
+		opts, _ := call.Argument(0).Export().(map[string]any)
+		if opts == nil {
+			fail("options object required")
+		}
+		rawURL, _ := opts["url"].(string)
+		if rawURL == "" {
+			fail("url required")
+		}
+		if err := guardSSRF(rawURL); err != nil {
+			fail("%v", err)
+		}
+		method, _ := opts["method"].(string)
+		if method == "" {
+			method = "GET"
+		}
+		method = strings.ToUpper(method)
+
+		// goja exports JS integers as int64 (toFloat doesn't cover that), so
+		// read the numeric timeout explicitly. It can only shorten the limit.
+		timeout := codeNodeTimeout
+		var ms float64
+		switch n := opts["timeout"].(type) {
+		case int64:
+			ms = float64(n)
+		case float64:
+			ms = n
+		}
+		if d := time.Duration(ms * float64(time.Millisecond)); d > 0 && d < timeout {
+			timeout = d
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		var body io.Reader
+		switch b := opts["body"].(type) {
+		case nil:
+		case string:
+			body = strings.NewReader(b)
+		default:
+			enc, err := json.Marshal(b)
+			if err != nil {
+				fail("body is not JSON-serializable")
+			}
+			body = strings.NewReader(string(enc))
+		}
+		req, err := http.NewRequestWithContext(reqCtx, method, rawURL, body)
+		if err != nil {
+			fail("invalid request")
+		}
+		req.Header.Set("User-Agent", defaultUserAgent())
+		if headers, ok := opts["headers"].(map[string]any); ok {
+			for k, v := range headers {
+				req.Header.Set(k, fmt.Sprintf("%v", v))
+			}
+		}
+		wantJSON, _ := opts["json"].(bool)
+		if wantJSON && req.Header.Get("Accept") == "" {
+			req.Header.Set("Accept", "application/json")
+		}
+		if _, isObj := opts["body"].(map[string]any); isObj && req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		client := e.Client
+		if client == nil {
+			client = &http.Client{Timeout: 30 * time.Second}
+		}
+		rc.MemGuard.WaitIfThrottled(reqCtx)
+		if rc.HeavyWorkGate != nil {
+			select {
+			case rc.HeavyWorkGate <- struct{}{}:
+			case <-reqCtx.Done():
+				fail("timed out waiting for a free request slot")
+			}
+		}
+		resp, err := client.Do(req)
+		if rc.HeavyWorkGate != nil {
+			<-rc.HeavyWorkGate
+		}
+		if err != nil {
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Err // drop the URL from the message
+			}
+			fail("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			fail("HTTP %d", resp.StatusCode)
+		}
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+		if err != nil {
+			fail("reading response failed")
+		}
+		if len(respBody) > maxResponseBytes {
+			fail("response exceeded %d byte cap", maxResponseBytes)
+		}
+		if !wantJSON {
+			return vm.ToValue(string(respBody))
+		}
+		// Parse with the VM's own JSON so the script gets native objects and
+		// arrays (Array.isArray, filter/map, ...), not wrapped Go values.
+		parse, ok := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
+		if !ok {
+			fail("JSON.parse unavailable")
+		}
+		parsed, err := parse(goja.Undefined(), vm.ToValue(string(respBody)))
+		if err != nil {
+			return vm.ToValue(string(respBody)) // non-JSON body: hand back the text, as n8n does
+		}
+		return parsed
+	}
 }
 
 func mustSet(vm *goja.Runtime, name string, v any) {

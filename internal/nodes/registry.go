@@ -21,7 +21,7 @@ func DefaultRegistry(deps Deps) map[model.NodeType]engine.NodeExecutor {
 		model.TypeErrorTrigger:    &PassThroughExecutor{},
 		model.TypeNoOp:            &PassThroughExecutor{},
 
-		model.TypeCode: &CodeExecutor{EnvAllowlist: deps.EnvAllowlist},
+		model.TypeCode: &CodeExecutor{EnvAllowlist: deps.EnvAllowlist, Client: deps.HTTPClient},
 
 		model.TypeIf:             &IfExecutor{},
 		model.TypeWait:           &WaitExecutor{},
