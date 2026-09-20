@@ -34,3 +34,27 @@ func IsPermanent(err error) bool {
 	var p *permanentError
 	return errors.As(err, &p)
 }
+
+// fatalError marks a configuration error that must stop the run even when the
+// failing node has ContinueOnFail set (e.g. GOOGLE_SHEETS_CONFIG_ERROR: reading
+// or writing the wrong spreadsheet tab is worse than stopping). A fatal error is
+// also permanent, so it is never retried.
+type fatalError struct{ err error }
+
+func (f *fatalError) Error() string { return f.err.Error() }
+func (f *fatalError) Unwrap() error { return f.err }
+
+// Fatal wraps err so the engine neither retries it nor turns it into a
+// continue-on-fail error item: the node fails and the run stops.
+func Fatal(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &fatalError{err: &permanentError{err: err}}
+}
+
+// IsFatal reports whether err (or anything it wraps) was marked via Fatal.
+func IsFatal(err error) bool {
+	var f *fatalError
+	return errors.As(err, &f)
+}
