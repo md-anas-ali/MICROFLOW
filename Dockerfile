@@ -85,7 +85,8 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
 
 FROM alpine:3.19
 
-RUN apk add --no-cache ffmpeg python3 ca-certificates bash
+# fontconfig + ttf-dejavu: ফন্ট না থাকলে ffmpeg subtitles আঁকে না, অথচ error-ও দেয় না
+RUN apk add --no-cache ffmpeg python3 ca-certificates bash fontconfig ttf-dejavu
 COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
 
 # Verify the vendored Edge TTS runtime at image build time.
