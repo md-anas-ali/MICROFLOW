@@ -9,9 +9,13 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"microflow/internal/engine"
 	"microflow/internal/expr"
@@ -75,6 +79,113 @@ func resolveSpreadsheetID() (string, error) {
 		return "", fmt.Errorf("GOOGLE_SHEETS_URL does not contain a valid spreadsheet ID (got %q) -- expected a URL like \"https://docs.google.com/spreadsheets/d/<ID>/edit\"", raw)
 	}
 	return id, nil
+}
+
+// --- Google Sheets: target tab from the gid in GOOGLE_SHEETS_URL ---
+//
+// GOOGLE_SHEETS_URL is the single configuration source. Besides the spreadsheet
+// ID it must carry the target tab's gid (".../edit#gid=123456789"). The Sheets
+// API addresses tabs by NAME, so the gid is resolved to the exact tab title with
+// one authenticated spreadsheets.get metadata call using the same connected
+// Google account as the Sheets node itself (no extra credential, no dependency).
+// There is deliberately NO fallback: no gid, an unresolvable gid or a failed
+// lookup is a fatal GOOGLE_SHEETS_CONFIG_ERROR (never swallowed by
+// continueOnFail), so nothing is ever read from or written to a wrong tab.
+
+// defaultSheetColumns is only the column span; the tab always comes from the gid.
+const defaultSheetColumns = "A:Z"
+
+var (
+	sheetGIDPattern    = regexp.MustCompile(`[#&?]gid=(\d+)`)
+	sheetColumnsFormat = regexp.MustCompile(`^[A-Za-z]{1,3}[0-9]*(:[A-Za-z]{1,3}[0-9]*)?$`)
+)
+
+func sheetsConfigError(format string, args ...any) error {
+	return engine.Fatal(fmt.Errorf("GOOGLE_SHEETS_CONFIG_ERROR: "+format, args...))
+}
+
+// resolveSheetsGID returns the required gid from GOOGLE_SHEETS_URL.
+func resolveSheetsGID() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("GOOGLE_SHEETS_URL"))
+	m := sheetGIDPattern.FindStringSubmatch(raw)
+	if m == nil {
+		return "", sheetsConfigError("GOOGLE_SHEETS_URL must include the target sheet gid (e.g. https://docs.google.com/spreadsheets/d/<ID>/edit#gid=123456789); no default or first-tab fallback is used")
+	}
+	return m[1], nil
+}
+
+// Tiny bounded cache (max 4 entries, 5 min TTL) so the metadata call is not
+// repeated for every Sheets node/row; a renamed tab is picked up within the TTL.
+type sheetTitleEntry struct {
+	title string
+	at    time.Time
+}
+
+const (
+	sheetTitleTTL      = 5 * time.Minute
+	sheetTitleCacheMax = 4
+)
+
+var (
+	sheetTitleMu    sync.Mutex
+	sheetTitleCache = map[string]sheetTitleEntry{}
+)
+
+// resolveSheetTitle maps gid -> exact tab title via the authenticated Sheets metadata API.
+func resolveSheetTitle(ctx context.Context, token, spreadsheetID, gid, operationID string) (string, error) {
+	want, err := strconv.ParseInt(gid, 10, 64)
+	if err != nil {
+		return "", sheetsConfigError("gid %q in GOOGLE_SHEETS_URL is not a number", gid)
+	}
+	key := spreadsheetID + "#" + gid
+	sheetTitleMu.Lock()
+	if e, ok := sheetTitleCache[key]; ok && time.Since(e.at) < sheetTitleTTL {
+		sheetTitleMu.Unlock()
+		return e.title, nil
+	}
+	sheetTitleMu.Unlock()
+
+	var resp struct {
+		Sheets []struct {
+			Properties struct {
+				SheetID int64  `json:"sheetId"`
+				Title   string `json:"title"`
+			} `json:"properties"`
+		} `json:"sheets"`
+	}
+	metaURL := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets.properties(sheetId,title)", spreadsheetID)
+	if err := googleAPICall(ctx, "GET", metaURL, token, nil, &resp, operationID); err != nil {
+		return "", sheetsConfigError("unable to resolve sheet gid %s (authenticated Sheets metadata lookup failed): %v", gid, err)
+	}
+	for _, sh := range resp.Sheets {
+		if sh.Properties.SheetID == want && sh.Properties.Title != "" {
+			sheetTitleMu.Lock()
+			if len(sheetTitleCache) >= sheetTitleCacheMax {
+				for k := range sheetTitleCache {
+					delete(sheetTitleCache, k)
+					break
+				}
+			}
+			sheetTitleCache[key] = sheetTitleEntry{title: sh.Properties.Title, at: time.Now()}
+			sheetTitleMu.Unlock()
+			return sh.Properties.Title, nil
+		}
+	}
+	return "", sheetsConfigError("unable to resolve sheet gid %s: no tab with that gid exists in the spreadsheet", gid)
+}
+
+// buildSheetRange returns the URL-escaped A1 range "'<tab>'!<columns>". The node's
+// optional "range" parameter may only hold columns (default A:Z); a tab name in it
+// is rejected so the tab can only ever come from the gid in GOOGLE_SHEETS_URL.
+func buildSheetRange(node *model.Node, title string) (string, error) {
+	cols := strings.TrimSpace(node.ParamString("range", ""))
+	if cols == "" {
+		cols = defaultSheetColumns
+	}
+	if !sheetColumnsFormat.MatchString(cols) {
+		return "", sheetsConfigError("node %q: range %q must be columns only (e.g. A:Z); the tab is taken from the gid in GOOGLE_SHEETS_URL", node.Name, cols)
+	}
+	return url.PathEscape("'" + strings.ReplaceAll(title, "'", "''") + "'!" + cols), nil
 }
 
 // All three executors below assume the credential vault (internal/vault)
@@ -144,9 +255,20 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 	token := creds["accessToken"]
 	spreadsheetID, err := resolveSpreadsheetID()
 	if err != nil {
+		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, sheetsConfigError("%v", err))
+	}
+	gid, err := resolveSheetsGID()
+	if err != nil {
 		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
 	}
-	sheetRange := node.ParamString("range", "A1:Z1000")
+	tabTitle, err := resolveSheetTitle(ctx, token, spreadsheetID, gid, rc.CurrentOperationID)
+	if err != nil {
+		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
+	}
+	sheetRange, err := buildSheetRange(node, tabTitle)
+	if err != nil {
+		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
+	}
 	operation, _ := node.Parameters["operation"].(string) // "read" | "append" | "update"
 
 	var out []model.Item
