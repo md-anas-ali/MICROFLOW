@@ -1,0 +1,2200 @@
+{
+  "name": "My workflow",
+  "active": true,
+  "nodes": [
+    {
+      "id": "a9f83f55-1df3-4044-be72-f0d504b435e5",
+      "name": "Apply Fact \u0026 Grammar Fixes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        960
+      ],
+      "parameters": {
+        "jsCode": "// Falls back to the deterministic Grammar QC Precheck output if the AI\n// checker call failed or didn't return usable JSON - never lets a bad\n// checker response break the run.\nconst original = $node(\"Lightweight Fact Lookup\").json;\n\nfunction extractText(b){\n  try {\n    return b?.candidates?.[0]?.content?.parts?.[0]?.text\n        ?? b?.choices?.[0]?.message?.content\n        ?? '';\n  } catch(e){ return ''; }\n}\n\nlet raw = extractText($json);\nraw = String(raw || '').replace(/^```json\\s*/i, '').replace(/```\\s*$/i, '').trim();\n\nfunction tryParse(s){ try { return JSON.parse(s); } catch(e) { return null; } }\n\nlet fixed = tryParse(raw);\n\nconst valid = fixed \u0026\u0026 fixed.title \u0026\u0026 fixed.topic \u0026\u0026 fixed.description\n  \u0026\u0026 Array.isArray(fixed.tags) \u0026\u0026 Array.isArray(fixed.scenes)\n  \u0026\u0026 fixed.scenes.length === (original.scenes ? original.scenes.length : 5)\n  \u0026\u0026 fixed.scenes.every(s =\u003e s \u0026\u0026 s.voice \u0026\u0026 s.image_prompt);\n\nconst finalData = valid ? fixed : original;\n\nreturn { json: {\n  title: finalData.title,\n  topic: finalData.topic,\n  hook: finalData.hook || (finalData.scenes[0] ? finalData.scenes[0].voice : ''),\n  description: finalData.description,\n  tags: finalData.tags,\n  scenes: finalData.scenes.map((s, i) =\u003e ({ ...s, scene: i + 1 })),\n  factCheckApplied: valid\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "86c2723a-824a-4dd7-8fa4-af509990617e",
+      "name": "Build Exclusion Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        960
+      ],
+      "parameters": {
+        "jsCode": "const rows = items.map(i =\u003e i.json).filter(Boolean);\n\nfunction norm(s){ return String(s||'').toLowerCase().trim(); }\n\nconst usedTitles   = rows.map(r =\u003e norm(r.title)).filter(Boolean);\nconst usedTopics   = rows.map(r =\u003e norm(r.topic)).filter(Boolean);\nconst usedHooks    = rows.map(r =\u003e norm(r.hook)).filter(Boolean);\nconst usedEntities = rows.map(r =\u003e norm(r.entities)).filter(Boolean);\nconst usedDescs    = rows.map(r =\u003e norm(r.description)).filter(Boolean);\n\nconst categories = ['world history mysteries','ancient civilizations \u0026 lost cities','human psychology \u0026 behavior','language \u0026 linguistics facts','mathematics \u0026 number theory','world geography \u0026 extreme places','economics \u0026 how money works','philosophy \u0026 big ideas','law \u0026 justice systems explained','political systems \u0026 government','space \u0026 astronomy','earth science \u0026 natural disasters','human body \u0026 anatomy','animal kingdom \u0026 wildlife biology','world religions \u0026 mythology','art history \u0026 famous artworks','architecture \u0026 engineering marvels','literature \u0026 famous authors','computer science \u0026 how technology works','military history \u0026 famous battles','medicine \u0026 health science','food science \u0026 nutrition facts','environmental science \u0026 climate change','famous scientists \u0026 discoveries','world cultures \u0026 traditions','archaeology \u0026 forgotten civilizations','forensic science \u0026 crime investigation','sports science \u0026 human performance','ocean \u0026 marine biology','weather \u0026 meteorology','world currencies \u0026 trade history','biggest disasters in history','learning science \u0026 memory hacks','world records \u0026 human extremes','folklore \u0026 legends explained','landmark scientific experiments','space exploration \u0026 missions','geology \u0026 deep earth history','chemistry in everyday life','physics in everyday life','artificial intelligence \u0026 future tech','renewable energy \u0026 sustainability','ancient egypt \u0026 pyramids','world war history','great explorers \u0026 expeditions','inventions that changed the world','famous philosophers \u0026 their ideas','how languages evolved','astronomy myths vs facts','ancient wonders of the world','unsolved quantum physics anomalies','bizarre deep sea creatures','forgotten historical empires','psychological paradoxes','mathematical impossibilities in nature','extreme planetary weather','bizarre ancient medical practices','microscopic world secrets','cryptography and lost codes','weird evolutionary traits','dark matter and astrophysics mysteries','rare geological formations'];\n\nconst wf = $getWorkflowStaticData('global');\nif (typeof wf.runCounter !== 'number') wf.runCounter = 0;\nwf.runCounter++;\nconst counter = wf.runCounter;\nconst category = categories[counter % categories.length];\n\nfunction fisherYatesSample(arr, n){\n  const a = arr.slice();\n  const len = Math.min(n, a.length);\n  for (let i = a.length - 1; i \u003e a.length - 1 - len; i--) {\n    const j = Math.floor(Math.random() * (i + 1));\n    [a[i], a[j]] = [a[j], a[i]];\n  }\n  return a.slice(a.length - len);\n}\n\n// Strategy: always keep the MOST RECENT items (catches near-term repeats reliably),\n// then top it up with a random sample from older history (catches long-tail repeats)\n// without ever exceeding a size small/free models can actually read.\nfunction buildBanBlock(list, recentN, randomN){\n  const unique = [...new Set(list)];\n  const recent = unique.slice(-recentN);\n  const older  = unique.slice(0, Math.max(0, unique.length - recentN));\n  const randomOlder = fisherYatesSample(older, randomN);\n  return [...new Set([...recent, ...randomOlder])];\n}\n\nconst banListArr   = buildBanBlock([...usedTopics, ...usedTitles], 250, 150); // cap ~400 entries\nconst hookBanArr    = buildBanBlock(usedHooks, 150, 100);                      // cap ~250 entries\nconst entityBanArr  = buildBanBlock(usedEntities.flatMap(e =\u003e e.split(',').map(x=\u003ex.trim()).filter(Boolean)), 150, 100);\nconst summaryBanArr = buildBanBlock(usedDescs, 100, 80);                       // feeds AI Semantic Duplicate Check\n\nconst banList    = banListArr.join(' | ');\nconst hookBan     = hookBanArr.join(' | ');\nconst entityBan   = entityBanArr.join(', ');\nconst summaryBan  = summaryBanArr.join(' | ');\n\nconst trendingContext = wf.trendingContext || '';\n\nreturn [{ json: { category, counter, banList, hookBan, entityBan, summaryBan, usedCount: rows.length, trendingContext } }];\n"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "67f62801-d486-400c-8ce1-522cfdb92f2e",
+      "name": "Build Full SRT",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1600,
+        1060
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''cd \"/tmp\" \u0026\u0026 sort -V -t'|' -k1 srt_lines.txt \u003e srt_sorted.txt \u0026\u0026 i=1; start=0; \u003e full.srt; while IFS='|' read -r idx dur text; do dur=${dur:-8}; end=$(awk \"BEGIN{print $start+$dur}\"); sh=$(awk \"BEGIN{printf \\\"%02d:%02d:%06.3f\\\",int($start/3600),int($start%3600/60),$start%60}\"); eh=$(awk \"BEGIN{printf \\\"%02d:%02d:%06.3f\\\",int($end/3600),int($end%3600/60),$end%60}\"); printf '%d\\n%s --\u003e %s\\n%s\\n\\n' \"$i\" \"$(echo $sh|sed 's/\\./,/')\" \"$(echo $eh|sed 's/\\./,/')\" \"$text\" \u003e\u003e full.srt; start=$end; i=$((i+1)); done \u003c srt_sorted.txt \u0026\u0026 rm -f srt_sorted.txt \u0026\u0026 echo SRT_BUILT \u0026\u0026 cat full.srt'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "c6325a3c-a1cc-409c-9544-0be6abc03fac",
+      "name": "Build YT Meta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        1060
+      ],
+      "parameters": {
+        "jsCode": "const meta = $node(\"Parse JSON\").json;\nconst tags = Array.isArray(meta.tags)?meta.tags:['science','technology','shorts'];\nconst title=(meta.title||'Amazing Facts').slice(0,95);\nlet description=`${meta.description||title}\\n\\n#shorts #science #technology #facts\\n\\n${tags.map(t=\u003e'#'+String(t).replace(/\\s+/g,'')).join(' ')}`;\nif(description.length\u003e4900)description=description.slice(0,4900);\nlet tagList=[],total=0;\nfor(const t of tags){const s=String(t);if(total+s.length+1\u003e480)break;tagList.push(s);total+=s.length+1;}\nif(tagList.length===0)tagList=['science','technology','shorts'];\nconst publishAt=new Date(Date.now()+2*60*60*1000).toISOString();\nreturn {json:{title,topic:meta.topic||title,description,tags:tagList,publishAt}};",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "a5dda7f5-3f49-4a66-810e-55b2cdb277bc",
+      "name": "Check Final Video",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        1060
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''F=/tmp/final.mp4; test -s \"$F\" || { echo FINAL_MISSING; exit 1; }; ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 \"$F\" | grep -qi h264 || { echo FINAL_NO_VIDEO; exit 1; }; repair_audio(){ ls /tmp/scene_*.mp3 \u003e/dev/null 2\u003e\u00261 || return 1; ls /tmp/scene_*.mp3 | sort -V | sed \"s/^/file '/;s/$/'/\" \u003e /tmp/audio_concat.txt; ffmpeg -y -threads 1 -f concat -safe 0 -i /tmp/audio_concat.txt -c:a aac -b:a 128k -ar 44100 -ac 1 /tmp/repaired_audio.m4a 2\u003e/dev/null; [ -s /tmp/repaired_audio.m4a ] || return 1; ffmpeg -y -threads 1 -i \"$F\" -i /tmp/repaired_audio.m4a -map 0:v -map 1:a -c:v copy -c:a copy -shortest /tmp/final_repaired.mp4 2\u003e/dev/null; [ -s /tmp/final_repaired.mp4 ] || return 1; mv -f /tmp/final_repaired.mp4 \"$F\"; rm -f /tmp/repaired_audio.m4a /tmp/audio_concat.txt; return 0; }; HAS_A=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 \"$F\" 2\u003e/dev/null); if ! echo \"$HAS_A\" | grep -qi aac; then echo FINAL_NO_AUDIO_ATTEMPTING_REPAIR; if repair_audio; then echo FINAL_AUDIO_REPAIRED; else echo FINAL_AUDIO_MISSING_UNRECOVERABLE; exit 1; fi; fi; MAXVOL=$(ffmpeg -i \"$F\" -af volumedetect -f null - 2\u003e\u00261 | grep -o 'max_volume: [-0-9.]*' | awk '{print $2}'); MAXVOL=${MAXVOL:--99}; ISSILENT=$(awk \"BEGIN{print ($MAXVOL\u003c=-50)?1:0}\"); if [ \"$ISSILENT\" = \"1\" ]; then echo FINAL_AUDIO_SILENT_${MAXVOL}dB_ATTEMPTING_REPAIR; if repair_audio; then MAXVOL2=$(ffmpeg -i \"$F\" -af volumedetect -f null - 2\u003e\u00261 | grep -o 'max_volume: [-0-9.]*' | awk '{print $2}'); MAXVOL2=${MAXVOL2:--99}; STILLSILENT=$(awk \"BEGIN{print ($MAXVOL2\u003c=-50)?1:0}\"); if [ \"$STILLSILENT\" = \"1\" ]; then echo FINAL_AUDIO_STILL_SILENT_AFTER_REPAIR; exit 1; fi; echo FINAL_AUDIO_REPAIRED_${MAXVOL2}dB; else echo FINAL_AUDIO_SILENT_UNRECOVERABLE; exit 1; fi; fi; DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \"$F\"); DUR=${DUR:-0}; OK=$(awk \"BEGIN{print ($DUR\u003e=10 \u0026\u0026 $DUR\u003c=120)?1:0}\"); if [ \"$OK\" != \"1\" ]; then echo FINAL_BAD_DUR_$DUR; exit 1; fi; echo FINAL_OK_$DUR'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "36d018dc-6eda-4548-9e6a-8a9fcd06571a",
+      "name": "Check Image Valid",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2420,
+        760
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''IMG=/tmp/scene_{{ $node[\"Prep Scene\"].json.idx }}.jpg; NEEDGEN=0; if [ ! -s \"$IMG\" ]; then echo IMG_MISSING_GEN; NEEDGEN=1; else SZ=$(stat -c%s \"$IMG\"); if [ \"$SZ\" -lt 3000 ]; then echo IMG_TOO_SMALL_${SZ}_GEN; NEEDGEN=1; else ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 \"$IMG\" \u003e/dev/null 2\u003e\u00261 || { echo IMG_NOT_VALID_GEN; NEEDGEN=1; }; fi; fi; if [ \"$NEEDGEN\" = \"1\" ]; then ffmpeg -y -threads 1 -f lavfi -i color=c=black:s=540x960:d=1 -frames:v 1 \"$IMG\" 2\u003e/dev/null \u0026\u0026 echo PLACEHOLDER_MADE; fi; SZ2=$(stat -c%s \"$IMG\" 2\u003e/dev/null); echo IMG_OK_${SZ2:-0}'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "ed0b5f53-ec9d-428c-aa1d-799e274c6233",
+      "name": "Check Voice Valid",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2820,
+        760
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''IDX={{ $node[\"Prep Scene\"].json.idx }}; F=/tmp/scene_${IDX}.mp3; makesilent(){ ffmpeg -y -threads 1 -f lavfi -i anullsrc=r=44100:cl=mono -t 6 -c:a libmp3lame -b:a 128k \"$F\" 2\u003e/dev/null; }; if [ ! -s \"$F\" ]; then echo VOICE_MISSING_REPAIR; makesilent; fi; DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \"$F\" 2\u003e/dev/null); DUR=${DUR:-0}; TOOSHORT=$(awk \"BEGIN{print ($DUR\u003c1.0)?1:0}\"); TOOLONG=$(awk \"BEGIN{print ($DUR\u003e15)?1:0}\"); if [ \"$TOOSHORT\" = \"1\" ]; then echo VOICE_TOO_SHORT_${DUR}_PADDING; ffmpeg -y -threads 1 -i \"$F\" -af \"apad=pad_dur=5\" -t 6 -c:a libmp3lame -b:a 128k /tmp/scene_${IDX}_pad.mp3 2\u003e/dev/null \u0026\u0026 mv -f /tmp/scene_${IDX}_pad.mp3 \"$F\"; fi; if [ \"$TOOLONG\" = \"1\" ]; then echo VOICE_TOO_LONG_${DUR}_TRIM; ffmpeg -y -threads 1 -i \"$F\" -t 14 -c:a libmp3lame -b:a 128k /tmp/scene_${IDX}_trim.mp3 2\u003e/dev/null \u0026\u0026 mv -f /tmp/scene_${IDX}_trim.mp3 \"$F\"; fi; CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 \"$F\" 2\u003e/dev/null); if [ -z \"$CODEC\" ]; then echo VOICE_NO_AUDIO_STREAM_REPAIR; makesilent; fi; MAXVOL=$(ffmpeg -i \"$F\" -af volumedetect -f null - 2\u003e\u00261 | grep -o 'max_volume: [-0-9.]*' | awk '{print $2}'); MAXVOL=${MAXVOL:--99}; ISSILENT=$(awk \"BEGIN{print ($MAXVOL\u003c=-50)?1:0}\"); if [ \"$ISSILENT\" = \"1\" ]; then echo VOICE_EFFECTIVELY_SILENT_${MAXVOL}dB_REPAIR; makesilent; fi; FDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \"$F\" 2\u003e/dev/null); FDUR=${FDUR:-0}; OK=$(awk \"BEGIN{print ($FDUR\u003e=1.0 \u0026\u0026 $FDUR\u003c=15)?1:0}\"); if [ \"$OK\" != \"1\" ]; then echo VOICE_FINAL_REPAIR; makesilent; FDUR=6.0; fi; echo VOICE_OK_$FDUR'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "34f30be7-84cf-452f-956d-36c547530d5c",
+      "name": "Concat + BGM + Subtitle",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1800,
+        1160
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''cd \"/tmp\" \u0026\u0026 ls clip_*.mp4 | sort -V | sed \"s/^/file '/;s/$/'/\" \u003e concat.txt \u0026\u0026 ffmpeg -y -threads 1 -f concat -safe 0 -i concat.txt -c copy /tmp/merged.mp4 \u0026\u0026 test -s /tmp/merged.mp4 || exit 1; HAS_A=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 /tmp/merged.mp4 2\u003e/dev/null); if [ -z \"$HAS_A\" ]; then echo MERGED_NO_AUDIO_FIX; ffmpeg -y -threads 1 -i /tmp/merged.mp4 -f lavfi -i anullsrc=r=44100:cl=mono -c:v copy -c:a aac -b:a 128k -shortest /tmp/merged2.mp4 2\u003e/dev/null \u0026\u0026 mv -f /tmp/merged2.mp4 /tmp/merged.mp4; fi; if [ -s /tmp/bgm.mp3 ]; then ffmpeg -y -threads 1 -i /tmp/merged.mp4 -stream_loop -1 -i /tmp/bgm.mp3 -filter_complex \"[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]\" -map 0:v -map \"[aout]\" -c:v copy -c:a aac -b:a 128k -ar 44100 -ac 1 -shortest /tmp/withaudio.mp4 2\u003e/dev/null || cp /tmp/merged.mp4 /tmp/withaudio.mp4; else cp /tmp/merged.mp4 /tmp/withaudio.mp4; fi \u0026\u0026 rm -f /tmp/clip_*.mp4 /tmp/merged.mp4 \u0026\u0026 ffmpeg -y -threads 1 -i /tmp/withaudio.mp4 -vf \"subtitles=/tmp/full.srt:force_style='FontName=DejaVu Sans,FontSize=15,Bold=1,PrimaryColour=\u0026H00FFFFFF,OutlineColour=\u0026H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=120'\" -c:v libx264 -preset ultrafast -crf 30 -x264-params ref=1:bframes=0 -g 40 -c:a copy -pix_fmt yuv420p -r 20 /tmp/final.mp4 2\u003e/tmp/sub_err.log || { echo SUBTITLE_FAILED_FALLBACK; cat /tmp/sub_err.log 2\u003e/dev/null | tail -3; cp /tmp/withaudio.mp4 /tmp/final.mp4; } \u0026\u0026 rm -f /tmp/withaudio.mp4 /tmp/sub_err.log \u0026\u0026 test -s /tmp/final.mp4 \u0026\u0026 ls -lh /tmp/final.mp4 \u0026\u0026 echo CONCAT_OK'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "230cd8d9-0a48-40b5-a0f0-f1ab90c20cbd",
+      "name": "Cooldown Between Scenes",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3220,
+        760
+      ],
+      "parameters": {
+        "amount": 5
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "01c088d3-be01-4e39-b245-b1b6430f964b",
+      "name": "Dedupe Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        960
+      ],
+      "parameters": {
+        "jsCode": "const wf = $getWorkflowStaticData('global');\nif (typeof wf.dupAttempts !== 'number') wf.dupAttempts = 0;\n\nconst data = $json;\n\n// ---------------- helpers ----------------\n\nconst STOPWORDS = new Set(['the','a','an','of','in','on','how','why','what','is','are','this','that','to','for','and','or','with','your','you','it','its','was','were','be','can','will','these','those','from','about','into','than','then','so','but','if','as','at','by','not','no','do','does','did','has','have','had','one','ever','most','world','new','updated','latest','version','remastered','revised','recent']);\n\n// words used purely to disguise a repost: sequence numbers, part/series markers, freshness claims\nconst DISGUISE_WORDS = /\\b(part|pt|set|vol|volume|series|episode|ep|no|num|number|chapter|edition|version|v\\d*|round|day\\d*|week\\d*|new|updated|latest|remastered|revised|recent|2024|2025|2026|2027)\\b/g;\n\nfunction stripAccents(s){\n  return String(s||'').normalize('NFKD').replace(/[\\u0300-\\u036f]/g,'');\n}\n\n// very light stemmer so plural/tense variants collapse to the same root\nfunction stem(w){\n  return w\n    .replace(/(ing|edly)$/,'')\n    .replace(/(ies)$/,'y')\n    .replace(/(ed|es)$/,'')\n    .replace(/s$/,'')\n    .trim();\n}\n\nfunction normalize(s){\n  let t = stripAccents(String(s || '')).toLowerCase();\n  t = t.replace(/[^a-z0-9\\s]/g, ' ');\n  t = t.replace(/\\b\\d+\\b/g, ' ');\n  t = t.replace(DISGUISE_WORDS, ' ');\n  t = t.replace(/\\s+/g, ' ').trim();\n  return t;\n}\n\nfunction tokens(s){\n  return normalize(s)\n    .split(' ')\n    .filter(w =\u003e w.length \u003e 2 \u0026\u0026 !STOPWORDS.has(w))\n    .map(stem)\n    .filter(Boolean);\n}\n\n// canonical signature: sorted unique stemmed tokens -\u003e catches word-order shuffles\nfunction signature(s){\n  return [...new Set(tokens(s))].sort().join(' ');\n}\n\n// small non-cryptographic hash for fast fingerprint compare\nfunction hashStr(s){\n  let h = 0;\n  for (let i = 0; i \u003c s.length; i++) {\n    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;\n  }\n  return (h \u003e\u003e\u003e 0).toString(36);\n}\n\nfunction jaccard(aTokens, bTokens){\n  if (!aTokens.length || !bTokens.length) return 0;\n  const a = new Set(aTokens), b = new Set(bTokens);\n  let inter = 0;\n  for (const w of a) if (b.has(w)) inter++;\n  const union = new Set([...a, ...b]).size;\n  return union ? inter / union : 0;\n}\n\n// word-bigram shingles catch paraphrases/rewrites that swap synonyms but keep sentence flow\nfunction shingles(tokArr, n){\n  const out = [];\n  for (let i = 0; i \u003c= tokArr.length - n; i++) out.push(tokArr.slice(i, i + n).join('_'));\n  return out;\n}\n\nfunction containsOrContained(a, b){\n  return a \u0026\u0026 b \u0026\u0026 (a === b || a.includes(b) || b.includes(a));\n}\n\n// ---------------- gather new content ----------------\n\nconst newTopic = String(data.topic || '');\nconst newTitle = String(data.title || '');\nconst newHook  = String(data.hook || '');\nconst newDesc  = String(data.description || '');\nconst scenes   = Array.isArray(data.scenes) ? data.scenes : [];\nconst newScript = scenes.map(s =\u003e String(s \u0026\u0026 s.voice || '')).join(' ');\n\nconst newTopicNorm = normalize(newTopic);\nconst newTopicSig  = signature(newTopic);\nconst newTitleSig  = signature(newTitle);\nconst newHookSig   = signature(newHook);\nconst newConceptSig = signature(`${newTopic} ${newTitle} ${newHook}`);\n\nconst newTopicTokens   = tokens(newTopic);\nconst newTitleTokens   = tokens(newTitle);\nconst newHookTokens    = tokens(newHook);\nconst newScriptTokens  = tokens(newScript);\nconst newScriptShingles = shingles(newScriptTokens, 3);\n\nconst newFingerprint = hashStr(newConceptSig);\nconst newScriptFingerprint = hashStr(signature(newScript));\n\n// ---------------- gather history ----------------\n\nlet pastEntries = [];\ntry {\n  const rows = $('Read Used Topics').all().map(i =\u003e i.json).filter(Boolean);\n  pastEntries = rows.map(r =\u003e ({\n    topic: String(r.topic || ''),\n    title: String(r.title || ''),\n    hook: String(r.hook || ''),\n    description: String(r.description || ''),\n    script: String(r.script || '')\n  }));\n} catch (e) {}\n\n// ---------------- thresholds ----------------\n\nconst TITLE_TOPIC_HOOK_THRESHOLD = 0.55;\nconst CONCEPT_THRESHOLD          = 0.6;   // topic+title+hook combined = \"same idea\" check\nconst SCRIPT_THRESHOLD           = 0.5;   // token overlap on full narration\nconst SCRIPT_SHINGLE_THRESHOLD   = 0.35;  // phrase-level rewrite/paraphrase detector\n\nlet isDup = false;\nlet dupReason = '';\nlet matchedAgainst = '';\n\nfor (const p of pastEntries) {\n  const pTopicNorm = normalize(p.topic);\n\n  // Layer 1: exact / substring normalized topic match (catches numbers, prefixes, suffixes, punctuation tricks)\n  if (newTopicNorm \u0026\u0026 pTopicNorm \u0026\u0026 containsOrContained(newTopicNorm, pTopicNorm)) {\n    isDup = true; dupReason = 'normalized-topic-match'; matchedAgainst = p.topic; break;\n  }\n\n  // Layer 2: canonical signature exact match (catches reordered words, disguise words, light rewrites)\n  const pTopicSig = signature(p.topic);\n  const pTitleSig = signature(p.title);\n  const pHookSig  = signature(p.hook);\n  const pConceptSig = signature(`${p.topic} ${p.title} ${p.hook}`);\n\n  if (newTopicSig \u0026\u0026 pTopicSig \u0026\u0026 newTopicSig === pTopicSig) {\n    isDup = true; dupReason = 'topic-signature-match'; matchedAgainst = p.topic; break;\n  }\n  if (newTitleSig \u0026\u0026 pTitleSig \u0026\u0026 newTitleSig === pTitleSig) {\n    isDup = true; dupReason = 'title-signature-match'; matchedAgainst = p.title; break;\n  }\n\n  // Layer 3: fingerprint hash match on combined concept\n  if (newFingerprint === hashStr(pConceptSig) \u0026\u0026 pConceptSig) {\n    isDup = true; dupReason = 'concept-fingerprint-match'; matchedAgainst = p.topic; break;\n  }\n\n  // Layer 4: token-overlap similarity (title / topic / hook individually)\n  const pTopicTokens = tokens(p.topic);\n  const pTitleTokens = tokens(p.title);\n  const pHookTokens  = tokens(p.hook);\n\n  if (jaccard(newTopicTokens, pTopicTokens) \u003e= TITLE_TOPIC_HOOK_THRESHOLD) { isDup = true; dupReason = 'topic-overlap'; matchedAgainst = p.topic; break; }\n  if (jaccard(newTitleTokens, pTitleTokens) \u003e= TITLE_TOPIC_HOOK_THRESHOLD) { isDup = true; dupReason = 'title-overlap'; matchedAgainst = p.title; break; }\n  if (newHookTokens.length \u0026\u0026 jaccard(newHookTokens, pHookTokens) \u003e= TITLE_TOPIC_HOOK_THRESHOLD) { isDup = true; dupReason = 'hook-overlap'; matchedAgainst = p.hook; break; }\n\n  // Layer 5: concept-level overlap (topic+title+hook together) -- catches \"same idea, different words everywhere\"\n  const pConceptTokens = tokens(`${p.topic} ${p.title} ${p.hook}`);\n  const newConceptTokens = tokens(`${newTopic} ${newTitle} ${newHook}`);\n  if (jaccard(newConceptTokens, pConceptTokens) \u003e= CONCEPT_THRESHOLD) {\n    isDup = true; dupReason = 'concept-overlap'; matchedAgainst = p.topic; break;\n  }\n\n  // Layer 6: script-level checks (only meaningful once history rows start storing \"script\")\n  if (p.script) {\n    const pScriptTokens = tokens(p.script);\n    if (newScriptTokens.length \u0026\u0026 jaccard(newScriptTokens, pScriptTokens) \u003e= SCRIPT_THRESHOLD) {\n      isDup = true; dupReason = 'script-overlap'; matchedAgainst = p.topic; break;\n    }\n    const pScriptShingles = shingles(pScriptTokens, 3);\n    if (newScriptShingles.length \u0026\u0026 jaccard(newScriptShingles, pScriptShingles) \u003e= SCRIPT_SHINGLE_THRESHOLD) {\n      isDup = true; dupReason = 'script-phrase-rewrite'; matchedAgainst = p.topic; break;\n    }\n    if (newScriptFingerprint === hashStr(signature(p.script))) {\n      isDup = true; dupReason = 'script-fingerprint-match'; matchedAgainst = p.topic; break;\n    }\n  }\n\n  // Layer 7: description overlap (thumbnail/description swap disguise)\n  if (p.description \u0026\u0026 newDesc) {\n    const pDescTokens = tokens(p.description);\n    const newDescTokens = tokens(newDesc);\n    if (jaccard(newDescTokens, pDescTokens) \u003e= 0.65) {\n      isDup = true; dupReason = 'description-overlap'; matchedAgainst = p.topic; break;\n    }\n  }\n}\n\nconst MAX_RETRIES = 5;\nlet decision = 'ok';\nif (isDup) {\n  wf.dupAttempts++;\n  // after MAX_RETRIES failed unique attempts in a row, let it through rather than stalling the run forever\n  decision = (wf.dupAttempts \u003e= MAX_RETRIES) ? 'ok' : 'dup';\n} else {\n  wf.dupAttempts = 0;\n}\n\n// Flag the reusable Finder's next task (only consumed if the semantic\n// AI check actually runs - i.e. isDup is still false after this check).\nwf.taskType = 'semanticdup';\n\nreturn {\n  json: {\n    ...data,\n    decision,\n    isDup,\n    dupReason,\n    matchedAgainst,\n    dupAttempts: wf.dupAttempts,\n    script: newScript,\n    scriptFingerprint: newScriptFingerprint,\n    conceptFingerprint: newFingerprint\n  }\n};",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "30d24930-21bd-4942-8131-d14b47e2b9ed",
+      "name": "Duplicate Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        1160
+      ],
+      "parameters": {
+        "amount": 20
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "d6ec5954-b118-4b36-9d58-fdecebba7535",
+      "name": "Ensure Scenes Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        680
+      ],
+      "parameters": {
+        "jsCode": "let data = $json;\nif (!data || !Array.isArray(data.scenes) || data.scenes.length === 0) {\n  const cat = data \u0026\u0026 (data.topic || data.title) ? (data.topic || data.title) : 'general';\n  data = {\n    ...data,\n    title: (data \u0026\u0026 data.title) || 'Amazing Facts',\n    topic: (data \u0026\u0026 data.topic) || cat,\n    hook: (data \u0026\u0026 data.hook) || 'fallback dynamic hook',\n    description: (data \u0026\u0026 data.description) || `Mind-blowing ${cat} facts you never knew. Follow for daily shorts!`,\n    tags: (data \u0026\u0026 Array.isArray(data.tags) \u0026\u0026 data.tags.length) ? data.tags : ['science','technology','facts','shorts','education'],\n    scenes: [\n      { scene:1, voice:`Here are five surprising facts about ${cat} you probably never knew.`, image_prompt:`cinematic vertical 9:16 dramatic ${cat} scene photorealistic lighting` },\n      { scene:2, voice:`Scientists recently discovered something surprising about ${cat}.`, image_prompt:`cinematic vertical 9:16 laboratory discovery ${cat} dramatic lighting photorealistic` },\n      { scene:3, voice:`This hidden detail about ${cat} is stranger than most people imagine.`, image_prompt:`cinematic vertical 9:16 mysterious ${cat} close up dramatic photorealistic` },\n      { scene:4, voice:`Experts still debate this ${cat} mystery because the answer sounds impossible.`, image_prompt:`cinematic vertical 9:16 intense ${cat} phenomenon glowing dramatic photorealistic` },\n      { scene:5, voice:`The story of ${cat} is only beginning, so follow for more.`, image_prompt:`cinematic vertical 9:16 vast dramatic ${cat} reveal glowing photorealistic` }\n    ]\n  };\n} else {\n  data = { ...data, scenes: data.scenes.map((s,i)=\u003e({...s, scene: i+1})) };\n}\nreturn { json: data };",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "9e103329-f2f1-4165-9e25-5812b948010f",
+      "name": "Error Cleanup",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -1400,
+        1460
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "8ed84c16-11bd-4769-ac86-8f06f6efb23f",
+      "name": "Error Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1600,
+        1460
+      ],
+      "parameters": {
+        "jsCode": "// Fixed: read-only error crash এড়াতে $json থেকে safely field নেওয়া হচ্ছে।\nconst e = $json || {};\nlet node='unknown', message='unknown error', wfName='Auto YouTube Shorts';\ntry { node = e.execution \u0026\u0026 e.execution.lastNodeExecuted ? e.execution.lastNodeExecuted : 'unknown'; } catch(err){}\ntry { message = (e.execution \u0026\u0026 e.execution.error \u0026\u0026 e.execution.error.message) ? String(e.execution.error.message) : JSON.stringify(e).slice(0,300); } catch(err){ message='error serialization failed'; }\ntry { wfName = (e.workflow \u0026\u0026 e.workflow.name) ? e.workflow.name : wfName; } catch(err){}\nconst log = { status:'FAILED', workflow:wfName, node, message, timestamp:new Date().toISOString() };\nconsole.error('[ERROR LOG]', JSON.stringify(log));\nreturn { json: log };",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "d28cc452-ece6-4f6e-802b-0c00fc69fc62",
+      "name": "Error Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1200,
+        1460
+      ],
+      "parameters": {
+        "body": "{\n  \"text\": \"Workflow FAILED at node: {{ $node[\"Error Log\"].json.node }}\\nError: {{ $node[\"Error Log\"].json.message }}\\nTime: {{ $node[\"Error Log\"].json.timestamp }}\"\n}",
+        "method": "POST",
+        "url": "{{ $env.NOTIFY_WEBHOOK_URL }}"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "b296dfb1-496f-45b1-b879-3c994614389e",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1800,
+        1460
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "471f5eef-bdcc-4b27-b6f6-dce424f26354",
+      "name": "Execution Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3800,
+        1060
+      ],
+      "parameters": {
+        "jsCode": "const meta=$node(\"Build YT Meta\").json;\nlet renderSec='n/a';\ntry{const raw=$readFileText('/tmp/render_start');const start=parseInt(String(raw||'').trim());if(!isNaN(start)){renderSec=Math.round(Date.now()/1000)-start;}}catch(e){}\nconst log={status:'SUCCESS',workflow:'Auto YouTube Shorts (v9)',title:meta.title,topic:meta.topic,videoId:$node(\"YouTube Upload (Scheduled)\").json.id,publishAt:meta.publishAt,sceneCount:$node(\"Wait All Scenes\").json.sceneCount,renderTimeSec:renderSec,timestamp:new Date().toISOString()};\nconsole.log('[EXEC LOG]',JSON.stringify(log));\nreturn {json:log};",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "2129d4a8-0399-4510-a4bd-560c2c8189f6",
+      "name": "Extract Google Trends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        960
+      ],
+      "parameters": {
+        "jsCode": "// Google Trends parse + store combined trending context.\nlet terms = [];\ntry {\n  const j = $input.first().json;\n  const raw = String(j.data ?? j.body ?? j ?? '');\n  const matches = [...raw.matchAll(/\u003ctitle\u003e(.*?)\u003c\\/title\u003e/g)].map(m =\u003e m[1]).filter(Boolean);\n  terms = matches.filter(t =\u003e !/daily search trends/i.test(t)).slice(0, 20);\n} catch(e) {}\nlet ytTrends = [];\ntry { ytTrends = $node(\"Extract YouTube Trends\").json.youtubeTrends || []; } catch(e) {}\nconst wf = $getWorkflowStaticData('global');\nconst combined = [...new Set([...ytTrends, ...terms])].filter(Boolean).slice(0, 15);\nwf.trendingContext = combined.join(' | ');\nreturn [{ json: { googleTrends: terms, trendingContextStored: wf.trendingContext } }];"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "8416b33c-2ea1-4459-bcf8-2c0411f83ef9",
+      "name": "Extract Wiki Topics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        960
+      ],
+      "parameters": {
+        "jsCode": "let obscureTopics = [];\ntry {\n  const list = $input.first().json.query?.random || [];\n  obscureTopics = list.map(x =\u003e x.title).filter(Boolean);\n} catch(e) { obscureTopics = []; }\n\n// filter out titles that make bad 45s Shorts fodder: lists, disambiguation, pure place/admin stubs\nconst BAD = /^(list of|category:|template:|disambiguation|index of)/i;\nobscureTopics = obscureTopics.filter(t =\u003e !BAD.test(t));\n\nreturn [{ json: { obscureTopics: obscureTopics.join(', ') } }];"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "4be17fce-7c4a-47f4-8995-d16bfd91d6ab",
+      "name": "Extract YouTube Trends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1200,
+        960
+      ],
+      "parameters": {
+        "jsCode": "let titles = [];\ntry {\n  const body = $input.first().json;\n  const items = body.items || [];\n  titles = items.map(v =\u003e v.snippet \u0026\u0026 v.snippet.title).filter(Boolean).slice(0, 20);\n} catch(e) {}\nreturn [{ json: { youtubeTrends: titles } }];"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "ec67ad65-9aa1-412b-bc67-fbd75799ea40",
+      "name": "Fetch Google Trends RSS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1000,
+        960
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://trends.google.com/trending/rss?geo=US"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "7711f1fc-f337-4081-97e2-21016fbde589",
+      "name": "Fetch Obscure Wiki Topics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -240,
+        960
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://en.wikipedia.org/w/api.php?action=query\u0026list=random\u0026rnnamespace=0\u0026rnlimit=5\u0026format=json"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "1592460a-c925-4b99-ae61-af6f27b35ddc",
+      "name": "Fetch YouTube Trending",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1400,
+        960
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics\u0026chart=mostPopular\u0026regionCode=US\u0026maxResults=2\u0026key={{ $env.YOUTUBE_DATA_API_KEY }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "f2592a84-a0f6-4c18-a68b-1019eda81e74",
+      "name": "Generate Thumbnail",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2200,
+        1060
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''test -s /tmp/thumb_src.jpg \u0026\u0026 ffmpeg -y -threads 1 -i /tmp/thumb_src.jpg -vf \"scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720\" -q:v 4 /tmp/thumb.jpg \u0026\u0026 rm -f /tmp/thumb_src.jpg /tmp/scene_*.jpg \u0026\u0026 echo THUMB_OK'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "5428cd89-5479-45a1-85d5-5fa632584e00",
+      "name": "Get Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1800,
+        760
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "{{ $json.url }}"
+      },
+      "continueOnFail": true,
+      "onError": "continueErrorOutput",
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "d3c400e2-f369-4401-a03e-3c9e28863453",
+      "name": "Gmail Error",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -1200,
+        1640
+      ],
+      "parameters": {
+        "message": "\u003ch2 style=\"color:red;\"\u003e❌ YouTube Shorts Workflow Failed\u003c/h2\u003e\u003chr\u003e\u003cp\u003e\u003cstrong\u003eNode:\u003c/strong\u003e {{ $node[\"Error Log\"].json.node }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eError:\u003c/strong\u003e {{ $node[\"Error Log\"].json.message }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eTime:\u003c/strong\u003e {{ $node[\"Error Log\"].json.timestamp }}\u003c/p\u003e",
+        "subject": "❌ Workflow Failed: {{ $node[\"Error Log\"].json.node }}",
+        "to": "mdanasali9810@gmail.com"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmailOAuth2",
+          "name": "gmailOAuth2"
+        }
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "60a482d7-278e-4026-a177-d87768192ada",
+      "name": "Gmail Success",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4000,
+        1160
+      ],
+      "parameters": {
+        "message": "\u003ch2 style=\"color:green;\"\u003e✅ YouTube Shorts Uploaded Successfully\u003c/h2\u003e\u003chr\u003e\u003cp\u003e\u003cstrong\u003eTitle:\u003c/strong\u003e {{ $json.title }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eTopic:\u003c/strong\u003e {{ $json.topic }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eVideo ID:\u003c/strong\u003e {{ $json.videoId }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eScenes:\u003c/strong\u003e {{ $json.sceneCount }}\u003c/p\u003e\u003cp\u003e\u003cstrong\u003eRender Time:\u003c/strong\u003e {{ $json.renderTimeSec }} seconds\u003c/p\u003e\u003cp\u003e\u003cstrong\u003ePublish Time:\u003c/strong\u003e {{ $json.publishAt }}\u003c/p\u003e\u003chr\u003e",
+        "subject": "{{ $node[\"Build YT Meta\"].json.title }}",
+        "to": "anas015987@gmail.com"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmailOAuth2",
+          "name": "gmailOAuth2"
+        }
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "95d03d76-394d-4e0e-bcf7-ffe0d4716c06",
+      "name": "Grammar QC Precheck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        860
+      ],
+      "parameters": {
+        "jsCode": "// CODE-FIRST grammar + QC validation. Deterministic only - no AI, no\n// network call here. Flags (a) grammar/QC issues, and (b) up to 2 specific,\n// checkable factual claims for the next node (Lightweight Fact Lookup) to\n// verify online. The actual AI-need decision is made after that lookup.\nconst d = $json;\nconst issues = [];\n\n// --- QC: required fields / schema -----------------------------------------\nif (!d.title) issues.push('missing_title');\nif (!d.topic) issues.push('missing_topic');\nif (!d.description) issues.push('missing_description');\nif (!Array.isArray(d.tags) || d.tags.length === 0) issues.push('missing_tags');\nif (!Array.isArray(d.scenes) || d.scenes.length !== 5) issues.push('bad_scene_count');\n\nconst scenes = Array.isArray(d.scenes) ? d.scenes : [];\n\n// --- Grammar/QC: per-scene deterministic checks + claim extraction --------\nconst factClaims = [];\nscenes.forEach((s, i) =\u003e {\n  const voice = String((s \u0026\u0026 s.voice) || '').trim();\n  const img = String((s \u0026\u0026 s.image_prompt) || '').trim();\n\n  if (!voice) { issues.push(`scene_${i + 1}_empty_voice`); return; }\n  if (!img) issues.push(`scene_${i + 1}_empty_image_prompt`);\n\n  const wc = voice.split(/\\s+/).filter(Boolean).length;\n  if (wc \u003c 10 || wc \u003e 30) issues.push(`scene_${i + 1}_word_count_${wc}`);\n\n  if (/\\s{2,}/.test(voice)) issues.push(`scene_${i + 1}_double_space`);\n  if (!/[.!?]$/.test(voice)) issues.push(`scene_${i + 1}_no_terminal_punctuation`);\n  if (/\\b(\\w+)\\s+\\1\\b/i.test(voice)) issues.push(`scene_${i + 1}_repeated_word`);\n  if (/^[a-z]/.test(voice)) issues.push(`scene_${i + 1}_not_capitalized`);\n\n  // A scene carrying a specific number or a two-word capitalized entity is\n  // worth a genuine fact-check pass; pure narrative filler is not.\n  // Capture the actual matched text as the online search term (bounded to\n  // the first 2 claims found across the whole script - keeps the next\n  // node's network usage small and predictable).\n  if (factClaims.length \u003c 2) {\n    const entityMatch = voice.match(/\\b[A-Z][a-z]+\\s+[A-Z][a-z]+\\b/);\n    const numberMatch = voice.match(/\\b\\d{2,}\\b[^.?!]*/);\n    const term = entityMatch ? entityMatch[0] : (numberMatch ? `${d.topic || ''} ${numberMatch[0]}`.trim() : null);\n    if (term) factClaims.push({ scene: i + 1, searchTerm: term.slice(0, 100) });\n  }\n});\n\nconst grammarPass = issues.length === 0;\nconst qcPass = !issues.some(i =\u003e i.startsWith('missing_') || i === 'bad_scene_count');\n\nreturn { json: {\n  title: d.title,\n  topic: d.topic,\n  hook: d.hook || (scenes[0] ? scenes[0].voice : ''),\n  description: d.description,\n  tags: d.tags,\n  scenes,\n  factCheckApplied: false,\n  grammarPass,\n  qcPass,\n  qcIssues: issues,\n  factClaims\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "f2ba1585-2de6-4d0c-8dc0-393d19dbe59a",
+      "name": "Guard All Clips",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        1060
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''MISSING=\"\"; for i in 1 2 3 4 5; do   if [ ! -s \"/tmp/clip_${i}.mp4\" ]; then     MISSING=\"$MISSING $i\";   fi; done; N=$(ls /tmp/clip_*.mp4 2\u003e/dev/null | wc -l); echo CLIPS_READY_${N}_OF_5; if [ -n \"$MISSING\" ]; then   echo MISSING_SCENES:${MISSING};   for i in $MISSING; do     echo --- scene ${i} diagnostics ---;     ls -la /tmp/scene_${i}.jpg /tmp/scene_${i}.mp3 2\u003e\u00261;     if [ -f /tmp/ffmpeg_err_${i}.log ]; then echo ffmpeg_err_${i}.log:; tail -c 400 /tmp/ffmpeg_err_${i}.log; fi;   done;   echo NOT_ALL_CLIPS_YET; exit 1; fi; echo ALL_CLIPS_OK'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "continueOnFail": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "c089e2bd-5b24-40f9-831c-c2eab7d345ec",
+      "name": "Is Unique?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        600,
+        960
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.decision }}",
+            "operator": "equals",
+            "right": "ok"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "c7179a9b-a021-4a38-9aba-3a5b439ff1d5",
+      "name": "Lightweight Fact Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        270,
+        860
+      ],
+      "parameters": {
+        "jsCode": "// REAL lightweight ONLINE verification for factual claims the deterministic\n// pass flagged - not AI. Uses Wikipedia's public search API (free, no auth,\n// tiny JSON, short timeout). Bounded to at most 2 lookups per run.\n//\n// PASS      = a claim's search term matched a clearly-relevant article.\n// FAIL      = a claim's search term returned zero results at all (strong\n//             lightweight signal the named entity/claim doesn't exist).\n// UNCERTAIN = ambiguous match, lookup error, or claim genuinely needs a\n//             judgment call this simple lookup can't make -\u003e AI last resort.\n//\n// If deterministic checks found no checkable claim, no network call is made\n// at all and this is an immediate PASS.\nconst d = $json;\nconst claims = Array.isArray(d.factClaims) ? d.factClaims.slice(0, 2) : [];\n\nasync function lookup(term) {\n  try {\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://en.wikipedia.org/w/api.php',\n      qs: { action: 'query', list: 'search', srsearch: term, srlimit: 1, format: 'json' },\n      timeout: 4000,\n      json: true\n    });\n    const hits = (res \u0026\u0026 res.query \u0026\u0026 Array.isArray(res.query.search)) ? res.query.search : [];\n    if (!hits.length) return 'no-match';\n    const claimTokens = new Set(String(term).toLowerCase().split(/\\s+/).filter(w =\u003e w.length \u003e 3));\n    const titleTokens = String(hits[0].title || '').toLowerCase().split(/\\s+/);\n    return titleTokens.some(w =\u003e claimTokens.has(w)) ? 'match' : 'weak-match';\n  } catch (e) {\n    return 'lookup-error';\n  }\n}\n\nlet results = [];\nlet factStatus = 'PASS';\nlet factCheckSkippedReason = 'no-claim-detected';\n\nif (claims.length \u0026\u0026 this \u0026\u0026 this.helpers \u0026\u0026 typeof this.helpers.httpRequest === 'function') {\n  factCheckSkippedReason = null;\n  for (const c of claims) {\n    results.push({ scene: c.scene, term: c.searchTerm, result: lookup.call(this, c.searchTerm) });\n  }\n  const outcomes = results.map(r =\u003e r.result);\n  if (outcomes.some(o =\u003e o === 'match')) {\n    factStatus = 'PASS';\n  } else if (outcomes.length \u0026\u0026 outcomes.every(o =\u003e o === 'no-match')) {\n    factStatus = 'FAIL';\n  } else {\n    factStatus = 'UNCERTAIN'; // weak-match / lookup-error / mixed -\u003e genuinely unresolved\n  }\n} else if (claims.length) {\n  // httpRequest helper unavailable in this runtime - fail safe to UNCERTAIN\n  // rather than silently skipping verification or crashing the run.\n  factStatus = 'UNCERTAIN';\n  factCheckSkippedReason = 'httpRequest-helper-unavailable';\n}\n\n// AI is invoked ONLY when grammar failed deterministically, or the online\n// verification above could not confidently resolve the claim (UNCERTAIN).\n// A successful PASS or FAIL never triggers AI.\nconst needsAiCheck = !d.grammarPass || factStatus === 'UNCERTAIN';\n\nif (needsAiCheck) {\n  // Flag the reusable Finder's next task in workflow static data (survives\n  // the Loop Wait retry loop untouched, unlike the item chain).\n  $getWorkflowStaticData('global').taskType = 'factgrammar';\n}\n\nreturn { json: {\n  title: d.title,\n  topic: d.topic,\n  hook: d.hook,\n  description: d.description,\n  tags: d.tags,\n  scenes: d.scenes,\n  factCheckApplied: false,\n  grammarPass: d.grammarPass,\n  qcPass: d.qcPass,\n  qcIssues: d.qcIssues,\n  factStatus,\n  factCheckSkippedReason,\n  factLookupResults: results,\n  needsAiCheck\n} };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "94727652-6f5a-4edb-9134-ee7561cdf863",
+      "name": "Loop One By One",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        860
+      ],
+      "parameters": {
+        "options": {}
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "134da4a8-1dee-4639-83d3-3ec0e108d175",
+      "name": "Loop Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        1280
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.decision }}",
+            "operator": "equals",
+            "right": "success"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "412dafd6-6cb3-4428-8883-b4828c2e561e",
+      "name": "Loop Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        260,
+        1480
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "b7999c0c-2dc6-4e1c-9cc5-7c0813dc3921",
+      "name": "Make Clip",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        3020,
+        760
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''IDX={{ $node[\"Prep Scene\"].json.idx }}; CLIP=/tmp/clip_${IDX}.mp4; if [ -s \"$CLIP\" ]; then echo CLIP_${IDX}_ALREADY_OK; exit 0; fi; if [ ! -s /tmp/scene_${IDX}.jpg ]; then echo MISSING_IMAGE_${IDX}; exit 1; fi; if [ ! -s /tmp/scene_${IDX}.mp3 ]; then echo MISSING_AUDIO_${IDX}; exit 1; fi; ADUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/scene_${IDX}.mp3 2\u003e/dev/null); ADUR=${ADUR:-8}; CDUR=$(awk \"BEGIN{a=$ADUR; p=a+0.6; min=6.0; max=12.0; d=(p\u003emin)?p:min; d=(d\u003cmax)?d:max; printf \\\"%.3f\\\", d}\"); echo ENCODING_${IDX}_DUR_${CDUR}; ffmpeg -y -threads 1 -loop 1 -i /tmp/scene_${IDX}.jpg -i /tmp/scene_${IDX}.mp3 -c:v libx264 -tune stillimage -preset ultrafast -crf 32 -x264-params ref=1:bframes=0 -g 36 -vf \"scale=432:768:force_original_aspect_ratio=decrease,pad=432:768:(ow-iw)/2:(oh-ih)/2,setsar=1\" -c:a aac -b:a 96k -ar 44100 -ac 1 -pix_fmt yuv420p -r 18 -t $CDUR \"$CLIP\" 2\u003e/tmp/ffmpeg_err_${IDX}.log; FFRC=$?; if [ \"$FFRC\" != \"0\" ] || [ ! -s \"$CLIP\" ]; then echo FFMPEG_FAILED_${IDX}_RC_${FFRC}; tail -c 400 /tmp/ffmpeg_err_${IDX}.log 2\u003e/dev/null; exit 1; fi; DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"$CLIP\"); echo \"${IDX}|$DUR|{{ $node[\"Prep Scene\"].json.voiceSrtSafe }}\" \u003e\u003e /tmp/srt_lines.txt \u0026\u0026 cp -f /tmp/scene_1.jpg /tmp/thumb_src.jpg 2\u003e/dev/null; echo CLIP_${IDX}_OK_${DUR}'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "c9140e94-c0c6-4324-8015-1db87013082e",
+      "name": "Merge Semantic Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        1200
+      ],
+      "parameters": {
+        "jsCode": "let aiDup = false;\nlet aiReason = '';\nlet aiMatched = '';\ntry {\n  const raw = $json?.candidates?.[0]?.content?.parts?.[0]?.text\n      ?? $json?.choices?.[0]?.message?.content\n      ?? '';\n  const cleaned = String(raw).replace(/^```json\\s*/i, '').replace(/```$/i, '').trim();\n  const parsed = JSON.parse(cleaned);\n  aiDup = !!parsed.duplicate;\n  aiReason = String(parsed.reason || '');\n  aiMatched = String(parsed.matched || '');\n} catch (e) {\n  // if the AI check itself fails/errors, do NOT block the pipeline on it -- heuristic Dedupe Check already ran\n  aiDup = false;\n  aiReason = 'ai-check-unavailable';\n}\n\nconst prev = $node(\"Dedupe Check\").json;\nconst finalIsDup = prev.isDup || aiDup;\nconst finalDecision = finalIsDup \u0026\u0026 prev.dupAttempts \u003c 5 ? 'dup' : 'ok';\n\nreturn {\n  json: {\n    ...prev,\n    aiDup,\n    aiReason,\n    aiMatched,\n    decision: finalDecision\n  }\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "a6f401c2-ecd9-4a69-890c-0438afa99c83",
+      "name": "Model Controller",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        1280
+      ],
+      "parameters": {
+        "jsCode": "const wf = $getWorkflowStaticData('global');\nif (typeof wf.modelAttempt !== 'number') wf.modelAttempt = 0;\n\n// ---- Provider circuit-breaker state (existing static data: wf.providerState) ----\n// Entry: { provider, status:'cooldown', reason, cooldownUntil, execId, setAt }\n// cooldownUntil = provider's reset timestamp (survives executions until it passes).\n// No reset timestamp -\u003e execution-scoped: valid only for this execution id (30 min cap),\n// so a stale entry can never disable a provider permanently.\nlet execId = 'na';\ntry { execId = String(($execution \u0026\u0026 $execution.id) || 'na'); } catch (e) { execId = 'na'; }\nfunction providerBlocked(p) {\n  const st = wf.providerState \u0026\u0026 wf.providerState[p];\n  if (!st) return false;\n  const now = Date.now();\n  if (st.cooldownUntil) {\n    if (now \u003c st.cooldownUntil) return true;\n  } else if (st.execId === execId \u0026\u0026 (now - (st.setAt || 0)) \u003c 30 * 60 * 1000) {\n    return true;\n  }\n  delete wf.providerState[p];\n  return false;\n}\n// Validate Attempt sets retrySame for the single allowed transient retry: same model, no re-discovery.\nconst isRetry = wf.retrySame === true;\nwf.retrySame = false;\nconst taskType = wf.taskType || 'script';\n\n// ---------------------------------------------------------------------------\n// SHARED MODEL FINDER - the ONE reusable instance for every AI checkpoint in\n// this workflow (Script Writer, Fact \u0026 Grammar Checker, AI Semantic Duplicate\n// Check). Do not create a second Finder anywhere else.\n//\n// AUTOMATIC RUNTIME DISCOVERY (no permanently-disabled providers):\n// every provider below is checked, every run: (1) required credential(s)\n// present via env, (2) the provider's own metadata/models endpoint is queried\n// to see what is CURRENTLY listed, (3) that live result is intersected with\n// this file's documented free-tier candidates (or, for OpenRouter/Together,\n// filtered directly on the provider's own live $0 pricing field - no\n// candidate list needed at all). A provider that cannot currently prove a\n// free model contributes ZERO entries to the queue and is skipped THIS RUN\n// only - nothing is hardcoded off. If a provider's pricing/availability\n// changes tomorrow, tomorrow's discovery reflects that automatically.\n//\n// Two verification tiers, both computed live, never assumed:\n//   'live-pricing'                      - the provider's own API returns a\n//                                          numeric per-model price; only\n//                                          entries priced exactly 0/0 pass.\n//                                          Verified current official\n//                                          endpoints that expose this today:\n//                                          OpenRouter (GET /api/v1/models,\n//                                          pricing.prompt/completion),\n//                                          Together (GET /v1/models,\n//                                          pricing.input/output), DeepInfra\n//                                          (GET api.deepinfra.com/models/list,\n//                                          public/keyless native catalog,\n//                                          pricing.cents_per_input_token/\n//                                          cents_per_output_token),\n//                                          Hugging Face router (GET\n//                                          router.huggingface.co/v1/models,\n//                                          per-provider pricing.input/output\n//                                          in USD/M tokens plus an is_free\n//                                          promo flag), and SambaNova (GET\n//                                          /v1/models, pricing.prompt/\n//                                          completion - confirmed in\n//                                          SambaNova's published OpenAPI\n//                                          spec).\n//   'existence-probe+documented-free'   - the provider's API does not expose\n//                                          machine-readable pricing, so we\n//                                          probe that our documented\n//                                          candidate model is CURRENTLY\n//                                          listed/enabled for this credential\n//                                          (proves it isn't renamed/removed/\n//                                          gated) and combine that with a\n//                                          maintained free-tier record.\n//                                          Used today for Google Gemini,\n//                                          Cerebras, Groq, and Cloudflare\n//                                          Workers AI (whose free daily\n//                                          Neuron allocation is documented,\n//                                          not per-model priced).\n// A provider with neither signal available returns zero models -\u003e UNKNOWN\n// -\u003e BLOCKED for this run, every run, until a real discovery signal exists.\n//\n// Providers are tried in this fixed priority order. ALL verified-free models\n// of a provider are exhausted before moving to the next provider. The first\n// model that returns a valid result (see Validate Attempt) wins immediately.\n//\n// ZERO-BILLING HARD LOCK: never a paid, trial-credit-only, unknown-price, or\n// auto/default/best/latest/pro/premium-routed model, ever, as primary,\n// fallback, or last resort. See finalBillingGuard() below - it runs on every\n// single candidate before it can ever become an actual HTTP request.\n// ---------------------------------------------------------------------------\nconst BILLING_MODE = 'free_only';\nconst PROVIDER_ORDER = ['openrouter', 'google', 'cerebras', 'groq', 'huggingface', 'deepinfra', 'together', 'sambanova', 'cloudflare'];\nconst PROVIDER_ALLOWLIST = new Set(PROVIDER_ORDER);\nconst APPROVED_ENDPOINTS = new Set(PROVIDER_ORDER);\n// Router/auto-selector \"models\" are never a fixed, audited model - block by\n// exact id regardless of any reported price.\nconst ROUTER_MODEL_DENYLIST = new Set(['openrouter/free', 'openrouter/auto', 'openrouter/auto-beta']);\n// Blocks any model id containing a standalone auto/default/best/latest/pro/\n// premium/paid token (word-boundary on typical model-id punctuation), e.g.\n// \"gemini-2.5-pro\" or \"openai/gpt-5-pro\" - but NOT substrings inside a real\n// word (does not false-positive on things like \"processor\" or \"protocol\").\nconst FORBIDDEN_MODEL_PATTERN = /(^|[\\/\\-_.:\\s])(auto|default|best|latest|pro|premium|paid)([\\/\\-_.:\\s]|$)/i;\nconst AUTH_ENV_BY_TYPE = {\n  openrouter: 'OPENROUTER_API_KEY',\n  cerebras: 'CEREBRAS_API_KEY',\n  groq: 'GROQ_API_KEY',\n  cloudflare: 'CLOUDFLARE_API_TOKEN',\n  huggingface: 'HF_TOKEN',\n  deepinfra: 'DEEPINFRA_API_KEY',\n  together: 'TOGETHER_API_KEY',\n  sambanova: 'SAMBANOVA_API_KEY'\n  // google uses x-goog-api-key (GEMINI_API_KEY), handled separately below -\n  // it must never be sent as a Bearer Authorization value or a URL param.\n};\nconst CHAT_ENDPOINTS = {\n  openrouter: 'https://openrouter.ai/api/v1/chat/completions',\n  cerebras: 'https://api.cerebras.ai/v1/chat/completions',\n  groq: 'https://api.groq.com/openai/v1/chat/completions',\n  // Verified against router.huggingface.co's own OpenAI-compatible chat\n  // completions docs. Model id must be sent as \"\u003cmodelId\u003e:\u003cproviderName\u003e\"\n  // (e.g. \"zai-org/GLM-5.3:baseten\") - discoverHuggingFace() below builds\n  // candidates in exactly that composite form.\n  huggingface: 'https://router.huggingface.co/v1/chat/completions',\n  // Verified against DeepInfra's official chat docs (docs.deepinfra.com).\n  deepinfra: 'https://api.deepinfra.com/v1/openai/chat/completions',\n  // Verified against Together's current official docs (docs.together.ai).\n  together: 'https://api.together.ai/v1/chat/completions',\n  // Verified against SambaNova's published OpenAPI spec (docs.sambanova.ai).\n  sambanova: 'https://api.sambanova.ai/v1/chat/completions'\n  // google and cloudflare are built dynamically (model-in-path / account-id-\n  // in-path respectively) in the request-building block below.\n};\n\n// Never leak a raw error (which could echo request context) - reduce every\n// discovery failure to a fixed, non-secret reason string.\nasync function httpGetJson(helpers, url, headers, timeoutMs) {\n  try {\n    const res = await helpers.httpRequest({ method: 'GET', url, headers: headers || {}, timeout: timeoutMs || 7000, json: true });\n    return { ok: true, data: res };\n  } catch (e) {\n    return { ok: false };\n  }\n}\n\n// --- Tier: live-pricing (the provider's own API returns a numeric price) ---\n\nasync function discoverOpenRouter(helpers, env) {\n  if (!env.OPENROUTER_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  const r = await httpGetJson(helpers, 'https://openrouter.ai/api/v1/models', { Authorization: `Bearer ${env.OPENROUTER_API_KEY}` });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const models = r.data.data\n    .filter(m =\u003e m \u0026\u0026 typeof m.id === 'string' \u0026\u0026 m.pricing\n      \u0026\u0026 Number(m.pricing.prompt) === 0 \u0026\u0026 Number(m.pricing.completion) === 0\n      \u0026\u0026 !ROUTER_MODEL_DENYLIST.has(m.id))\n    .map(m =\u003e m.id)\n    .slice(0, 20);\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-zero-price-model', models, tier: 'live-pricing' };\n}\n\nasync function discoverTogether(helpers, env) {\n  if (!env.TOGETHER_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  // api.together.ai is Together's current documented domain (docs.together.ai/reference/models);\n  // api.together.xyz remains a live alias but api.together.ai is what's verified official today.\n  const r = await httpGetJson(helpers, 'https://api.together.ai/v1/models', { Authorization: `Bearer ${env.TOGETHER_API_KEY}` });\n  if (!r.ok || !Array.isArray(r.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const models = r.data\n    .filter(m =\u003e m \u0026\u0026 typeof m.id === 'string' \u0026\u0026 m.pricing\n      \u0026\u0026 Number(m.pricing.input) === 0 \u0026\u0026 Number(m.pricing.output) === 0)\n    .map(m =\u003e m.id)\n    .slice(0, 20);\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-model-with-verified-zero-price', models, tier: 'live-pricing' };\n}\n\n// --- Tier: existence-probe + documented free-tier (no live pricing field) ---\n\nasync function discoverGoogle(helpers, env) {\n  if (!env.GEMINI_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  const r = await httpGetJson(helpers, 'https://generativelanguage.googleapis.com/v1beta/models', { 'x-goog-api-key': env.GEMINI_API_KEY });\n  if (!r.ok || !r.data || !Array.isArray(r.data.models)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const liveIds = new Set(r.data.models.map(m =\u003e String((m \u0026\u0026 m.name) || '').replace(/^models\\//, '')));\n  // gemini-2.5-pro is intentionally NEVER in this list - see FORBIDDEN_MODEL_PATTERN for the executable guard too.\n  const FREE_TIER_CANDIDATES = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];\n  const models = FREE_TIER_CANDIDATES.filter(id =\u003e liveIds.has(id));\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-candidate-currently-listed', models, tier: 'existence-probe+documented-free' };\n}\n\nasync function discoverCerebras(helpers, env) {\n  if (!env.CEREBRAS_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  const r = await httpGetJson(helpers, 'https://api.cerebras.ai/v1/models', { Authorization: `Bearer ${env.CEREBRAS_API_KEY}` });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const liveIds = new Set(r.data.data.map(m =\u003e m \u0026\u0026 m.id));\n  const FREE_TIER_CANDIDATES = ['llama-3.3-70b', 'qwen-3-32b', 'llama-4-scout-17b-16e-instruct', 'deepseek-r1-distill-llama-70b'];\n  const models = FREE_TIER_CANDIDATES.filter(id =\u003e liveIds.has(id));\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-candidate-currently-listed', models, tier: 'existence-probe+documented-free' };\n}\n\nasync function discoverGroq(helpers, env) {\n  if (!env.GROQ_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  const r = await httpGetJson(helpers, 'https://api.groq.com/openai/v1/models', { Authorization: `Bearer ${env.GROQ_API_KEY}` });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const liveIds = new Set(r.data.data.map(m =\u003e m \u0026\u0026 m.id));\n  const FREE_TIER_CANDIDATES = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3-32b'];\n  const models = FREE_TIER_CANDIDATES.filter(id =\u003e liveIds.has(id));\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-candidate-currently-listed', models, tier: 'existence-probe+documented-free' };\n}\n\nasync function discoverCloudflare(helpers, env) {\n  if (!env.CLOUDFLARE_API_TOKEN || !env.CLOUDFLARE_ACCOUNT_ID) return { available: false, reason: 'missing-credential', models: [] };\n  const url = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai/models/search?per_page=100`;\n  const r = await httpGetJson(helpers, url, { Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}` });\n  if (!r.ok || !r.data || r.data.success !== true || !Array.isArray(r.data.result)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const liveIds = new Set(r.data.result.map(m =\u003e m \u0026\u0026 m.name));\n  const FREE_TIER_CANDIDATES = ['@cf/meta/llama-3.1-8b-instruct-fast', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/qwen/qwen3-30b-a3b-fp8'];\n  const models = FREE_TIER_CANDIDATES.filter(id =\u003e liveIds.has(id));\n  // Cloudflare Workers AI Free plan: requests beyond the daily neuron quota\n  // are REJECTED, never auto-billed - satisfies fail-closed billing safety\n  // even without a live per-model USD price field.\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-candidate-currently-listed', models, tier: 'existence-probe+free-quota-not-auto-billed' };\n}\n\n// --- Tier: live-pricing, verified 2026 against each provider's own docs ---\n// Hugging Face, DeepInfra and SambaNova each expose real machine-readable\n// per-model pricing today (confirmed against current official docs/OpenAPI\n// specs below) - none of them are \"no endpoint\" placeholders any more.\n\nasync function discoverHuggingFace(helpers, env) {\n  if (!env.HF_TOKEN) return { available: false, reason: 'missing-credential', models: [] };\n  // Verified: huggingface.co/docs/inference-providers/hub-api#list-openai-compatible-models\n  // Each model lists one entry per serving provider; a provider entry may carry\n  // pricing.input/output (USD per million tokens) and/or is_free (temporary\n  // promo flag). We treat either signal as proof of FREE - never trial credit.\n  const r = await httpGetJson(helpers, 'https://router.huggingface.co/v1/models', { Authorization: `Bearer ${env.HF_TOKEN}` });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const models = [];\n  for (const m of r.data.data) {\n    if (!m || typeof m.id !== 'string' || !Array.isArray(m.providers)) continue;\n    for (const p of m.providers) {\n      if (!p || p.status !== 'live' || typeof p.provider !== 'string') continue;\n      const isFreePromo = p.is_free === true;\n      const isZeroPriced = p.pricing \u0026\u0026 Number(p.pricing.input) === 0 \u0026\u0026 Number(p.pricing.output) === 0;\n      if (isFreePromo || isZeroPriced) {\n        // HF router requires the provider to be pinned in the model id itself.\n        models.push(`${m.id}:${p.provider}`);\n      }\n    }\n  }\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-zero-price-model', models: models.slice(0, 20), tier: 'live-pricing' };\n}\n\nasync function discoverDeepInfra(helpers, env) {\n  if (!env.DEEPINFRA_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  // Verified: docs.deepinfra.com/chat/overview (chat endpoint) and DeepInfra's\n  // public, keyless native catalog at api.deepinfra.com/models/list, which -\n  // unlike the OpenAI-compatible /v1/openai/models listing - reports real\n  // per-token pricing (cents_per_input_token / cents_per_output_token).\n  const r = await httpGetJson(helpers, 'https://api.deepinfra.com/models/list', {});\n  if (!r.ok || !Array.isArray(r.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const models = r.data\n    .filter(m =\u003e m \u0026\u0026 typeof m.model_name === 'string'\n      \u0026\u0026 (m.type === 'text-generation' || m.reported_type === 'text-generation')\n      \u0026\u0026 !m.deprecated\n      \u0026\u0026 m.pricing \u0026\u0026 Number(m.pricing.cents_per_input_token) === 0 \u0026\u0026 Number(m.pricing.cents_per_output_token) === 0)\n    .map(m =\u003e m.model_name)\n    .slice(0, 20);\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-zero-price-model', models, tier: 'live-pricing' };\n}\n\nasync function discoverSambaNova(helpers, env) {\n  if (!env.SAMBANOVA_API_KEY) return { available: false, reason: 'missing-credential', models: [] };\n  // Verified: docs.sambanova.ai OpenAPI spec for GET /v1/models - each\n  // ModelMetadata entry carries pricing.prompt / pricing.completion (USD per\n  // token). SambaNova's account-level \"no card required\" offer is a one-time\n  // trial credit, NOT a recurring free tier, so credit alone is never treated\n  // as FREE here - only a model actually priced at 0/0 in this live response is.\n  const r = await httpGetJson(helpers, 'https://api.sambanova.ai/v1/models', { Authorization: `Bearer ${env.SAMBANOVA_API_KEY}` });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { available: false, reason: 'discovery-unavailable', models: [] };\n  const models = r.data.data\n    .filter(m =\u003e m \u0026\u0026 typeof m.id === 'string' \u0026\u0026 m.pricing\n      \u0026\u0026 Number(m.pricing.prompt) === 0 \u0026\u0026 Number(m.pricing.completion) === 0)\n    .map(m =\u003e m.id)\n    .slice(0, 20);\n  return { available: models.length \u003e 0, reason: models.length ? null : 'no-verified-zero-price-model', models, tier: 'live-pricing' };\n}\n\nconst DISCOVERERS = {\n  openrouter: discoverOpenRouter,\n  google: discoverGoogle,\n  cerebras: discoverCerebras,\n  groq: discoverGroq,\n  huggingface: discoverHuggingFace,\n  deepinfra: discoverDeepInfra,\n  together: discoverTogether,\n  sambanova: discoverSambaNova,\n  cloudflare: discoverCloudflare\n};\n\nasync function buildFreeQueue(helpers, env) {\n  const settled = await Promise.allSettled(PROVIDER_ORDER.map(p =\u003e providerBlocked(p) ? Promise.resolve({ available: false, models: [] }) : DISCOVERERS[p](helpers, env)));\n  const queue = [];\n  for (let i = 0; i \u003c PROVIDER_ORDER.length; i++) {\n    const providerType = PROVIDER_ORDER[i];\n    const outcome = settled[i];\n    const disc = (outcome.status === 'fulfilled' \u0026\u0026 outcome.value) ? outcome.value : { available: false, models: [] };\n    if (disc.available \u0026\u0026 Array.isArray(disc.models)) {\n      for (const modelId of disc.models) {\n        queue.push({ provider: providerType, type: providerType, model: modelId, tier: disc.tier || 'unverified', verifiedFree: true });\n      }\n    }\n  }\n  return queue;\n}\n\n// Final, executable, pre-HTTP billing guard. Runs on every candidate before\n// it can ever be selected as `current` - not just once at startup. ALL of\n// these must hold or the candidate is skipped, never called.\nfunction finalBillingGuard(candidate, env) {\n  if (!candidate) return { pass: false, reason: 'no-candidate' };\n  if (!PROVIDER_ALLOWLIST.has(candidate.provider)) return { pass: false, reason: 'provider-not-allowlisted' };\n  if (candidate.verifiedFree !== true) return { pass: false, reason: 'not-verified-free' };\n  if (BILLING_MODE !== 'free_only') return { pass: false, reason: 'billing-mode-not-free-only' };\n  if (!APPROVED_ENDPOINTS.has(candidate.type)) return { pass: false, reason: 'endpoint-not-approved' };\n  if (typeof candidate.model !== 'string' || !candidate.model.trim().length) return { pass: false, reason: 'invalid-model' };\n  if (ROUTER_MODEL_DENYLIST.has(candidate.model)) return { pass: false, reason: 'router-model-denied' };\n  if (FORBIDDEN_MODEL_PATTERN.test(candidate.model)) return { pass: false, reason: 'forbidden-routing-token' };\n  if (candidate.type === 'google') {\n    if (!(env.GEMINI_API_KEY \u0026\u0026 String(env.GEMINI_API_KEY).trim().length)) return { pass: false, reason: 'missing-credential' };\n  } else if (candidate.type === 'cloudflare') {\n    if (!(env.CLOUDFLARE_API_TOKEN \u0026\u0026 String(env.CLOUDFLARE_API_TOKEN).trim().length)) return { pass: false, reason: 'missing-credential' };\n    if (!(env.CLOUDFLARE_ACCOUNT_ID \u0026\u0026 String(env.CLOUDFLARE_ACCOUNT_ID).trim().length)) return { pass: false, reason: 'missing-credential' };\n  } else {\n    const authEnvVar = AUTH_ENV_BY_TYPE[candidate.type];\n    if (!authEnvVar || !(env[authEnvVar] \u0026\u0026 String(env[authEnvVar]).trim().length)) return { pass: false, reason: 'missing-credential' };\n  }\n  return { pass: true };\n}\n\n// Rebuild discovery only at the start of a fresh task-attempt sequence\n// (modelAttempt reset to 0 by Validate Attempt on the previous task's\n// success/failed_all) or when the cache is missing/belongs to a different\n// taskType. Mid-task retries (modelAttempt \u003e 0) reuse the already-discovered\n// queue instead of re-querying all 9 providers on every single retry - the\n// data is still \"at the time of execution\" for this task, just not\n// re-fetched on every loop tick within it.\nconst needsRebuild = (wf.modelAttempt === 0 \u0026\u0026 !isRetry) || !wf.freeQueueCache || wf.freeQueueCache.taskType !== taskType;\nlet modelQueue;\nif (needsRebuild) {\n  wf.transientTried = null;\n  const helpers = this.helpers;\n  modelQueue = (helpers \u0026\u0026 typeof helpers.httpRequest === 'function') ? await buildFreeQueue(helpers, $env) : [];\n  // Only non-secret metadata is ever cached - no credential value is stored.\n  wf.freeQueueCache = { taskType, queue: modelQueue, builtAt: Date.now() };\n} else {\n  modelQueue = wf.freeQueueCache.queue;\n}\n\n// billing guard + provider circuit breaker: a cooled-down/disabled provider's remaining models are skipped wholesale.\nwhile (wf.modelAttempt \u003c modelQueue.length \u0026\u0026 (!finalBillingGuard(modelQueue[wf.modelAttempt], $env).pass || providerBlocked(modelQueue[wf.modelAttempt].provider))) {\n  wf.modelAttempt++;\n}\n\n// all FREE models across all providers exhausted (or none currently verify\n// as free/available) -\u003e clean failure state. Validate Attempt routes this\n// straight to each task's own deterministic fallback - never a paid model\n// call - and tags the result resultType: 'DETERMINISTIC_FALLBACK' so it can\n// never be mistaken for a real AI success.\nif (wf.modelAttempt \u003e= modelQueue.length) {\n  wf.modelAttempt = 0;\n  wf.freeQueueCache = null;\n  wf.transientTried = null;\n  return { json: { loopStatus: 'failed_all', resultType: 'DETERMINISTIC_FALLBACK', failureCode: 'NO_FREE_PROVIDER_AVAILABLE', taskType } };\n}\n\nconst current = modelQueue[wf.modelAttempt];\n\n\n// ---------------------------------------------------------------------------\n// Task-specific prompt. Only the prompt text + response shape differ between\n// checkpoints; model/provider selection and request plumbing are shared.\n// ---------------------------------------------------------------------------\nlet promptText;\nlet googleGenerationConfig;\nlet orTemperature, orMaxTokens, orPresencePenalty;\n\nif (taskType === 'factgrammar') {\n  const d = $node(\"Lightweight Fact Lookup\").json;\n  const draft = JSON.stringify({ title: d.title, topic: d.topic, hook: d.hook, description: d.description, tags: d.tags, scenes: d.scenes });\n\n  promptText = `You are an expert Fact-Checker and native US-English grammar editor for YouTube Shorts scripts.\n\nReview the DRAFT SCRIPT below.\n\nTASKS:\n1. GRAMMAR: fix any awkward phrasing, grammar errors, or robotic tone in every 'voice' field so it sounds like a natural, engaging native-English voiceover. Keep each voice line 16-22 words.\n2. FACT-CHECK: verify every factual claim from your general knowledge. If a claim is false, a debunked myth, outdated, or unverifiable, REWRITE only that scene with a true, verifiable fact on the same topic. Do not invent new unverifiable facts.\n3. Keep title/topic/hook/description/tags/scenes structure and field names EXACTLY the same. Do not add or remove scenes.\n\nDRAFT SCRIPT:\n${draft}\n\nOutput ONLY the corrected JSON object. No markdown, no code fences, no explanation, no extra text before or after the JSON.`;\n\n  googleGenerationConfig = { response_mime_type: 'application/json', maxOutputTokens: 4096, temperature: 0.3 };\n  orTemperature = 0.3; orMaxTokens = 4096; orPresencePenalty = 0;\n\n} else if (taskType === 'semanticdup') {\n  const d = $node(\"Dedupe Check\").json;\n  const banList = ($node(\"Build Exclusion Prompt\").json.banList || '').slice(0, 12000);\n  const hookBan = ($node(\"Build Exclusion Prompt\").json.hookBan || '').slice(0, 6000);\n  const entityBan = ($node(\"Build Exclusion Prompt\").json.entityBan || '').slice(0, 5000);\n  const summaryBan = ($node(\"Build Exclusion Prompt\").json.summaryBan || '').slice(0, 15000);\n  const newBundle = JSON.stringify({ topic: d.topic, title: d.title, hook: d.hook, description: d.description, script: d.script });\n\n  promptText = `You are an expert semantic duplicate-content auditor for a YouTube Shorts channel.\n\nYour only task is deciding whether the NEW VIDEO is substantially the same as ANY previous video.\n\nCompare SEMANTIC MEANING only.\n\nIgnore:\n- Title changes\n- Hook changes\n- Description changes\n- Tags\n- Script order\n- Paraphrasing\n- Synonyms\n- Translation\n- Different narration\n- Different examples\n- Different intro/outro\n- Category changes\n- Updated/Latest/2026/Remastered\n- Part/Episode numbering\n\nTreat as DUPLICATE when the viewer would learn essentially the same:\n\n\\u2022 Fact\n\\u2022 Story\n\\u2022 Explanation\n\\u2022 Educational lesson\n\\u2022 Scientific concept\n\\u2022 Historical event\n\\u2022 Biography\n\\u2022 Comparison\n\\u2022 Ranking\n\\u2022 Myth\n\\u2022 Conclusion\n\nUse all available memories together.\n\nNEW VIDEO\n${newBundle}\n\nPREVIOUS TITLES/TOPICS\n${banList}\n\nPREVIOUS HOOKS\n${hookBan}\n\nPREVIOUS ENTITIES\n${entityBan}\n\nPREVIOUS SUMMARIES\n${summaryBan}\n\nReturn ONLY valid JSON.\n\n{\n  \"duplicate\": true,\n  \"confidence\": 0.97,\n  \"duplicate_type\": \"same_fact\",\n  \"reason\": \"same scientific fact explained differently\",\n  \"matched\": [\n    \"Why Sharks Never Stop Swimming\",\n    \"The Truth About Shark Movement\"\n  ]\n}\n\nduplicate_type must be one of:\n\nsame_fact\nsame_story\nsame_history\nsame_science\nsame_person\nsame_biography\nsame_comparison\nsame_ranking\nsame_myth\nsame_explanation\nsame_conclusion\nsame_topic\ndifferent\n\nConfidence must be between 0 and 1.\n\nIf uncertain, choose duplicate=true.`;\n\n  googleGenerationConfig = { response_mime_type: 'application/json', temperature: 0, topP: 0.9, maxOutputTokens: 350 };\n  orTemperature = 0; orMaxTokens = 350; orPresencePenalty = 0;\n\n} else {\n  // taskType === 'script' (original, unchanged behavior)\n  const src = $node(\"Build Exclusion Prompt\").json;\n  const category = src.category;\n  const banList = src.banList || '';\n  const hookBan = src.hookBan || '';\n  const trending = src.trendingContext || '';\n  const trendLine = trending ? trending : 'none available - proceed with the assigned category';\n\n  let obscureTopics = '';\n  try { obscureTopics = $node(\"Extract Wiki Topics\").json.obscureTopics || ''; } catch(e) { obscureTopics = ''; }\n  const obscureLine = obscureTopics\n    ? `Optional creative fuel - a few real, randomly-picked reference points (use ONLY if one genuinely fits the category and makes a strong obscure fact; ignore any that don't fit, never force a bad one): ${obscureTopics}`\n    : '';\n\n  promptText = `You are a world-class viral YouTube Shorts scriptwriter for a US audience. Return ONLY valid JSON. No markdown, no code fences.\n\nCreate ONE viral Short in category: ${category}.\n\nTRENDING SIGNALS (inspiration only, never copy phrasing, no news/person commentary):\n${trendLine}\n\n${obscureLine}\n\nMEMORY BLACKLIST (never reuse/paraphrase):\nTitles/topics: ${banList}\nHooks: ${hookBan}\n\nORIGINALITY: rare, narrow, fresh, specific topic \\u2014 never generic. PERMANENTLY BANNED clich\\u00e9s/myths, never use in any form: neutron star teaspoon weighs a billion tons, smartphone more powerful than Apollo guidance computer, lightning hotter than the sun's surface, bananas are radioactive, honey never spoils, octopus has three hearts, sharks older than trees, humans share 50 percent DNA with bananas, great wall of china visible from space, goldfish three second memory, napoleon was short, einstein failed math, humans only use 10 percent of the brain, bulls are enraged by red color, vikings wore horned helmets, glass is a slow-flowing liquid, people swallow spiders while sleeping, water boils faster at higher altitude, venus is the hottest planet, diamonds form from coal, chameleons change color only to camouflage, mount everest is the tallest mountain measured base to peak, left brain vs right brain personality types, body replaces every cell every seven years, dinosaurs went extinct only from an asteroid, pyramids built by aliens, coriolis effect determines toilet flush direction, blood is blue inside the body, sugar makes children hyperactive, we swallow our tongue during a seizure. ALSO BAN generic viral-video phrasing: 'did you know', 'here's a fact', 'you won't believe', 'this will blow your mind', 'wait for it', 'mind blown', 'crazy fact', 'let that sink in', 'number 5 will shock you', 'scientists say' with no named source. Every script must center on a genuinely obscure, specific, verifiable fact a general audience has not seen repeated on Shorts before. Do NOT try to dodge the blacklist by appending numbers (\"topic 1\", \"topic 2\"), adding words like part/set/vol/series, reordering words, or lightly rewording a banned title/topic/hook \\u2014 the system detects normalized and near-duplicate matches automatically and will reject them. Pick a genuinely different subject instead.\n\nSTRUCTURE: exactly 5 scenes. Scene 1 = shocking question or bold claim, max 12 words, never start with 'Did you know'. Scenes 2-4 reveal one surprising fact each, escalating curiosity. Scene 5 = biggest reveal + soft follow request.\n\nVOICE: one sentence per scene, simple natural US English, 16-22 words each, total 35-45s.\n\nIMAGE PROMPT: match scene voice, each different concept, vertical 9:16 cinematic photorealistic dramatic lighting high contrast, max 22 words.\n\nTITLE: under 60 chars, curiosity driven, include a number, must match content, no full spoiler.\nDESCRIPTION: max 30 words natural keywords.\nTAGS: exactly 10 lowercase keywords.\nTOPIC: short lowercase slug for one main subject.\n\nOUTPUT ONLY JSON:\n{\"title\":\"\",\"topic\":\"\",\"hook\":\"\",\"description\":\"\",\"tags\":[],\"scenes\":[{\"scene\":1,\"voice\":\"\",\"image_prompt\":\"\"}]}`;\n\n  googleGenerationConfig = { response_mime_type: 'application/json', maxOutputTokens: 8192, temperature: 1.05, topP: 0.95 };\n  orTemperature = 1.5; orMaxTokens = 5000; orPresencePenalty = 1.2;\n}\n\nlet url, body, googHeaderValue = '';\nif (current.type === 'google') {\n  // Key goes in a header (x-goog-api-key), never in the URL query string.\n  googHeaderValue = $env.GEMINI_API_KEY || '';\n  url = `https://generativelanguage.googleapis.com/v1beta/models/${current.model}:generateContent`;\n  body = {\n    contents: [ { parts: [ { text: promptText } ] } ],\n    generationConfig: googleGenerationConfig\n  };\n} else if (current.type === 'cloudflare') {\n  // Cloudflare Workers AI OpenAI-compatible chat endpoint. The account id is\n  // part of the URL path (never a query param, and it is not itself a secret\n  // - only CLOUDFLARE_API_TOKEN, sent as a Bearer header, is).\n  const accountId = $env.CLOUDFLARE_ACCOUNT_ID || '';\n  url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;\n  body = {\n    model: current.model,\n    messages: [ { role: 'user', content: promptText } ],\n    temperature: orTemperature,\n    max_tokens: orMaxTokens\n  };\n} else {\n  // OpenAI-chat-completions-compatible providers (openrouter, cerebras, groq,\n  // together). Only the base URL + auth env var differ between them, both\n  // resolved from the shared CHAT_ENDPOINTS / AUTH_ENV_BY_TYPE maps above -\n  // never a provider URL supplied dynamically from input.\n  url = CHAT_ENDPOINTS[current.type];\n  body = {\n    model: current.model,\n    messages: [ { role: 'user', content: promptText } ],\n    temperature: orTemperature,\n    top_p: 1,\n    max_tokens: orMaxTokens,\n    presence_penalty: orPresencePenalty\n  };\n}\n\n// Every non-Google provider is OpenAI-chat-completions-compatible and needs a\n// Bearer Authorization header carrying its OWN credential - never a shared or\n// hardcoded key. finalBillingGuard() above already guarantees the right\n// env var(s) are set whenever that provider's model is selected. OpenRouter\n// additionally sends an HTTP-Referer for its dashboard attribution; no other\n// provider here requires or accepts that header.\nconst authEnvVar = AUTH_ENV_BY_TYPE[current.type];\nconst authValue = (current.type !== 'google' \u0026\u0026 authEnvVar) ? `Bearer ${$env[authEnvVar]}` : '';\nconst refererValue = current.type === 'openrouter' ? 'https://n8n-latest-h80s.onrender.com' : '';\n\n// Defense-in-depth: re-run the SAME executable guard one last time,\n// immediately before returning the request Unified AI Request will actually\n// send. The skip-forward loop above already enforces this for every\n// candidate, so this should never fail here - but if it somehow ever did,\n// fail closed instead of ever emitting the HTTP call.\nconst lastCheck = finalBillingGuard(current, $env);\nif (!lastCheck.pass) {\n  wf.modelAttempt = 0;\n  wf.freeQueueCache = null;\n  wf.transientTried = null;\n  return { json: { loopStatus: 'failed_all', resultType: 'DETERMINISTIC_FALLBACK', failureCode: 'NO_FREE_PROVIDER_AVAILABLE', taskType, blockedReason: lastCheck.reason } };\n}\n\nreturn {\n  json: {\n    loopStatus: 'continue',\n    taskType,\n    attempt: wf.modelAttempt,\n    provider: current.provider,\n    modelType: current.type,\n    modelName: current.model,\n    verifiedFree: current.verifiedFree,\n    verificationTier: current.tier,\n    billingMode: BILLING_MODE,\n    url,\n    body,\n    bodyStr: JSON.stringify(body),\n    authValue,\n    refererValue,\n    googHeaderValue\n  }\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "bcd9f972-fc53-4dfe-bae4-9a193f4985d2",
+      "name": "Model Request Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -290,
+        1460
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.loopStatus }}",
+            "operator": "equals",
+            "right": "continue"
+          },
+          {
+            "left": "{{ $json.url }}",
+            "operator": "contains",
+            "right": "://"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "b5f5dd00-bd92-4a50-95a8-4551a2e1ba23",
+      "name": "Needs Fact Grammar AI?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        860
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.needsAiCheck }}",
+            "operator": "equals",
+            "right": "true"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "dc1caeab-f61e-426d-8d44-4c7031d6ee15",
+      "name": "Parse JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        180,
+        960
+      ],
+      "parameters": {
+        "jsCode": "function dynamicFallback(){\n  const cat = (()=\u003e{ try { return $node(\"Build Exclusion Prompt\").json.category; } catch(e){ return 'science'; } })();\n  const ctr = (()=\u003e{ try { return $node(\"Build Exclusion Prompt\").json.counter || 0; } catch(e){ return Math.floor(Math.random()*1000); } })();\n  const topic = `${cat} fact set ${ctr}`;\n  return {\n    title: `${ctr%9+1} ${cat.split(' ')[0]} Secrets You Never Knew`,\n    topic,\n    hook: 'fallback dynamic hook',\n    description: `Mind-blowing ${cat} facts you never knew. Follow for daily shorts!`,\n    tags: ['science','technology','facts','shorts',cat.split(' ')[0],'future','viral','education','didyouknow','learn'],\n    scenes: [\n      { scene:1, voice:`What if everything you believe about ${cat} is completely wrong right now today?`, image_prompt:`cinematic vertical 9:16 dramatic ${cat} scene glowing high contrast photorealistic detailed lighting` },\n      { scene:2, voice:`Scientists recently discovered something about ${cat} that quietly changes how we understand the entire world.`, image_prompt:`cinematic vertical 9:16 laboratory discovery ${cat} dramatic lighting photorealistic ultra detailed` },\n      { scene:3, voice:`This single hidden detail in ${cat} is far stranger than almost anyone alive today ever imagined.`, image_prompt:`cinematic vertical 9:16 mysterious ${cat} close up dramatic high contrast photorealistic` },\n      { scene:4, voice:`Experts still argue about this ${cat} mystery because the real answer sounds almost impossible to believe.`, image_prompt:`cinematic vertical 9:16 intense ${cat} phenomenon glowing dramatic lighting photorealistic detailed` },\n      { scene:5, voice:`The truth about ${cat} is only beginning, so follow now and never miss another mind blowing fact.`, image_prompt:`cinematic vertical 9:16 vast dramatic ${cat} reveal glowing cosmos high contrast photorealistic` }\n    ]\n  };\n}\n\n// --- 1) Response extraction: Gemini + OpenRouter/OpenAI দুটোই সাপোর্ট করে ---\nlet raw = '';\nlet apiErrorMsg = '';\ntry { apiErrorMsg = $json?.error?.message ?? ''; } catch(e){ apiErrorMsg = ''; }\n\ntry {\n  raw = $json?.candidates?.[0]?.content?.parts?.[0]?.text\n     ?? $json?.choices?.[0]?.message?.content\n     ?? '';\n} catch(e){ raw=''; }\n\n// --- 4) API error (429 / empty response ইত্যাদি) লগ করা ---\nif (!raw \u0026\u0026 apiErrorMsg) {\n  console.log('API error:', apiErrorMsg);\n}\n\ntry{ raw=String(raw).replace(/^```json\\s*/i,'').replace(/```$/i,'').trim(); }catch(e){ raw=''; }\n\nfunction tryParse(s){ try{ return JSON.parse(s); }catch(e){ return null; } }\n\nlet data=null;\nif(raw \u0026\u0026 raw.length\u003e2){\n  data=tryParse(raw);\n  if(!data){\n    try{\n      let fixed=raw;\n      fixed=fixed.replace(/,\\s*\"[^\"]*\"\\s*:\\s*\"[^\"]*$/,'');\n      fixed=fixed.replace(/,\\s*\"[^\"]*$/,'');\n      fixed=fixed.replace(/,\\s*$/,'');\n      const oC=(fixed.match(/\\{/g)||[]).length,cC=(fixed.match(/\\}/g)||[]).length,oB=(fixed.match(/\\[/g)||[]).length,cB=(fixed.match(/\\]/g)||[]).length;\n      fixed+=']'.repeat(Math.max(0,oB-cB));\n      fixed+='}'.repeat(Math.max(0,oC-cC));\n      data=tryParse(fixed);\n    }catch(e){ data=null; }\n  }\n}\n\n// --- 2) JSON output validation (title/topic/description/tags/scenes) ---\nif(!data || !data.title || !data.topic || !data.description || !Array.isArray(data.tags) || !Array.isArray(data.scenes) || data.scenes.length===0){\n  data=dynamicFallback();\n}else{\n  // --- 3) Scene voice/image validation (আপনার আগের লজিক অপরিবর্তিত) ---\n  data.scenes=data.scenes.filter(s=\u003es\u0026\u0026s.voice\u0026\u0026s.image_prompt).slice(0,5);\n  if(data.scenes.length\u003c5){ data=dynamicFallback(); }\n}\n\ndata.scenes=data.scenes.map((s,i)=\u003e({...s,scene:i+1}));\n\nreturn {json:{\n  title:data.title||'Amazing Facts',\n  topic:data.topic||data.title||'general',\n  hook:data.hook||(data.scenes[0]?data.scenes[0].voice:''),\n  description:data.description||(data.title||'Facts'),\n  tags:Array.isArray(data.tags)\u0026\u0026data.tags.length?data.tags:['science','technology','shorts'],\n  scenes:data.scenes\n}};",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "16d89ae0-3684-4b76-b1d9-5eee2576f952",
+      "name": "Post Cleanup",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3600,
+        1060
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "883f8f6e-847c-447f-9406-6aebc9c408a3",
+      "name": "Pre Cleanup",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -1600,
+        960
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "aa9cfaa3-c956-4c6b-b811-b0ce1f5a144f",
+      "name": "Prep Scene",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        860
+      ],
+      "parameters": {
+        "jsCode": "const scene = $json;\nconst meta = $node(\"Parse JSON\").json;\nconst voice = String(scene.voice || '').trim();\nconst idx = scene.scene || 1;\nconst image_prompt = scene.image_prompt;\nconst imagePromptEncoded = encodeURIComponent(image_prompt || '');\nconst imageSeed = Math.floor(Math.random()*99999);\nconst voiceSrtSafe = voice.replace(/[\\u0027\\u0022|]/g, '');\nreturn { json: { idx, voice, voiceSrtSafe, image_prompt, imagePromptEncoded, imageSeed, title: meta.title, topic: meta.topic, description: meta.description, tags: meta.tags } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "9959cfc2-614c-444a-86eb-bd98f75cf780",
+      "name": "Read Final Video",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        1060
+      ],
+      "parameters": {
+        "fileName": "/tmp/final.mp4",
+        "operation": "read"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "0fba94c3-1b94-4791-91d3-96bb50203e5d",
+      "name": "Read Thumbnail",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        3200,
+        1200
+      ],
+      "parameters": {
+        "fileName": "/tmp/thumb.jpg",
+        "operation": "read"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "2ce9a729-579e-4a9a-ae97-fb20b3e64159",
+      "name": "Read Used Topics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -600,
+        960
+      ],
+      "parameters": {},
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "googleSheetsOAuth2Api",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "9da401a2-2be1-4125-9437-a5071c1f9528",
+      "name": "Record Topic (Reserve)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        860
+      ],
+      "parameters": {
+        "operation": "append"
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "googleSheetsOAuth2Api",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "febf1159-e47c-4e2f-a892-1734583ec193",
+      "name": "Retry New Topic (loop back)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        860,
+        1160
+      ],
+      "parameters": {},
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "bc0eeb37-276b-4462-8a59-bac11a04ea4e",
+      "name": "Save Image",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        760
+      ],
+      "parameters": {
+        "fileName": "/tmp/scene_{{ $node[\"Prep Scene\"].json.idx }}.jpg",
+        "operation": "write"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "2031dd09-8b38-4ec9-8163-707fd45c7d04",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1800,
+        960
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 19
+            }
+          ]
+        }
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "529dd76e-3ca8-4264-b358-6682cd976f8a",
+      "name": "Set Thumbnail",
+      "type": "n8n-nodes-base.youTube",
+      "typeVersion": 1,
+      "position": [
+        3400,
+        1060
+      ],
+      "parameters": {
+        "operation": "setThumbnail",
+        "resource": "thumbnail",
+        "videoId": "{{ $node[\"YouTube Upload (Scheduled)\"].json.id }}"
+      },
+      "credentials": {
+        "youTubeOAuth2Api": {
+          "id": "youTubeOAuth2Api",
+          "name": "youTubeOAuth2Api"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "1c342baf-69f6-47c5-b81a-3161bd7f7d86",
+      "name": "Skip AI Duplicate Check?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        1040
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.isDup }}",
+            "operator": "equals",
+            "right": "true"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "0208a25b-019d-4c17-b08e-e0960bb588a6",
+      "name": "Split Scenes",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        860
+      ],
+      "parameters": {
+        "fieldToSplitOut": "scenes",
+        "options": {}
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "42e08fdb-0709-4b79-976b-cffeb94ff528",
+      "name": "Success Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4000,
+        960
+      ],
+      "parameters": {
+        "body": "{\n  \"text\": \"Uploaded: {{ $json.title }}\\nTopic: {{ $json.topic }}\\nID: {{ $json.videoId }}\\nScenes: {{ $json.sceneCount }} | Render: {{ $json.renderTimeSec }}s\\nPublish: {{ $json.publishAt }}\"\n}",
+        "method": "POST",
+        "url": "{{ $env.NOTIFY_WEBHOOK_URL }}"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "1e52eea2-15ab-41f7-99b7-c84711e5db9c",
+      "name": "TTS (Eleven-\u003eEdge-\u003eSilent)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2620,
+        760
+      ],
+      "parameters": {
+        "args": [
+          "-c",
+          "import subprocess, sys, os\nos.chdir('/tmp')\nscript = r'''IDX={{ $node[\"Prep Scene\"].json.idx }}; OUT=/tmp/scene_${IDX}.mp3; TXTFILE=/tmp/tts_text_${IDX}.txt; rm -f \"$OUT\"; cat \u003e \"$TXTFILE\" \u003c\u003c'TTSEOF'\n{{ $node[\"Prep Scene\"].json.voiceSrtSafe }}\nTTSEOF\nWCCHK=$(wc -w \u003c \"$TXTFILE\" 2\u003e/dev/null); WCCHK=${WCCHK:-0}; if [ \"$WCCHK\" -lt 1 ]; then echo TEXT_EMPTY_USING_SILENT; ffmpeg -y -threads 1 -f lavfi -i anullsrc=r=44100:cl=mono -t 6 -c:a libmp3lame -b:a 128k \"$OUT\" 2\u003e/dev/null \u0026\u0026 echo TTS_SILENT_OK; rm -f \"$TXTFILE\"; exit 0; fi; validmp3(){ [ -s \"$OUT\" ] || return 1; head -c1 \"$OUT\" | grep -q '{' \u0026\u0026 return 1; CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 \"$OUT\" 2\u003e/dev/null); [ -n \"$CODEC\" ] || return 1; D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \"$OUT\" 2\u003e/dev/null); D=${D:-0}; awk \"BEGIN{exit !($D\u003e=1.0)}\" || return 1; MAXVOL=$(ffmpeg -i \"$OUT\" -af volumedetect -f null - 2\u003e\u00261 | grep -o 'max_volume: [-0-9.]*' | awk '{print $2}'); MAXVOL=${MAXVOL:--99}; awk \"BEGIN{exit !($MAXVOL\u003e-50)}\"; }; edge-tts --voice en-US-AndrewNeural --file \"$TXTFILE\" --write-media \"$OUT\" 2\u003e/tmp/edge_err_${IDX}.log; if validmp3; then echo TTS_EDGE_OK; else echo EDGE_FAILED_SILENT; cat /tmp/edge_err_${IDX}.log 2\u003e/dev/null; rm -f \"$OUT\"; WC=$(wc -w \u003c \"$TXTFILE\"); WC=${WC:-8}; SD=$(awk \"BEGIN{d=$WC/2.8; if(d\u003c6)d=6; if(d\u003e12)d=12; printf \\\"%.1f\\\", d}\"); ffmpeg -y -threads 1 -f lavfi -i anullsrc=r=44100:cl=mono -t $SD -c:a libmp3lame -b:a 128k \"$OUT\" 2\u003e/dev/null \u0026\u0026 echo TTS_SILENT_OK; fi; rm -f \"$TXTFILE\" /tmp/edge_err_${IDX}.log'''\nr = subprocess.run(script, shell=True, executable='/bin/bash')\nsys.exit(r.returncode)\n"
+        ],
+        "binary": "python3"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "e14e3bb6-b8ab-4a72-92f5-cd9fe0a06220",
+      "name": "Task Router: Fact/Grammar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        420,
+        1160
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.taskType }}",
+            "operator": "equals",
+            "right": "factgrammar"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "640b4eed-ff95-4408-a9ee-b327d0b604fa",
+      "name": "Task Router: Semantic Dup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        420,
+        1320
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.taskType }}",
+            "operator": "equals",
+            "right": "semanticdup"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "28b045b8-f963-451a-9a89-9b6ac410cf4a",
+      "name": "Unified AI Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -180,
+        1280
+      ],
+      "parameters": {
+        "body": "{{ $json.bodyStr }}",
+        "headers": {
+          "Authorization": "{{ $json.authValue }}",
+          "Content-Type": "application/json",
+          "HTTP-Referer": "{{ $json.refererValue }}",
+          "x-goog-api-key": "{{ $json.googHeaderValue }}"
+        },
+        "method": "POST",
+        "url": "{{ $json.url }}"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "1d8882e9-9117-4bae-a04f-b21b696e54c6",
+      "name": "Update Topic (Uploaded)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3000,
+        1060
+      ],
+      "parameters": {
+        "operation": "update"
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "googleSheetsOAuth2Api",
+          "name": "googleSheetsOAuth2Api"
+        }
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "bb5852cb-866b-49ea-8307-a0bfd2c48d23",
+      "name": "Validate Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        1280
+      ],
+      "parameters": {
+        "jsCode": "function extractContent(body){\n  try {\n    return body?.candidates?.[0]?.content?.parts?.[0]?.text\n        ?? body?.choices?.[0]?.message?.content\n        ?? '';\n  } catch(e){ return ''; }\n}\n\nfunction tryParseJson(raw){\n  try {\n    const cleaned = String(raw || '').replace(/^```json\\s*/i, '').replace(/```\\s*$/i, '').trim();\n    return JSON.parse(cleaned);\n  } catch(e) { return null; }\n}\n\n// Real structural validation. A model attempt is only ever \"success\" when the\n// parsed JSON actually satisfies the task's required output shape - never\n// merely because non-empty text came back. Anything else (unparsable JSON,\n// missing/empty required fields, wrong scene count, missing voice or\n// image_prompt, malformed duplicate result) is a LOOP -\u003e next FREE model.\nfunction isValidScriptShape(data, expectedSceneCount){\n  if (!data || typeof data !== 'object') return false;\n  if (!data.title || typeof data.title !== 'string' || !data.title.trim()) return false;\n  if (!data.topic || typeof data.topic !== 'string' || !data.topic.trim()) return false;\n  if (!data.description || typeof data.description !== 'string' || !data.description.trim()) return false;\n  if (!Array.isArray(data.tags) || data.tags.length === 0) return false;\n  if (!Array.isArray(data.scenes)) return false;\n  const want = (typeof expectedSceneCount === 'number' \u0026\u0026 expectedSceneCount \u003e 0) ? expectedSceneCount : 5;\n  if (data.scenes.length !== want) return false;\n  return data.scenes.every(s =\u003e s\n    \u0026\u0026 typeof s.voice === 'string' \u0026\u0026 s.voice.trim().length \u003e 0\n    \u0026\u0026 typeof s.image_prompt === 'string' \u0026\u0026 s.image_prompt.trim().length \u003e 0);\n}\n\nconst DUP_TYPES = new Set(['same_fact','same_story','same_history','same_science','same_person','same_biography','same_comparison','same_ranking','same_myth','same_explanation','same_conclusion','same_topic','different']);\n\nfunction isValidSemanticDupShape(data){\n  if (!data || typeof data !== 'object') return false;\n  if (typeof data.duplicate !== 'boolean') return false;\n  if (typeof data.confidence !== 'number' || data.confidence \u003c 0 || data.confidence \u003e 1) return false;\n  if (!data.duplicate_type || !DUP_TYPES.has(String(data.duplicate_type))) return false;\n  return true;\n}\n\nconst wf = $getWorkflowStaticData('global');\nlet execId = 'na';\ntry { execId = String(($execution \u0026\u0026 $execution.id) || 'na'); } catch (e) { execId = 'na'; }\n// Circuit breaker: mark the WHOLE provider. Model Controller skips all of its remaining models.\nfunction markProvider(p, reason, resetTs) {\n  if (!p) return;\n  const now = Date.now();\n  const timed = resetTs \u0026\u0026 resetTs \u003e now \u0026\u0026 resetTs \u003c now + 26 * 3600 * 1000;\n  wf.providerState = wf.providerState || {};\n  wf.providerState[p] = { provider: p, status: 'cooldown', reason, cooldownUntil: timed ? resetTs : null, execId, setAt: now };\n}\nconst controller = $node(\"Model Controller\").json;\nconst taskType = controller.taskType || 'script';\n\n// all models already exhausted -\u003e pass straight through to this task's own\n// deterministic fallback (Parse JSON's built-in generator for 'script';\n// Apply Fact \u0026 Grammar Fixes / Merge Semantic Result already fall back to\n// the original, unmodified data for 'factgrammar' / 'semanticdup' when the\n// AI response is unusable). Never a paid model call.\nif (controller.loopStatus === 'failed_all') {\n  return { json: { decision: 'success', taskType, ...$json, resultType: 'DETERMINISTIC_FALLBACK' } };\n}\n\nconst b = $json;\nconst errMsg = (b \u0026\u0026 b.error \u0026\u0026 (b.error.message || JSON.stringify(b.error))) || '';\nconst text = extractContent(b);\n\n\n// ---- Error classification: provider_quota | provider_auth | model_error | transient | success ----\nfunction classifyError(body, provider) {\n  let raw = '';\n  try { raw = String((body.error \u0026\u0026 body.error.message) || '') + ' ' + JSON.stringify(body.error).slice(0, 4000); } catch (e) { raw = errMsg; }\n  const low = raw.toLowerCase();\n  let code = NaN;\n  const e = (body \u0026\u0026 body.error) || {};\n  for (const v of [e.httpCode, e.status, e.statusCode, e.code]) { const n = Number(v); if (n \u003e= 100 \u0026\u0026 n \u003c= 599) { code = n; break; } }\n  if (isNaN(code)) { const m = String(e.message || '').match(/^\\s*(\\d{3})\\b/) || low.match(/\"code\"\\W{1,4}(\\d{3})\\b/); if (m) code = Number(m[1]); }\n  if (provider === 'openrouter') {\n    const rem = low.match(/x-ratelimit-remaining\\W{1,8}(\\d+)/);\n    const rst = low.match(/x-ratelimit-reset\\W{1,8}(\\d{10,13})/);\n    let resetTs = null;\n    if (rst) { resetTs = Number(rst[1]); if (rst[1].length \u003c= 10) resetTs *= 1000; }\n    const quota = low.includes('free-models-per-day') || low.includes('openrouter_free_tier_daily') || (code === 429 \u0026\u0026 rem \u0026\u0026 Number(rem[1]) === 0);\n    if (quota) return { cls: 'provider_quota', skipProvider: true, retryable: false, resetTs, reason: 'free_quota_exhausted' };\n  }\n  if (code === 401 || code === 402 || (code === 403 \u0026\u0026 /key|auth|permission|credential|forbidden|unauthori/.test(low))) {\n    return { cls: 'provider_auth', skipProvider: true, retryable: false, resetTs: null, reason: 'auth_or_billing_rejected' };\n  }\n  if ((code \u003e= 500 \u0026\u0026 code \u003c= 599) || code === 408 || /timeout|timed out|etimedout|esockettimedout|econnreset|econnrefused|socket hang up/.test(low)) {\n    return { cls: 'transient', skipProvider: false, retryable: true, resetTs: null, reason: 'transient' };\n  }\n  return { cls: 'model_error', skipProvider: false, retryable: false, resetTs: null, reason: 'model_error' }; // 4xx incl. plain 429/404 -\u003e next model, 0 retry\n}\n\nfunction loopToNextModel(reason, extra){\n  wf.modelAttempt = (wf.modelAttempt || 0) + 1;\n  wf.transientTried = null;\n  wf.retrySame = false;\n  return { json: Object.assign({ decision: 'loop', taskType, attempt: wf.modelAttempt, failedModel: controller.modelName, lastError: reason, errorClass: 'model_error', skipProvider: false, retryable: false }, extra || {}) };\n}\n\nif (errMsg || !text || String(text).trim().length \u003c 20) {\n  if (!errMsg) return loopToNextModel('empty content');\n  const c = classifyError(b, controller.provider);\n  if (c.cls === 'provider_quota' || c.cls === 'provider_auth') {\n    markProvider(controller.provider, c.reason, c.resetTs);\n    return loopToNextModel(errMsg, { errorClass: c.cls, skipProvider: true, retryable: false, cooldownUntil: c.resetTs || null });\n  }\n  if (c.cls === 'transient') {\n    const key = controller.provider + '|' + controller.modelName + '|' + wf.modelAttempt;\n    if (wf.transientTried !== key) { // the ONE allowed retry: same model, same attempt slot\n      wf.transientTried = key;\n      wf.retrySame = true;\n      return { json: { decision: 'loop', taskType, attempt: wf.modelAttempt, failedModel: controller.modelName, lastError: errMsg, errorClass: 'transient', skipProvider: false, retryable: true, retrySame: true } };\n    }\n  }\n  return loopToNextModel(errMsg, { errorClass: c.cls === 'transient' ? 'transient' : 'model_error' });\n}\n\nconst parsed = tryParseJson(text);\n\nlet validOutput = false;\nif (taskType === 'factgrammar') {\n  let expectedCount = 5;\n  try { expectedCount = ($node(\"Lightweight Fact Lookup\").json.scenes || []).length || 5; } catch (e) { expectedCount = 5; }\n  validOutput = isValidScriptShape(parsed, expectedCount);\n} else if (taskType === 'semanticdup') {\n  validOutput = isValidSemanticDupShape(parsed);\n} else {\n  // 'script' (original generation task)\n  validOutput = isValidScriptShape(parsed, 5);\n}\n\nif (!validOutput) {\n  return loopToNextModel('invalid_or_malformed_task_output');\n}\n\nwf.modelAttempt = 0;\nwf.transientTried = null;\nwf.retrySame = false;\nreturn { json: { decision: 'success', taskType, ...b, resultType: 'AI_SUCCESS' } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "88eaa7ee-a4f2-473c-a388-afb68ff486ee",
+      "name": "Wait All Scenes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        1040
+      ],
+      "parameters": {
+        "jsCode": "const meta = $node(\"Parse JSON\").json;\nreturn [{json:{ready:true,sceneCount:5,title:meta.title,topic:meta.topic,description:meta.description,tags:meta.tags}}];"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "d81e0e86-4681-47e5-9f10-15d2bf374e41",
+      "name": "Wait Before Fact Check",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        320,
+        960
+      ],
+      "parameters": {
+        "amount": 15
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "9dba98f5-c315-4def-a5ed-8175b7a1f8ac",
+      "name": "Wait Before Image",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1600,
+        860
+      ],
+      "parameters": {
+        "amount": 3
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "b1a16800-6c14-4cf8-829c-4f312c678eee",
+      "name": "Wait Before Semantic Check",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        1200
+      ],
+      "parameters": {
+        "amount": 15
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "1cb0be29-d5d6-40a4-9b65-6b9d5c8c1e05",
+      "name": "YouTube Upload (Scheduled)",
+      "type": "n8n-nodes-base.youTube",
+      "typeVersion": 1,
+      "position": [
+        2800,
+        1060
+      ],
+      "parameters": {
+        "description": "{{ $node[\"Build YT Meta\"].json.description }}",
+        "operation": "upload",
+        "privacyStatus": "private",
+        "resource": "video",
+        "title": "{{ $node[\"Build YT Meta\"].json.title }}"
+      },
+      "credentials": {
+        "youTubeOAuth2Api": {
+          "id": "youTubeOAuth2Api",
+          "name": "youTubeOAuth2Api"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "6335d3f2-532c-4311-91b7-a391eb8bf24b",
+      "name": "Free Image Provider Controller",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        1320
+      ],
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// FREE IMAGE PROVIDER CONTROLLER\n// One provider, one model, one request at a time. Loop shape mirrors the text\n// pipeline (Model Controller -\u003e Request Ready? -\u003e HTTP -\u003e Validate -\u003e Router):\n//   this node  = live discovery + FREE-only filter + quota/health + select ONE model + build the request\n//   Get Image  = the actual HTTP generation (raw image bytes stay in native nodes; nothing binary is handled in JS)\n//   Image Attempt Result = validation verdict + bounded state update -\u003e next FREE model / next provider\n//\n// Provider sequence (fixed): pollinations -\u003e cloudflare -\u003e huggingface -\u003e google -\u003e openrouter -\u003e together -\u003e replicate.\n// A later provider is only reached when the earlier one has NO usable FREE model left (all tried this scene,\n// on cooldown, or quota-exhausted). Discovery is live on every call, only for the provider being considered.\n//\n// FREE is never inferred from a model name. Accepted evidence only:\n//   keyless-anonymous     - request carries NO credential at all, so it cannot be billed (Pollinations legacy endpoint)\n//   account-non-billable  - live HF whoami: not PRO (free accounts cannot pay-as-you-go), no payment method on file\n//   free-quota-no-overage - Cloudflare Workers AI Free allocation: over-quota calls are rejected, not billed\n//   live-zero-price      - provider's own live catalogue prices EVERY field at 0 (OpenRouter)\n// Providers with no machine-readable FREE signal are UNKNOWN -\u003e skipped (never treated as free, never treated as paid).\n// Output format is a CAPABILITY, not a pricing verdict: a verified-FREE model whose response is base64 JSON is marked\n// responseFormat=base64 and, while the native HTTP -\u003e Save Image path cannot store base64, gets status\n// FREE_BUT_UNSUPPORTED_OUTPUT (skipped, sibling models tried, provider NOT exhausted). Flip NATIVE_BASE64_SUPPORT once supported.\n// ---------------------------------------------------------------------------\nconst wf = $getWorkflowStaticData('global');\nif (!wf.imageCtl || typeof wf.imageCtl !== 'object' || !wf.imageCtl.rec) wf.imageCtl = { rec: {}, scene: '', tried: {}, attempts: 0, cur: null };\nconst S = wf.imageCtl;\nif (!S.failedCanon) S.failedCanon = {};\nconst helpers = this.helpers;\nconst NOW = Date.now();\nlet execId = 'na';\ntry { execId = String(($execution \u0026\u0026 $execution.id) || 'na'); } catch (e) { execId = 'na'; }\n\nconst sc = $node(\"Prep Scene\").json || {};\nconst idx = sc.idx || 1;\nconst prompt = String(sc.image_prompt || '').replace(/\\s+/g, ' ').trim().slice(0, 900);\nconst seed = Number(sc.imageSeed) \u003e= 0 ? Number(sc.imageSeed) : Math.floor(Math.random() * 99999);\nconst W = 512, H = 896;                 // same 9:16 size the old Get Image used\nconst HOUR = 3600000;\nconst MAX_SCENE_ATTEMPTS = 12;\nconst NATIVE_BASE64_SUPPORT = false;   // HTTP -\u003e Save Image currently stores raw image bytes only\nconst UNSUPPORTED = 'FREE_BUT_UNSUPPORTED_OUTPUT';\n\nconst PROVIDER_ORDER = ['pollinations', 'cloudflare', 'huggingface', 'google', 'openrouter', 'together', 'replicate'];\nconst STATIC_SKIP = {   // UNKNOWN pricing -\u003e excluded (not marked paid, not marked free)\n  google: 'UNKNOWN:no-machine-readable-free-image-tier',\n  together: 'UNKNOWN:image-pricing-not-machine-readable',\n  replicate: 'UNKNOWN:no-free-tier-signal'\n};\nconst ROUTER_MODEL_DENYLIST = new Set(['openrouter/free', 'openrouter/auto', 'openrouter/auto-beta']);\nconst FORBIDDEN_MODEL_PATTERN = /(^|[\\/\\-_.:\\s])(auto|default|best|latest|pro|premium|paid)([\\/\\-_.:\\s]|$)/i;\nconst ENDPOINT_PREFIX = {\n  pollinations: 'https://image.pollinations.ai/prompt/',\n  cloudflare: 'https://api.cloudflare.com/client/v4/accounts/',\n  huggingface: 'https://router.huggingface.co/hf-inference/models/',\n  openrouter: 'https://openrouter.ai/api/v1/chat/completions'\n};\n\nfunction failed(code, skipped) {\n  return { json: { loopStatus: 'failed_all', resultType: 'PLACEHOLDER_FALLBACK', failureCode: code, sceneIdx: idx, skipped: skipped || [] } };\n}\n\nfunction hasCred(p) {\n  const e = $env || {};\n  const ok = (v) =\u003e typeof v === 'string' \u0026\u0026 v.trim().length \u003e 0;\n  if (p === 'pollinations') return true;\n  if (p === 'cloudflare') return ok(e.CLOUDFLARE_API_TOKEN) \u0026\u0026 ok(e.CLOUDFLARE_ACCOUNT_ID);\n  if (p === 'huggingface') return ok(e.HF_TOKEN);\n  if (p === 'openrouter') return ok(e.OPENROUTER_API_KEY);\n  return false;\n}\nfunction peek(p, m) { return S.rec[p + '|' + m] || null; }\n// returns the timestamp until which a record is unusable (0 = usable); also lifts expired quota flags (auto-reset)\nfunction blockedUntil(rec) {\n  if (!rec) return 0;\n  let until = 0;\n  if (rec.quotaState === 'exhausted') {\n    if (rec.quotaResetAt \u0026\u0026 NOW \u003e= rec.quotaResetAt) {\n      rec.quotaState = 'available'; rec.quotaResetAt = 0;\n      if (rec.status === 'quota_exhausted' || rec.status === 'payment_required') rec.status = 'ok';\n    } else { until = Math.max(until, rec.quotaResetAt || (NOW + HOUR)); }\n  }\n  if (rec.cooldownUntil \u0026\u0026 NOW \u003c rec.cooldownUntil) until = Math.max(until, rec.cooldownUntil);\n  return until;\n}\nfunction canonicalOf(id) {\n  let s = String(id || '').toLowerCase().split(':')[0];\n  s = s.split('/').pop().replace(/[^a-z0-9]+/g, '').replace(/free$/, '');\n  return s;\n}\nasync function getJson(url, headers) {\n  try {\n    const r = await helpers.httpRequest({ method: 'GET', url, headers: headers || {}, timeout: 4000, json: true });\n    return { ok: true, data: r };\n  } catch (e) { return { ok: false }; }\n}\nfunction nonZero(o) {\n  if (!o || typeof o !== 'object') return false;\n  for (const k of Object.keys(o)) { const n = Number(o[k]); if (isFinite(n) \u0026\u0026 n \u003e 0) return true; }\n  return false;\n}\n\nfunction allZero(o) {\n  if (!o || typeof o !== 'object') return false;\n  if (o.prompt === undefined || o.completion === undefined) return false;\n  let n = 0;\n  for (const k of Object.keys(o)) {\n    if (o[k] === null || o[k] === undefined || o[k] === '') continue;\n    const v = Number(o[k]);\n    if (!isFinite(v) || v !== 0) return false;\n    n++;\n  }\n  return n \u003e 0;\n}\n// Cloudflare: best-effort live schema read to learn whether the model answers with raw bytes or base64 JSON.\nasync function cfResponseFormat(id) {\n  const r = await getJson('https://api.cloudflare.com/client/v4/accounts/' + $env.CLOUDFLARE_ACCOUNT_ID + '/ai/models/schema?model=' + encodeURIComponent(id), { Authorization: 'Bearer ' + $env.CLOUDFLARE_API_TOKEN });\n  if (!r.ok || !r.data || !r.data.result) return 'unknown';\n  let t = '';\n  try { const o = r.data.result.output !== undefined ? r.data.result.output : r.data.result; t = JSON.stringify(o).toLowerCase(); } catch (e) { return 'unknown'; }\n  if (t.indexOf('binary') !== -1) return 'binary';\n  if (/\"image\"\\s*:/.test(t)) return 'base64';\n  return 'unknown';\n}\n\n// ---- live discovery: returns { models:[{id, evidence, order}], reason } ----\nasync function discoverPollinations() {\n  const r = await getJson('https://image.pollinations.ai/models', {});\n  let data = r.ok ? r.data : null;\n  if (typeof data === 'string') {\n    try { data = JSON.parse(data); } catch (e) { data = data.split(/\\r?\\n/).map(s =\u003e s.trim()).filter(Boolean); }\n  }\n  const out = [];\n  if (Array.isArray(data)) {\n    for (const m of data) {\n      let id = null;\n      if (typeof m === 'string') id = m;\n      else if (m \u0026\u0026 typeof m === 'object') {\n        if (m.paid_only === true || m.paid === true || nonZero(m.pricing)) continue;\n        id = m.name || m.id || null;\n      }\n      if (typeof id === 'string' \u0026\u0026 /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) out.push({ id, evidence: 'keyless-anonymous', responseFormat: 'binary', order: out.length });\n      if (out.length \u003e= 25) break;\n    }\n    return { models: out, reason: out.length ? null : 'empty-catalogue' };\n  }\n  // catalogue unreachable: only re-use models that already produced a valid image via this same keyless endpoint\n  for (const k of Object.keys(S.rec)) {\n    const rec = S.rec[k];\n    if (rec.provider === 'pollinations' \u0026\u0026 rec.model !== '*' \u0026\u0026 rec.successCount \u003e 0) out.push({ id: rec.model, evidence: 'keyless-anonymous', responseFormat: 'binary', order: out.length });\n  }\n  return { models: out, reason: out.length ? 'catalogue-unavailable-using-known-good' : 'discovery-unavailable' };\n}\nasync function discoverCloudflare() {\n  const e = $env;\n  const hdr = { Authorization: 'Bearer ' + e.CLOUDFLARE_API_TOKEN };\n  const base = 'https://api.cloudflare.com/client/v4/accounts/' + e.CLOUDFLARE_ACCOUNT_ID + '/ai/models/search?per_page=100';\n  let r = await getJson(base + '\u0026task=Text-to-Image', hdr);\n  if (!r.ok || !r.data || r.data.success !== true || !Array.isArray(r.data.result)) r = await getJson(base, hdr);\n  if (!r.ok || !r.data || r.data.success !== true || !Array.isArray(r.data.result)) return { models: [], reason: 'discovery-unavailable' };\n  const out = [];\n  for (const m of r.data.result) {\n    const name = m \u0026\u0026 m.name;\n    const task = m \u0026\u0026 m.task ? String(m.task.name || '') : '';\n    if (typeof name !== 'string' || !/^@(cf|hf)\\/[A-Za-z0-9._\\/-]+$/.test(name)) continue;\n    if (!/text[\\s-]*to[\\s-]*image/i.test(task)) continue;\n    out.push({ id: name, evidence: 'free-quota-no-overage', responseFormat: 'unknown', order: out.length });\n  }\n  return { models: out.slice(0, 20), reason: out.length ? null : 'no-text-to-image-model' };\n}\nasync function discoverHF() {\n  const hdr = { Authorization: 'Bearer ' + $env.HF_TOKEN };\n  const who = await getJson('https://huggingface.co/api/whoami-v2', hdr);\n  if (!who.ok || !who.data || typeof who.data !== 'object') return { models: [], reason: 'account-unverifiable' };\n  // FREE only when the account cannot be billed: not PRO (free users have no pay-as-you-go) and no payment method\n  if (who.data.isPro !== false || who.data.canPay === true) return { models: [], reason: 'account-can-be-billed-or-unknown' };\n  const q = 'https://huggingface.co/api/models?pipeline_tag=text-to-image\u0026inference_provider=hf-inference\u0026sort=downloads\u0026direction=-1\u0026limit=30';\n  let r = await getJson(q + '\u0026expand[]=inferenceProviderMapping', hdr);\n  if (!r.ok || !Array.isArray(r.data)) r = await getJson(q, hdr);\n  if (!r.ok || !Array.isArray(r.data)) return { models: [], reason: 'discovery-unavailable' };\n  const out = [];\n  for (const m of r.data) {\n    const id = m \u0026\u0026 m.id;\n    if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) continue;\n    const map = m.inferenceProviderMapping;\n    if (map) {\n      let ent = null;\n      if (Array.isArray(map)) ent = map.find(x =\u003e x \u0026\u0026 x.provider === 'hf-inference');\n      else if (typeof map === 'object') ent = map['hf-inference'];\n      if (!ent || (ent.status \u0026\u0026 ent.status !== 'live')) continue;\n    }\n    out.push({ id, evidence: 'account-non-billable', responseFormat: 'binary', order: out.length });\n    if (out.length \u003e= 15) break;\n  }\n  return { models: out, reason: out.length ? null : 'no-hf-inference-image-model' };\n}\nasync function discoverOpenRouter() {\n  const r = await getJson('https://openrouter.ai/api/v1/models?output_modalities=image', { Authorization: 'Bearer ' + $env.OPENROUTER_API_KEY });\n  if (!r.ok || !r.data || !Array.isArray(r.data.data)) return { models: [], reason: 'discovery-unavailable' };\n  const out = [];\n  for (const m of r.data.data) {\n    const id = m \u0026\u0026 m.id;\n    if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:\\/-]{0,120}$/.test(id)) continue;\n    const om = m.architecture \u0026\u0026 Array.isArray(m.architecture.output_modalities) ? m.architecture.output_modalities : null;\n    if (om \u0026\u0026 om.indexOf('image') === -1) continue;\n    if (!allZero(m.pricing)) continue;   // FREE only when the live price of every field is exactly 0 (never from the name / ':free')\n    out.push({ id, evidence: 'live-zero-price', responseFormat: 'base64', modalities: om \u0026\u0026 om.indexOf('text') !== -1 ? ['image', 'text'] : ['image'], order: out.length });\n    if (out.length \u003e= 20) break;\n  }\n  return { models: out, reason: out.length ? null : 'no-verified-zero-price-image-model' };\n}\nconst DISCOVERERS = { pollinations: discoverPollinations, cloudflare: discoverCloudflare, huggingface: discoverHF, openrouter: discoverOpenRouter };\n\n// ---- request builders (URLs are built from fixed prefixes only; catalogue ids are pattern-validated above) ----\nfunction buildRequest(p, id, cfg) {\n  if (p === 'pollinations') {\n    return { method: 'GET', authValue: '', bodyStr: '',\n      url: ENDPOINT_PREFIX.pollinations + encodeURIComponent(prompt) + '?width=' + W + '\u0026height=' + H + '\u0026model=' + encodeURIComponent(id) + '\u0026nologo=true\u0026seed=' + seed };\n  }\n  if (p === 'cloudflare') {\n    return { method: 'POST', authValue: 'Bearer ' + $env.CLOUDFLARE_API_TOKEN,\n      url: ENDPOINT_PREFIX.cloudflare + $env.CLOUDFLARE_ACCOUNT_ID + '/ai/run/' + id,\n      bodyStr: JSON.stringify({ prompt }) };\n  }\n  if (p === 'huggingface') {\n    return { method: 'POST', authValue: 'Bearer ' + $env.HF_TOKEN,\n      url: ENDPOINT_PREFIX.huggingface + id,\n      bodyStr: JSON.stringify({ inputs: prompt, parameters: { width: W, height: H } }) };\n  }\n  if (p === 'openrouter') {   // only reachable once NATIVE_BASE64_SUPPORT is true\n    return { method: 'POST', authValue: 'Bearer ' + $env.OPENROUTER_API_KEY,\n      url: ENDPOINT_PREFIX.openrouter,\n      bodyStr: JSON.stringify({ model: id, messages: [{ role: 'user', content: prompt }], modalities: (cfg \u0026\u0026 cfg.modalities) || ['image', 'text'], stream: false }) };\n  }\n  return null;\n}\n\n// Paid protection: FREE + image-capable + API available + quota available + no payment required. Any miss -\u003e no request.\nfunction guard(p, c) {\n  if (c.free !== true || !c.evidence) return 'not-verified-free';\n  if (c.imageCapable !== true) return 'not-image-model';\n  if (!hasCred(p)) return 'missing-credential';\n  if (!ENDPOINT_PREFIX[p]) return 'endpoint-not-approved';\n  if (ROUTER_MODEL_DENYLIST.has(c.id) || FORBIDDEN_MODEL_PATTERN.test(c.id)) return 'router-or-tiered-model';\n  const rec = peek(p, c.id);\n  if (blockedUntil(rec)) return rec \u0026\u0026 rec.status === UNSUPPORTED ? UNSUPPORTED : 'quota-or-cooldown';\n  return null;\n}\nfunction rank(st) { return st === 'ok' ? 0 : (st === 'degraded' ? 1 : (st === 'unhealthy' ? 2 : 3)); }\n\n// ---------------------------------------------------------------------------\nconst sceneKey = execId + '|' + idx;\nif (S.scene !== sceneKey) { S.scene = sceneKey; S.tried = {}; S.failedCanon = {}; S.attempts = 0; S.cur = null; }\nif (!prompt) return failed('EMPTY_IMAGE_PROMPT', []);\nif (S.attempts \u003e= MAX_SCENE_ATTEMPTS) return failed('ATTEMPT_CAP', []);\n\nconst skipped = [];\nconst note = (s) =\u003e { if (skipped.length \u003c 12) skipped.push(s); };\n\nfor (const p of PROVIDER_ORDER) {\n  if (STATIC_SKIP[p]) { note(p + ':' + STATIC_SKIP[p]); continue; }\n  if (!hasCred(p)) { note(p + ':no-credential'); continue; }\n  const provRec = peek(p, '*');\n  if (blockedUntil(provRec)) { note(p + ':provider-exhausted'); continue; }\n\n  const disc = await DISCOVERERS[p]();\n  // canonical de-duplication inside the provider's live list\n  const seen = {};\n  const list = [];\n  for (const m of disc.models) {\n    const canon = canonicalOf(m.id);\n    if (!canon || seen[canon]) continue;\n    seen[canon] = true;\n    list.push({ id: m.id, canonical: canon, evidence: m.evidence, order: m.order, responseFormat: m.responseFormat || 'unknown', modalities: m.modalities, free: true, imageCapable: true });\n  }\n  if (!list.length) {\n    // nothing verifiable right now: short provider cooldown, then re-discover automatically\n    S.rec[p + '|*'] = Object.assign(S.rec[p + '|*'] || { provider: p, model: '*', status: 'ok', successCount: 0, failureCount: 0, lastSuccess: 0, lastFailure: 0, lastLatency: 0, quotaState: 'unknown', quotaResetAt: 0 },\n      { status: 'exhausted', cooldownUntil: NOW + 2 * 60000, lastFailure: NOW });\n    note(p + ':' + (disc.reason || 'no-free-model'));\n    continue;\n  }\n  list.sort((a, b) =\u003e {\n    const ra = peek(p, a.id), rb = peek(p, b.id);\n    const sa = ra ? rank(ra.status) : 0, sb = rb ? rank(rb.status) : 0;\n    if (sa !== sb) return sa - sb;\n    const ta = ra ? ra.lastSuccess : 0, tb = rb ? rb.lastSuccess : 0;\n    if (ta !== tb) return tb - ta;\n    return a.order - b.order;\n  });\n  for (const c of list) {\n    if (S.tried[p + '|' + c.id]) continue;\n    if (S.failedCanon[c.canonical]) { note(p + ':' + c.id + ':duplicate-of-failed-model'); continue; }\n    const g = guard(p, c);\n    if (g) { note(p + ':' + c.id + ':' + g); continue; }\n    if (c.responseFormat === 'unknown' \u0026\u0026 p === 'cloudflare') c.responseFormat = await cfResponseFormat(c.id);\n    // output format = capability: verified-FREE but not storable by the native path -\u003e skip THIS model only (provider stays available)\n    if (c.responseFormat === 'base64' \u0026\u0026 !NATIVE_BASE64_SUPPORT) { note(p + ':' + c.id + ':' + UNSUPPORTED + '(responseFormat=base64)'); continue; }\n    const req = buildRequest(p, c.id, c);\n    if (!req || req.url.indexOf(ENDPOINT_PREFIX[p]) !== 0) { note(p + ':' + c.id + ':endpoint-not-approved'); continue; }\n    if (p === 'pollinations' \u0026\u0026 req.authValue) { note(p + ':' + c.id + ':credential-on-keyless'); continue; }\n    S.tried[p + '|' + c.id] = 1;\n    S.attempts += 1;\n    S.cur = { provider: p, model: c.id, canonical: c.canonical, evidence: c.evidence, at: NOW };\n    return { json: {\n      loopStatus: 'continue', sceneIdx: idx, attempt: S.attempts,\n      provider: p, modelName: c.id, canonical: c.canonical,\n      verifiedFree: true, verificationTier: c.evidence,\n      method: req.method, url: req.url, authValue: req.authValue, bodyStr: req.bodyStr,\n      skipped\n    } };\n  }\n  note(p + ':no-compatible-free-model-left');\n}\nreturn failed('NO_FREE_IMAGE_PROVIDER_AVAILABLE', skipped);\n"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "5826b717-f538-4894-abd2-a1cf1869ca31",
+      "name": "Image Request Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        1320
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.loopStatus }}",
+            "operator": "equals",
+            "right": "continue"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "62668328-25c0-48ec-9d76-47a6f138d064",
+      "name": "Image Request Is GET?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        1320
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.method }}",
+            "operator": "equals",
+            "right": "GET"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "e67b9b20-d8e6-458e-aa19-cdccd268f7cb",
+      "name": "Get Image (POST)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        1420
+      ],
+      "parameters": {
+        "body": "{{ $json.bodyStr }}",
+        "headers": {
+          "Authorization": "{{ $json.authValue }}",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "url": "{{ $json.url }}"
+      },
+      "waitBetweenTries": 1000,
+      "continueOnFail": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "4172d7e4-a194-48b8-a9f5-6088cda07ffa",
+      "name": "Image Attempt Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        1320
+      ],
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// IMAGE ATTEMPT RESULT\n// Fed by (a) Get Image / Get Image (POST) error outputs (HTTP failure) and (b) Check Image Valid (file verdict).\n// Updates the bounded per-model state, then decides: 'success' (continue to TTS) or 'loop' (next FREE model /\n// next provider via the controller). Bounded state per provider|model:\n//   provider, model, status, successCount, failureCount, lastSuccess, lastFailure, lastLatency,\n//   quotaState, quotaResetAt, cooldownUntil     (max 48 records; oldest evicted)\n// ---------------------------------------------------------------------------\nconst wf = $getWorkflowStaticData('global');\nif (!wf.imageCtl || typeof wf.imageCtl !== 'object' || !wf.imageCtl.rec) wf.imageCtl = { rec: {}, scene: '', tried: {}, attempts: 0, cur: null };\nconst S = wf.imageCtl;\nif (!S.failedCanon) S.failedCanon = {};\nconst UNSUPPORTED = 'FREE_BUT_UNSUPPORTED_OUTPUT';\nconst NOW = Date.now();\nconst HOUR = 3600000;\nconst MAX_RECORDS = 48;\nconst MAX_SCENE_ATTEMPTS = 12;\nconst KEYLESS = { pollinations: true };\nconst PROVIDER_WIDE_QUOTA = { cloudflare: true, huggingface: true };\n\nconst ctl = $node(\"Free Image Provider Controller\").json || {};\nfunction finish(extra) {\n  S.scene = ''; S.tried = {}; S.failedCanon = {}; S.attempts = 0; S.cur = null;    // next scene starts clean\n  return { json: Object.assign({ decision: 'success' }, extra || {}) };\n}\nif (ctl.loopStatus !== 'continue') {\n  return finish({ imageStatus: 'failed_all', imageFailureCode: ctl.failureCode || 'NO_FREE_IMAGE_PROVIDER_AVAILABLE' });\n}\nconst provider = ctl.provider, model = ctl.modelName;\n\nfunction getRec(p, m) {\n  const k = p + '|' + m;\n  if (!S.rec[k]) {\n    S.rec[k] = { provider: p, model: m, status: 'ok', successCount: 0, failureCount: 0, lastSuccess: 0, lastFailure: 0, lastLatency: 0, quotaState: 'unknown', quotaResetAt: 0, cooldownUntil: 0 };\n    const keys = Object.keys(S.rec);\n    if (keys.length \u003e MAX_RECORDS) {\n      keys.filter(x =\u003e x !== k).sort((a, b) =\u003e Math.max(S.rec[a].lastSuccess, S.rec[a].lastFailure) - Math.max(S.rec[b].lastSuccess, S.rec[b].lastFailure))\n        .slice(0, keys.length - MAX_RECORDS).forEach(x =\u003e { delete S.rec[x]; });\n    }\n  }\n  return S.rec[k];\n}\nfunction nextUtcMidnight() { const d = new Date(NOW); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); }\nfunction nextUtcMonth() { const d = new Date(NOW); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1); }\nfunction resetFor(p, resetTs) {\n  if (resetTs \u0026\u0026 resetTs \u003e NOW) return Math.max(Math.min(resetTs, NOW + 35 * 24 * HOUR), NOW + 60000);\n  if (p === 'cloudflare') return nextUtcMidnight();\n  if (p === 'huggingface') return nextUtcMonth();\n  return NOW + HOUR;\n}\nfunction blockProvider(p, until, status, quota) {\n  const r = getRec(p, '*');\n  r.status = status; r.lastFailure = NOW; r.failureCount += 1;\n  if (quota) { r.quotaState = 'exhausted'; r.quotaResetAt = until; }\n  r.cooldownUntil = until;\n}\n\n// ---- HTTP failure classification (same idea as Validate Attempt; the error text carries code/headers) ----\n// err is the engine's error text (string) or object; extra = body of the HTTP node's last response (a non-2xx reply is NOT an\n// error for the HTTP node, it simply arrives as JSON/text with no image -\u003e Save Image fails), so the provider's own message is used.\nfunction classify(err, extra) {\n  let raw = '';\n  if (typeof err === 'string') raw = err + ' ' + (extra || '');\n  else { try { raw = String(err.message || '') + ' ' + JSON.stringify(err).slice(0, 3000) + ' ' + (extra || ''); } catch (e) { raw = String(err); } }\n  if (typeof err !== 'object' || err === null) err = {};\n  const low = raw.toLowerCase();\n  let code = NaN;\n  for (const v of [err.httpCode, err.status, err.statusCode, err.code]) { const n = Number(v); if (n \u003e= 100 \u0026\u0026 n \u003c= 599) { code = n; break; } }\n  if (isNaN(code)) { const m = String(err.message || '').match(/^\\s*(\\d{3})\\b/) || low.match(/http (\\d{3})\\b/) || low.match(/\"(?:code|status|statuscode)\"\\W{1,4}(\\d{3})\\b/); if (m) code = Number(m[1]); }\n  if (isNaN(code)) {\n    if (/too many requests|rate.?limit/.test(low)) code = 429;\n    else if (/payment required/.test(low)) code = 402;\n    else if (/unauthori[sz]ed|forbidden|invalid.{0,12}api.?key/.test(low)) code = 401;\n    else if (/not found|no such model|unknown model/.test(low)) code = 404;\n  }\n  const ra = low.match(/retry-after\\W{1,8}(\\d+)/);\n  const rst = low.match(/x-ratelimit-reset\\W{1,8}(\\d{10,13})/);\n  let resetTs = null;\n  if (rst) { resetTs = Number(rst[1]); if (rst[1].length \u003c= 10) resetTs *= 1000; }\n  else if (ra) resetTs = NOW + Number(ra[1]) * 1000;\n  const quotaWords = /(daily|per day|per-day|quota|allocation|exhaust|exceed|credit|billing|insufficient|monthly|4006|free-models-per-day)/.test(low);\n  if (isNaN(code) \u0026\u0026 /no binary data|binary data to write|empty (body|response)|zero-length|not an image/.test(low)) return { cls: 'invalid', resetTs: null };   // empty / non-binary provider response\n  if (/timeout|timed out|etimedout|econnreset|econnrefused|socket hang up/.test(low) \u0026\u0026 !(code \u003e= 400 \u0026\u0026 code \u003c 500)) return { cls: 'timeout', resetTs: null };\n  if (code === 402) return { cls: 'quota', payment: true, wide: true, resetTs };\n  if (code === 429) {\n    if (quotaWords || (resetTs \u0026\u0026 resetTs - NOW \u003e 15 * 60000)) return { cls: 'quota', wide: !!PROVIDER_WIDE_QUOTA[provider], resetTs };\n    return { cls: 'rate', resetTs };\n  }\n  if (code === 401 || code === 403) {\n    if (quotaWords) return { cls: 'quota', wide: !!PROVIDER_WIDE_QUOTA[provider], resetTs };\n    return { cls: 'auth', resetTs: null };\n  }\n  if (code === 404 || code === 410 || code === 400 || code === 422) return { cls: 'unsupported', resetTs: null };\n  return { cls: 'server', resetTs: null };\n}\nfunction ladder(rec) {\n  if (rec.status === 'ok' || rec.status === 'quota_exhausted') { rec.status = 'degraded'; rec.cooldownUntil = NOW + 60000; }\n  else if (rec.status === 'degraded') { rec.status = 'unhealthy'; rec.cooldownUntil = NOW + 10 * 60000; }\n  else { rec.status = 'unhealthy'; rec.cooldownUntil = NOW + HOUR; }\n}\n\nconst rec = getRec(provider, model);\nconst b = $json || {};\nconst started = S.cur \u0026\u0026 S.cur.at ? S.cur.at : NOW;\nlet verdict = null;   // null = success\n\nif (b.error) {\n  let extra = '';\n  try { extra = JSON.stringify($node(ctl.method === 'GET' ? 'Get Image' : 'Get Image (POST)').json).slice(0, 2000); } catch (e) { extra = ''; }\n  verdict = classify(b.error, extra);\n} else {\n  let text = '';\n  try { text = JSON.stringify(b).slice(0, 4000); } catch (e) { text = ''; }\n  // Check Image Valid marks any bad/missing/undersized file with *_GEN (and replaces it with a placeholder)\n  if (/_GEN|PLACEHOLDER_MADE|IMG_MISSING|IMG_NOT_VALID|IMG_TOO_SMALL/.test(text) || !/IMG_OK_/.test(text)) verdict = { cls: 'invalid', resetTs: null };\n}\n\nif (!verdict) {\n  rec.status = 'ok'; rec.successCount += 1; rec.lastSuccess = NOW; rec.lastLatency = Math.max(0, NOW - started);\n  rec.quotaState = 'available'; rec.quotaResetAt = 0; rec.cooldownUntil = 0;\n  const pr = S.rec[provider + '|*'];\n  if (pr) { pr.status = 'ok'; pr.cooldownUntil = 0; pr.quotaState = 'available'; pr.quotaResetAt = 0; }\n  return finish({ imageStatus: 'ok', imageProvider: provider, imageModel: model, imageCanonical: ctl.canonical, imageFreeEvidence: ctl.verificationTier, imageAttempts: ctl.attempt, imageLatencyMs: rec.lastLatency });\n}\n\nrec.failureCount += 1; rec.lastFailure = NOW;\nif (verdict.cls === 'quota') {\n  const until = resetFor(provider, verdict.resetTs);\n  rec.status = verdict.payment ? 'payment_required' : 'quota_exhausted';\n  rec.quotaState = 'exhausted'; rec.quotaResetAt = verdict.payment ? Math.max(until, NOW + 24 * HOUR) : until; rec.cooldownUntil = 0;\n  if (verdict.wide) blockProvider(provider, rec.quotaResetAt, 'quota_exhausted', true);   // account-wide: no point trying siblings\n} else if (verdict.cls === 'rate') {\n  const wait = Math.min(Math.max(verdict.resetTs ? verdict.resetTs - NOW : 0, 30000), 15 * 60000);\n  if (KEYLESS[provider]) blockProvider(provider, NOW + wait, 'degraded', false);          // anonymous limit is per-IP, not per-model\n  else { rec.status = 'degraded'; rec.cooldownUntil = NOW + wait; }\n} else if (verdict.cls === 'auth') {\n  if (KEYLESS[provider]) { rec.status = 'auth_blocked'; rec.cooldownUntil = NOW + 24 * HOUR; }\n  else blockProvider(provider, NOW + HOUR, 'auth_blocked', false);\n} else if (verdict.cls === 'unsupported') {\n  rec.status = 'unsupported'; rec.cooldownUntil = NOW + 6 * HOUR;\n} else if (verdict.cls === 'invalid' \u0026\u0026 rec.successCount === 0 \u0026\u0026 provider !== 'pollinations') {\n  // verified FREE but never produced a storable image (typically base64 JSON output): a capability gap, NOT paid / NOT non-free.\n  // Only this model is set aside (re-probed automatically after 24h); the provider stays available for its other FREE models.\n  rec.status = UNSUPPORTED; rec.cooldownUntil = NOW + 24 * HOUR;\n} else {\n  ladder(rec);\n}\n\nif (verdict.cls === 'invalid' \u0026\u0026 ctl.canonical) S.failedCanon[ctl.canonical] = 1;   // same underlying model elsewhere would give the same bad output\nif (S.attempts \u003e= MAX_SCENE_ATTEMPTS) {\n  return finish({ imageStatus: 'failed_all', imageFailureCode: 'ATTEMPT_CAP', lastError: verdict.cls });\n}\nreturn { json: { decision: 'loop', failedProvider: provider, failedModel: model, errorClass: verdict.cls, attempt: S.attempts } };\n"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "9f0dafd8-46e4-4d83-92bb-0889388d448d",
+      "name": "Image Loop Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2800,
+        1320
+      ],
+      "parameters": {
+        "combinator": "and",
+        "conditions": [
+          {
+            "left": "{{ $json.decision }}",
+            "operator": "equals",
+            "right": "success"
+          }
+        ]
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "413ca6a3-2ad7-4295-b1b8-80ca4d6037bd",
+      "name": "Image Loop Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2800,
+        1460
+      ],
+      "parameters": {
+        "amount": 2
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "467373f6-019b-4534-a0e9-c7c48630ff4c",
+      "name": "Validate Google Sheets Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -700,
+        1060
+      ],
+      "parameters": {
+        "jsCode": "// Fail-fast validation of the single Google Sheets configuration source: GOOGLE_SHEETS_URL (full spreadsheet URL incl. the target tab's gid).\n//   https://docs.google.com/spreadsheets/d/\u003cSPREADSHEET_ID\u003e/edit#gid=\u003cTAB_GID\u003e\n// This runs before any Sheets read/write. The MicroFlow engine's Google Sheets executor derives the spreadsheet ID from the same\n// variable and resolves gid -\u003e exact tab name with the connected Google account (a Code node has no authenticated Google access).\n// There is NO fallback (no first tab, no default range): any problem stops the execution with GOOGLE_SHEETS_CONFIG_ERROR.\nconst url = String(($env \u0026\u0026 $env.GOOGLE_SHEETS_URL) || '').trim();\nif (!url) {\n  throw new Error('GOOGLE_SHEETS_CONFIG_ERROR: environment variable GOOGLE_SHEETS_URL is missing. Set it to the full Google Spreadsheet URL including the target sheet gid (https://docs.google.com/spreadsheets/d/\u003cID\u003e/edit#gid=\u003cTAB_ID\u003e).');\n}\nif (!/^https:\\/\\/docs\\.google\\.com\\/spreadsheets\\/(?:u\\/\\d+\\/)?d\\/[A-Za-z0-9_-]{20,}/.test(url)) {\n  throw new Error('GOOGLE_SHEETS_CONFIG_ERROR: GOOGLE_SHEETS_URL is not a valid Google Spreadsheet URL (spreadsheet ID could not be extracted; expected https://docs.google.com/spreadsheets/d/\u003cID\u003e/...).');\n}\nif (!/[#\u0026?]gid=\\d+/.test(url)) {\n  throw new Error('GOOGLE_SHEETS_CONFIG_ERROR: GOOGLE_SHEETS_URL must include the target sheet gid (e.g. ...#gid=123456789). No default or first-tab fallback is used.');\n}\nreturn [{ json: Object.assign({}, $json) }];\n"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "9a42d6e9-2a4f-44ac-8428-508ebe7db909",
+      "name": "Normalize Topic Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        760
+      ],
+      "parameters": {
+        "jsCode": "// Google Sheets cells must be scalars. Every field of the row is normalized deterministically before the Sheets node:\n//   null/undefined -\u003e ''   | string/number/boolean -\u003e unchanged   | array of scalars -\u003e \"a,b,c\"\n//   nested array/object -\u003e compact JSON string   | each cell capped (bounded) below the Sheets per-cell limit\n// Field names and their order are preserved, so the sheet column layout is unchanged.\nconst MAX_CELL = 45000;\nconst cap = (s) =\u003e (s.length \u003e MAX_CELL ? s.slice(0, MAX_CELL) : s);\nfunction isScalar(x) { const t = typeof x; return t === 'string' || t === 'number' || t === 'boolean'; }\nfunction scalar(v) {\n  if (v === null || v === undefined) return '';\n  const t = typeof v;\n  if (t === 'string') return cap(v);\n  if (t === 'number') return isFinite(v) ? v : '';\n  if (t === 'boolean') return v;\n  if (v instanceof Date) return v.toISOString();\n  if (Array.isArray(v)) {\n    let simple = true;\n    for (let i = 0; i \u003c v.length; i++) { if (!isScalar(v[i])) { simple = false; break; } }\n    if (simple) { const parts = []; for (let i = 0; i \u003c v.length; i++) parts.push(String(v[i])); return cap(parts.join(',')); }\n  }\n  try { const s = JSON.stringify(v); return s === undefined ? '' : cap(s); } catch (e) { return cap(String(v)); }\n}\nconst src = $json || {};\nconst out = {};\nfor (const k of Object.keys(src)) out[k] = scalar(src[k]);\nreturn [{ json: out }];\n"
+      },
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "a9616202-13b2-43fb-b09e-72b3a8d62e60",
+      "name": "Normalize Topic Update Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        1160
+      ],
+      "parameters": {
+        "jsCode": "// Google Sheets cells must be scalars. Every field of the row is normalized deterministically before the Sheets node:\n//   null/undefined -\u003e ''   | string/number/boolean -\u003e unchanged   | array of scalars -\u003e \"a,b,c\"\n//   nested array/object -\u003e compact JSON string   | each cell capped (bounded) below the Sheets per-cell limit\n// Field names and their order are preserved, so the sheet column layout is unchanged.\nconst MAX_CELL = 45000;\nconst cap = (s) =\u003e (s.length \u003e MAX_CELL ? s.slice(0, MAX_CELL) : s);\nfunction isScalar(x) { const t = typeof x; return t === 'string' || t === 'number' || t === 'boolean'; }\nfunction scalar(v) {\n  if (v === null || v === undefined) return '';\n  const t = typeof v;\n  if (t === 'string') return cap(v);\n  if (t === 'number') return isFinite(v) ? v : '';\n  if (t === 'boolean') return v;\n  if (v instanceof Date) return v.toISOString();\n  if (Array.isArray(v)) {\n    let simple = true;\n    for (let i = 0; i \u003c v.length; i++) { if (!isScalar(v[i])) { simple = false; break; } }\n    if (simple) { const parts = []; for (let i = 0; i \u003c v.length; i++) parts.push(String(v[i])); return cap(parts.join(',')); }\n  }\n  try { const s = JSON.stringify(v); return s === undefined ? '' : cap(s); } catch (e) { return cap(String(v)); }\n}\nconst src = $json || {};\nconst out = {};\nfor (const k of Object.keys(src)) out[k] = scalar(src[k]);\nreturn [{ json: out }];\n"
+      },
+      "waitBetweenTries": 1000
+    }
+  ],
+  "connections": {
+    "Apply Fact \u0026 Grammar Fixes": {
+      "main": [
+        [
+          {
+            "node": "Dedupe Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Exclusion Prompt": {
+      "main": [
+        [
+          {
+            "node": "Fetch Obscure Wiki Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Full SRT": {
+      "main": [
+        [
+          {
+            "node": "Concat + BGM + Subtitle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build YT Meta": {
+      "main": [
+        [
+          {
+            "node": "Read Final Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Final Video": {
+      "main": [
+        [
+          {
+            "node": "Generate Thumbnail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Image Valid": {
+      "main": [
+        [
+          {
+            "node": "Image Attempt Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Voice Valid": {
+      "main": [
+        [
+          {
+            "node": "Make Clip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Concat + BGM + Subtitle": {
+      "main": [
+        [
+          {
+            "node": "Check Final Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cooldown Between Scenes": {
+      "main": [
+        [
+          {
+            "node": "Loop One By One",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe Check": {
+      "main": [
+        [
+          {
+            "node": "Skip AI Duplicate Check?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate Wait": {
+      "main": [
+        [
+          {
+            "node": "Retry New Topic (loop back)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure Scenes Data": {
+      "main": [
+        [
+          {
+            "node": "Split Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Error Notification",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Gmail Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Log": {
+      "main": [
+        [
+          {
+            "node": "Error Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Error Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execution Log": {
+      "main": [
+        [
+          {
+            "node": "Success Notification",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Gmail Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Google Trends": {
+      "main": [
+        [
+          {
+            "node": "Validate Google Sheets Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Wiki Topics": {
+      "main": [
+        [
+          {
+            "node": "Model Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract YouTube Trends": {
+      "main": [
+        [
+          {
+            "node": "Fetch Google Trends RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Google Trends RSS": {
+      "main": [
+        [
+          {
+            "node": "Extract Google Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Obscure Wiki Topics": {
+      "main": [
+        [
+          {
+            "node": "Extract Wiki Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch YouTube Trending": {
+      "main": [
+        [
+          {
+            "node": "Extract YouTube Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Thumbnail": {
+      "main": [
+        [
+          {
+            "node": "Build YT Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Image": {
+      "main": [
+        [
+          {
+            "node": "Save Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Attempt Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grammar QC Precheck": {
+      "main": [
+        [
+          {
+            "node": "Lightweight Fact Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guard All Clips": {
+      "main": [
+        [
+          {
+            "node": "Wait All Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Unique?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Topic Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Ensure Scenes Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Duplicate Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lightweight Fact Lookup": {
+      "main": [
+        [
+          {
+            "node": "Needs Fact Grammar AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop One By One": {
+      "main": [
+        [
+          {
+            "node": "Guard All Clips",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Scene",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Router": {
+      "main": [
+        [
+          {
+            "node": "Task Router: Fact/Grammar?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Wait": {
+      "main": [
+        [
+          {
+            "node": "Model Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Clip": {
+      "main": [
+        [
+          {
+            "node": "Cooldown Between Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Semantic Result": {
+      "main": [
+        [
+          {
+            "node": "Is Unique?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Controller": {
+      "main": [
+        [
+          {
+            "node": "Model Request Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Request Ready?": {
+      "main": [
+        [
+          {
+            "node": "Unified AI Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Fact Grammar AI?": {
+      "main": [
+        [
+          {
+            "node": "Wait Before Fact Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dedupe Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Grammar QC Precheck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Execution Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Fetch YouTube Trending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Scene": {
+      "main": [
+        [
+          {
+            "node": "Wait Before Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Final Video": {
+      "main": [
+        [
+          {
+            "node": "YouTube Upload (Scheduled)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Thumbnail": {
+      "main": [
+        [
+          {
+            "node": "Set Thumbnail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Used Topics": {
+      "main": [
+        [
+          {
+            "node": "Build Exclusion Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry New Topic (loop back)": {
+      "main": [
+        [
+          {
+            "node": "Build Exclusion Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Image": {
+      "main": [
+        [
+          {
+            "node": "Check Image Valid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Attempt Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pre Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Thumbnail": {
+      "main": [
+        [
+          {
+            "node": "Post Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip AI Duplicate Check?": {
+      "main": [
+        [
+          {
+            "node": "Is Unique?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait Before Semantic Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Scenes": {
+      "main": [
+        [
+          {
+            "node": "Loop One By One",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "TTS (Eleven-\u003eEdge-\u003eSilent)": {
+      "main": [
+        [
+          {
+            "node": "Check Voice Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Task Router: Fact/Grammar?": {
+      "main": [
+        [
+          {
+            "node": "Apply Fact \u0026 Grammar Fixes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Task Router: Semantic Dup?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Task Router: Semantic Dup?": {
+      "main": [
+        [
+          {
+            "node": "Merge Semantic Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unified AI Request": {
+      "main": [
+        [
+          {
+            "node": "Validate Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Topic (Uploaded)": {
+      "main": [
+        [
+          {
+            "node": "Read Thumbnail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Attempt": {
+      "main": [
+        [
+          {
+            "node": "Loop Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait All Scenes": {
+      "main": [
+        [
+          {
+            "node": "Build Full SRT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Fact Check": {
+      "main": [
+        [
+          {
+            "node": "Model Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Image": {
+      "main": [
+        [
+          {
+            "node": "Free Image Provider Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Semantic Check": {
+      "main": [
+        [
+          {
+            "node": "Model Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "YouTube Upload (Scheduled)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Topic Update Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Free Image Provider Controller": {
+      "main": [
+        [
+          {
+            "node": "Image Request Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Request Ready?": {
+      "main": [
+        [
+          {
+            "node": "Image Request Is GET?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Image Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Request Is GET?": {
+      "main": [
+        [
+          {
+            "node": "Get Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Image (POST)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Image (POST)": {
+      "main": [
+        [
+          {
+            "node": "Save Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Attempt Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Attempt Result": {
+      "main": [
+        [
+          {
+            "node": "Image Loop Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Loop Router": {
+      "main": [
+        [
+          {
+            "node": "TTS (Eleven-\u003eEdge-\u003eSilent)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Loop Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Loop Wait": {
+      "main": [
+        [
+          {
+            "node": "Free Image Provider Controller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Google Sheets Config": {
+      "main": [
+        [
+          {
+            "node": "Read Used Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Topic Row": {
+      "main": [
+        [
+          {
+            "node": "Record Topic (Reserve)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Topic Update Row": {
+      "main": [
+        [
+          {
+            "node": "Update Topic (Uploaded)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
