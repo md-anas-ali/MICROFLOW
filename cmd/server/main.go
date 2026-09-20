@@ -59,6 +59,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Login page credentials come from MICROFLOW_LOGIN_USER /
+	// MICROFLOW_LOGIN_PASSWORD (see auth.go). Fails closed if missing.
+	gate, err := newAuthGateFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	st, err := store.Open(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("db connect: %v", err)
@@ -196,6 +203,8 @@ func main() {
 		"APP_REFERER_URL",
 		"NOTIFY_WEBHOOK_URL",
 		"GOOGLE_SHEETS_URL",
+		"GOOGLE_SHEET_ID",
+		"YOUTUBE_CATEGORY_ID",
 		"TOGETHER_API_KEY",
 		"FIREWORKS_API_KEY",
 		"SAMBANOVA_API_KEY",
@@ -398,7 +407,7 @@ func main() {
 	mux.Handle("/webhook/", whServer.Handler())
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: mux, ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Minute}
+	srv := &http.Server{Addr: addr, Handler: gate.Wrap(mux), ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Minute}
 
 	go func() {
 		log.Printf("MicroFlow listening on %s", addr)
