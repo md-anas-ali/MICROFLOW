@@ -389,7 +389,7 @@ runLoop:
 			}
 			result.Status = model.StatusError
 			result.Error = rc.Redactor.RedactString(nodeErr.Error())
-			if node.ContinueOnFail && !IsFatal(nodeErr) {
+			if node.ContinueOnFail {
 				errItem := model.Item{JSON: map[string]any{"error": nodeErr.Error()}}
 				errOut := model.NodeOutput{{errItem}}
 				branchIdx := 0
