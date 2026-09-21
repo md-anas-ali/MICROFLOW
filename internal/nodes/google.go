@@ -238,13 +238,24 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		}
 		title, _ := expr.EvalValue(node.ParamString("title", ""), exprCtx)
 		description, _ := expr.EvalValue(node.ParamString("description", ""), exprCtx)
-		snippet := map[string]any{
-			"snippet": map[string]any{
-				"title":       title,
-				"description": description,
-			},
-			"status": map[string]any{"privacyStatus": node.ParamString("privacyStatus", "private")},
+		snip := map[string]any{
+			"title":       title,
+			"description": description,
 		}
+		status := map[string]any{"privacyStatus": node.ParamString("privacyStatus", "private")}
+		if cat, _ := expr.EvalValue(node.ParamString("categoryId", ""), exprCtx); cat != nil && fmt.Sprint(cat) != "" {
+			snip["categoryId"] = fmt.Sprint(cat)
+		}
+		if opts, ok := node.Parameters["options"].(map[string]any); ok {
+			if raw, ok := opts["publishAt"].(string); ok && raw != "" {
+				if v, _ := expr.EvalValue(raw, exprCtx); v != nil && fmt.Sprint(v) != "" {
+					// Scheduled publish: YouTube requires private + publishAt (RFC3339).
+					status["publishAt"] = fmt.Sprint(v)
+					status["privacyStatus"] = "private"
+				}
+			}
+		}
+		snippet := map[string]any{"snippet": snip, "status": status}
 		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet, rc.CurrentOperationID)
 		if err != nil {
 			return nil, fmt.Errorf("youTube %q upload: %w", node.Name, err)
