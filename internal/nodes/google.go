@@ -9,8 +9,11 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"microflow/internal/engine"
@@ -150,23 +153,29 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 	operation, _ := node.Parameters["operation"].(string) // "read" | "append" | "update"
 
 	var out []model.Item
+	tab := sheetTabFromRange(sheetRange)
 	switch operation {
 	case "append":
-		for _, it := range flatten(input) {
-			row := jsonToRow(it.JSON)
-			body, _ := json.Marshal(map[string]any{"values": [][]any{row}})
-			url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s:append?valueInputOption=USER_ENTERED", spreadsheetID, sheetRange)
-			if err := googleAPICall(ctx, "POST", url, token, body, nil, rc.CurrentOperationID); err != nil {
-				return nil, fmt.Errorf("googleSheets %q append: %w", node.Name, err)
-			}
-			out = append(out, it)
+		// Header-aware append: every item's fields are written into the column
+		// whose row-1 header has the same name (new field names are added as new
+		// header columns). The old code wrote map values in random Go-map order
+		// with no header mapping, which scrambled the sheet.
+		items := flatten(input)
+		if err := sheetsAppendItems(ctx, rc, token, spreadsheetID, tab, sheetRange, items); err != nil {
+			return nil, fmt.Errorf("googleSheets %q append: %w", node.Name, err)
 		}
+		out = append(out, items...)
 	case "update":
+		// Row-targeted update: finds the LAST row whose <matchingColumn> equals
+		// the item's value and rewrites only the item's own fields in that row.
+		// If no row matches, the item is appended (upsert). The old code PUT
+		// the item over A1 of the range, overwriting the header row.
+		matchCol := strings.TrimSpace(node.ParamString("matchingColumn", ""))
+		if matchCol == "" {
+			return nil, fmt.Errorf("googleSheets %q update: set the node parameter \"matchingColumn\" to the header name that identifies the row (e.g. runId)", node.Name)
+		}
 		for _, it := range flatten(input) {
-			row := jsonToRow(it.JSON)
-			body, _ := json.Marshal(map[string]any{"values": [][]any{row}})
-			url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s?valueInputOption=USER_ENTERED", spreadsheetID, sheetRange)
-			if err := googleAPICall(ctx, "PUT", url, token, body, nil, rc.CurrentOperationID); err != nil {
+			if err := sheetsUpdateItem(ctx, rc, token, spreadsheetID, tab, sheetRange, matchCol, it); err != nil {
 				return nil, fmt.Errorf("googleSheets %q update: %w", node.Name, err)
 			}
 			out = append(out, it)
@@ -184,13 +193,21 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 			for _, row := range resp.Values[1:] {
 				m := map[string]any{}
 				for i, h := range header {
-					key := fmt.Sprintf("%v", h)
+					key := strings.TrimSpace(fmt.Sprintf("%v", h))
+					if key == "" {
+						continue
+					}
 					if i < len(row) {
 						m[key] = row[i]
 					}
 				}
 				out = append(out, model.Item{JSON: m})
 			}
+		}
+		// An empty sheet (header only) must still let the workflow continue:
+		// downstream nodes never run when a node outputs zero items.
+		if len(out) == 0 {
+			out = append(out, model.Item{JSON: map[string]any{}})
 		}
 	}
 	return model.NodeOutput{out}, nil
@@ -442,12 +459,246 @@ func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string,
 	return parsed.ID, nil
 }
 
-func jsonToRow(m map[string]any) []any {
-	row := make([]any, 0, len(m))
-	for _, v := range m {
-		row = append(row, v)
+// ---------------------------------------------------------------------------
+// Google Sheets helpers: header-aware append / row-targeted update.
+// Row 1 of the tab is the header; item fields are matched to it BY NAME.
+// ---------------------------------------------------------------------------
+
+// sheetTabFromRange returns the tab name of a range like "UsedTopics!A:Z".
+func sheetTabFromRange(r string) string {
+	if i := strings.Index(r, "!"); i > 0 {
+		return strings.Trim(r[:i], "'")
 	}
-	return row
+	return ""
+}
+
+// a1 builds a quoted A1 reference for a tab and a cell/range part.
+func a1(tab, part string) string {
+	if tab == "" {
+		return part
+	}
+	return "'" + strings.ReplaceAll(tab, "'", "''") + "'!" + part
+}
+
+// colName converts a zero-based column index to A, B, ... Z, AA, AB, ...
+func colName(i int) string {
+	s := ""
+	for i >= 0 {
+		s = string(rune('A'+i%26)) + s
+		i = i/26 - 1
+	}
+	return s
+}
+
+// sheetCellValue turns any JSON value into something a Sheets cell can hold.
+func sheetCellValue(v any) any {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string, bool, float64, float32, int, int32, int64, json.Number:
+		return t
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprint(t)
+		}
+		return string(b)
+	}
+}
+
+func sheetCellString(v any) string {
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+func sheetValuesURL(spreadsheetID, ref, query string) string {
+	u := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s", spreadsheetID, url.PathEscape(ref))
+	if query != "" {
+		u += "?" + query
+	}
+	return u
+}
+
+func sheetsReadValues(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, ref string) ([][]any, error) {
+	var resp struct {
+		Values [][]any `json:"values"`
+	}
+	if err := googleAPICall(ctx, "GET", sheetValuesURL(spreadsheetID, ref, ""), token, nil, &resp, rc.CurrentOperationID); err != nil {
+		return nil, err
+	}
+	return resp.Values, nil
+}
+
+func sheetsWriteHeader(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, tab string, header []string) error {
+	row := make([]any, len(header))
+	for i, h := range header {
+		row[i] = h
+	}
+	body, _ := json.Marshal(map[string]any{"values": [][]any{row}})
+	ref := a1(tab, "A1:"+colName(len(header)-1)+"1")
+	return googleAPICall(ctx, "PUT", sheetValuesURL(spreadsheetID, ref, "valueInputOption=RAW"), token, body, nil, rc.CurrentOperationID)
+}
+
+// sheetsEnsureHeader makes sure every key of the items has a header column,
+// appending missing names to the right of the existing header (never
+// reordering or overwriting existing header cells).
+func sheetsEnsureHeader(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, tab string, header []string, items []model.Item) ([]string, error) {
+	idx := map[string]int{}
+	for i, h := range header {
+		if h != "" {
+			idx[h] = i
+		}
+	}
+	changed := false
+	for _, it := range items {
+		keys := make([]string, 0, len(it.JSON))
+		for k := range it.JSON {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if strings.TrimSpace(k) == "" {
+				continue
+			}
+			if _, ok := idx[k]; !ok {
+				header = append(header, k)
+				idx[k] = len(header) - 1
+				changed = true
+			}
+		}
+	}
+	if changed {
+		if err := sheetsWriteHeader(ctx, rc, token, spreadsheetID, tab, header); err != nil {
+			return nil, err
+		}
+	}
+	return header, nil
+}
+
+func sheetHeaderFromRow(row []any) []string {
+	header := make([]string, len(row))
+	for i, h := range row {
+		header[i] = strings.TrimSpace(fmt.Sprint(h))
+	}
+	return header
+}
+
+func sheetsAppendItems(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, tab, sheetRange string, items []model.Item) error {
+	if len(items) == 0 {
+		return nil
+	}
+	rows, err := sheetsReadValues(ctx, rc, token, spreadsheetID, a1(tab, "1:1"))
+	if err != nil {
+		return err
+	}
+	var header []string
+	if len(rows) > 0 {
+		header = sheetHeaderFromRow(rows[0])
+	}
+	header, err = sheetsEnsureHeader(ctx, rc, token, spreadsheetID, tab, header, items)
+	if err != nil {
+		return err
+	}
+	if len(header) == 0 {
+		return errors.New("nothing to append: item has no fields")
+	}
+	idx := map[string]int{}
+	for i, h := range header {
+		if h != "" {
+			idx[h] = i
+		}
+	}
+	values := make([][]any, 0, len(items))
+	for _, it := range items {
+		row := make([]any, len(header))
+		for i := range row {
+			row[i] = ""
+		}
+		for k, v := range it.JSON {
+			if i, ok := idx[k]; ok {
+				row[i] = sheetCellValue(v)
+			}
+		}
+		values = append(values, row)
+	}
+	body, _ := json.Marshal(map[string]any{"values": values})
+	ref := a1(tab, "A:"+colName(len(header)-1))
+	if tab == "" {
+		ref = sheetRange
+	}
+	return googleAPICall(ctx, "POST", sheetValuesURL(spreadsheetID, ref, "valueInputOption=RAW&insertDataOption=INSERT_ROWS"), token, body, nil, rc.CurrentOperationID)
+}
+
+func sheetsUpdateItem(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, tab, sheetRange, matchCol string, it model.Item) error {
+	want := sheetCellString(it.JSON[matchCol])
+	if want == "" {
+		return fmt.Errorf("item has no value for matchingColumn %q", matchCol)
+	}
+	values, err := sheetsReadValues(ctx, rc, token, spreadsheetID, sheetRange)
+	if err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return sheetsAppendItems(ctx, rc, token, spreadsheetID, tab, sheetRange, []model.Item{it})
+	}
+	header := sheetHeaderFromRow(values[0])
+	mi := -1
+	for i, h := range header {
+		if h == matchCol {
+			mi = i
+			break
+		}
+	}
+	if mi < 0 {
+		return fmt.Errorf("column %q not found in header row", matchCol)
+	}
+	rowNum := -1
+	for r := len(values) - 1; r >= 1; r-- {
+		if mi < len(values[r]) && sheetCellString(values[r][mi]) == want {
+			rowNum = r + 1 // 1-based sheet row
+			break
+		}
+	}
+	if rowNum < 0 {
+		return sheetsAppendItems(ctx, rc, token, spreadsheetID, tab, sheetRange, []model.Item{it})
+	}
+	header, err = sheetsEnsureHeader(ctx, rc, token, spreadsheetID, tab, header, []model.Item{it})
+	if err != nil {
+		return err
+	}
+	idx := map[string]int{}
+	for i, h := range header {
+		if h != "" {
+			idx[h] = i
+		}
+	}
+	keys := make([]string, 0, len(it.JSON))
+	for k := range it.JSON {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var data []map[string]any
+	for _, k := range keys {
+		if k == matchCol {
+			continue
+		}
+		i, ok := idx[k]
+		if !ok {
+			continue
+		}
+		data = append(data, map[string]any{
+			"range":  a1(tab, colName(i)+strconv.Itoa(rowNum)),
+			"values": [][]any{{sheetCellValue(it.JSON[k])}},
+		})
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{"valueInputOption": "RAW", "data": data})
+	u := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values:batchUpdate", spreadsheetID)
+	return googleAPICall(ctx, "POST", u, token, body, nil, rc.CurrentOperationID)
 }
 
 func buildRFC2822(to, subject, body string) string {
