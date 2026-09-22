@@ -149,7 +149,13 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 	if err != nil {
 		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
 	}
-	sheetRange := node.ParamString("range", "A1:Z1000")
+	// Default range when the node doesn't set one. This used to be
+	// "A1:Z1000" -- a hard cap of 1000 rows and 26 columns that silently
+	// dropped data once a sheet (e.g. a topic-dedupe log) grew past it,
+	// which is exactly the "read every row, no sampling/limits" case this
+	// node needs to support. "A1:ZZ" keeps the same (first/default) tab
+	// but removes both caps: no row limit, and 702 columns of headroom.
+	sheetRange := node.ParamString("range", "A1:ZZ")
 	operation, _ := node.Parameters["operation"].(string) // "read" | "append" | "update"
 
 	var out []model.Item
@@ -184,8 +190,12 @@ func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContex
 		var resp struct {
 			Values [][]any `json:"values"`
 		}
-		url := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s", spreadsheetID, sheetRange)
-		if err := googleAPICall(ctx, "GET", url, token, nil, &resp, rc.CurrentOperationID); err != nil {
+		// Build the URL the same way append/update do (sheetValuesURL,
+		// with url.PathEscape on the range). The old code interpolated
+		// sheetRange into the URL unescaped, so a tab name containing a
+		// space or other reserved character (e.g. "My Sheet!A:Z") built
+		// an invalid request URL and the read would fail outright.
+		if err := googleAPICall(ctx, "GET", sheetValuesURL(spreadsheetID, sheetRange, ""), token, nil, &resp, rc.CurrentOperationID); err != nil {
 			return nil, fmt.Errorf("googleSheets %q read: %w", node.Name, err)
 		}
 		if len(resp.Values) > 0 {
@@ -636,7 +646,15 @@ func sheetsUpdateItem(ctx context.Context, rc *engine.RunContext, token, spreads
 	if want == "" {
 		return fmt.Errorf("item has no value for matchingColumn %q", matchCol)
 	}
-	values, err := sheetsReadValues(ctx, rc, token, spreadsheetID, sheetRange)
+	// Read via a:zz on the tab, not the node's raw sheetRange. sheetRange
+	// is whatever column bound the node happens to be configured with
+	// (e.g. "!A:Z" caps at 26 columns); sheetsEnsureHeader can grow the
+	// real header past that bound over time as new fields show up. If we
+	// read with the narrow bound here, columns beyond it silently vanish
+	// from `values`/`header` below -- matchCol can appear "not found" (or
+	// the row can appear not to match) even though the data is there,
+	// which either fails the update or wrongly upserts a duplicate row.
+	values, err := sheetsReadValues(ctx, rc, token, spreadsheetID, a1(tab, "A:ZZ"))
 	if err != nil {
 		return err
 	}
