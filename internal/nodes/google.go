@@ -531,6 +531,22 @@ func sheetValuesURL(spreadsheetID, ref, query string) string {
 	return u
 }
 
+// sheetValuesAppendURL builds the URL for values.append, which -- unlike
+// every other values.* endpoint -- requires a literal ":append" suffix on
+// the path, after the range and before the query string:
+// ".../values/{range}:append?...". sheetsAppendItems used to call
+// sheetValuesURL (no ":append"), which POSTs to a URL values.append doesn't
+// recognize; Google answers that with a generic HTML 404 page instead of a
+// JSON API error, which is exactly the "status 404: <!DOCTYPE html>..."
+// failure on every append (and every update that falls back to append).
+func sheetValuesAppendURL(spreadsheetID, ref, query string) string {
+	u := fmt.Sprintf("https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s:append", spreadsheetID, url.PathEscape(ref))
+	if query != "" {
+		u += "?" + query
+	}
+	return u
+}
+
 func sheetsReadValues(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, ref string) ([][]any, error) {
 	var resp struct {
 		Values [][]any `json:"values"`
@@ -638,7 +654,7 @@ func sheetsAppendItems(ctx context.Context, rc *engine.RunContext, token, spread
 	if tab == "" {
 		ref = sheetRange
 	}
-	return googleAPICall(ctx, "POST", sheetValuesURL(spreadsheetID, ref, "valueInputOption=RAW&insertDataOption=INSERT_ROWS"), token, body, nil, rc.CurrentOperationID)
+	return googleAPICall(ctx, "POST", sheetValuesAppendURL(spreadsheetID, ref, "valueInputOption=RAW&insertDataOption=INSERT_ROWS"), token, body, nil, rc.CurrentOperationID)
 }
 
 func sheetsUpdateItem(ctx context.Context, rc *engine.RunContext, token, spreadsheetID, tab, sheetRange, matchCol string, it model.Item) error {
