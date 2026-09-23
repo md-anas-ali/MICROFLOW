@@ -358,6 +358,15 @@ func (v *verifyingReader) Close() error {
 // trailer -- passes through completely unaffected: nothing here sends a
 // custom header a third party wouldn't understand, and no outbound request
 // body is ever altered.
+//
+// The one exception is outbound request-body compression, and it is
+// strictly opt-in per destination host via MICROFLOW_COMPRESS_UPLOAD_HOSTS
+// (see maybeCompressRequestBody's doc comment below) -- this is what
+// reduces the "Service-Initiated" / "Service-Initiated (Private Link)"
+// side of outbound bandwidth for calls between an operator's own MicroFlow
+// instances. With that variable unset (the default), this function's
+// behavior toward request bodies is unchanged from before: nothing is
+// ever compressed on the way out.
 func WrapTransport(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
 		rt = http.DefaultTransport
@@ -368,12 +377,131 @@ func WrapTransport(rt http.RoundTripper) http.RoundTripper {
 type verifyingTransport struct{ next http.RoundTripper }
 
 func (t *verifyingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = maybeCompressRequestBody(req)
 	resp, err := t.next.RoundTrip(req)
 	if err != nil || resp == nil || resp.Body == nil || !Enabled() {
 		return resp, err
 	}
 	resp.Body = &verifyingReadCloser{body: resp.Body, sum: sha256.New(), resp: resp}
 	return resp, nil
+}
+
+// maybeCompressRequestBody is the sending half of the same integrity
+// mechanism verifyingReader (RequestMiddleware, server side) already
+// implements for reading: it gzip-compresses an outbound request body,
+// streaming it through a bounded buffer via io.Pipe (never buffering the
+// whole payload), and attaches the same ChecksumTrailer -- computed over
+// the ORIGINAL bytes, exactly like ResponseMiddleware does for responses
+// -- so that a receiving MicroFlow instance's *existing, unmodified*
+// RequestMiddleware decompresses and verifies it with zero further
+// changes on that end.
+//
+// This only ever runs for a destination host explicitly listed in
+// MICROFLOW_COMPRESS_UPLOAD_HOSTS (comma-separated hostnames, each
+// optionally with :port, matched case-insensitively against req.URL.Host
+// -- a bare hostname also matches that host on any port). That allowlist
+// is intentionally the operator's own other MicroFlow instances (reached
+// over the public internet or over a Render Private Link -- the code path
+// here is identical either way, since Private Link is just a different
+// route to the same host:port and this package never touches routing).
+// An arbitrary third-party API (Google, OpenRouter, a pasted webhook URL)
+// is never a safe target: it has no obligation to accept a gzip-encoded
+// request body, so compressing toward it could turn a working call into a
+// broken or misinterpreted one. Leaving the variable unset -- the default
+// -- makes this function return req unchanged in every case, so every
+// existing outbound call keeps behaving exactly as it did before this
+// function existed.
+func maybeCompressRequestBody(req *http.Request) *http.Request {
+	if !Enabled() || req.Body == nil || req.Body == http.NoBody {
+		return req
+	}
+	if req.Header.Get("Content-Encoding") != "" {
+		return req // caller already encoded the body its own way
+	}
+	if looksAlreadyCompressed(req.Header.Get("Content-Type")) {
+		return req // e.g. a video/audio upload -- gzip would not help and could grow it
+	}
+	if cl := req.ContentLength; cl > 0 && cl < minCompressSize {
+		return req // not worth gzip's own frame overhead
+	}
+	if !uploadHostAllowed(req.URL.Host) {
+		return req
+	}
+
+	req2 := req.Clone(req.Context())
+	// GetBody, if the caller set one, would replay the ORIGINAL
+	// (uncompressed) body -- wrong once Content-Encoding says gzip. Clear
+	// it so a retry/redirect at the Client layer (which reads GetBody
+	// from its own copy of the pre-Transport request, never from req2)
+	// is unaffected, and so nothing downstream is tempted to replay our
+	// already-consumed pipe reader.
+	req2.GetBody = nil
+	req2.ContentLength = -1
+	req2.Header.Del("Content-Length")
+	req2.Header.Set("Content-Encoding", "gzip")
+	// Trailer keys must be declared before the body is sent; the value is
+	// filled in by the goroutine below just before the pipe reaches EOF.
+	req2.Trailer = http.Header{ChecksumTrailer: nil}
+
+	origBody := req.Body
+	pr, pw := io.Pipe()
+	req2.Body = pr
+	go func() {
+		sum := sha256.New()
+		gz := gzip.NewWriter(pw)
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := origBody.Read(buf)
+			if n > 0 {
+				sum.Write(buf[:n])
+				if _, werr := gz.Write(buf[:n]); werr != nil {
+					_ = origBody.Close()
+					_ = pw.CloseWithError(fmt.Errorf("compress: request gzip write: %w", werr))
+					return
+				}
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					_ = origBody.Close()
+					_ = pw.CloseWithError(rerr)
+					return
+				}
+				break
+			}
+		}
+		_ = origBody.Close()
+		if err := gz.Close(); err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("compress: request gzip close: %w", err))
+			return
+		}
+		req2.Trailer.Set(ChecksumTrailer, hex.EncodeToString(sum.Sum(nil)))
+		_ = pw.Close()
+	}()
+	return req2
+}
+
+// uploadHostAllowed reports whether host (req.URL.Host, so possibly
+// "example.com:8080") is one of the operator's own MicroFlow peers, per
+// MICROFLOW_COMPRESS_UPLOAD_HOSTS. Read from the environment on every
+// call (like Enabled()) rather than cached, so the allowlist can be
+// changed without a redeploy.
+func uploadHostAllowed(host string) bool {
+	list := os.Getenv("MICROFLOW_COMPRESS_UPLOAD_HOSTS")
+	if list == "" {
+		return false
+	}
+	h := strings.ToLower(host)
+	hostOnly := h
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		hostOnly = h[:i]
+	}
+	for _, entry := range strings.Split(list, ",") {
+		e := strings.ToLower(strings.TrimSpace(entry))
+		if e != "" && (e == h || e == hostOnly) {
+			return true
+		}
+	}
+	return false
 }
 
 type verifyingReadCloser struct {
