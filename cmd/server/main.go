@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"microflow/internal/api"
+	"microflow/internal/compress"
 	"microflow/internal/engine"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
@@ -226,7 +227,12 @@ func main() {
 		// workflow's ~85s of paced Wait/cooldown gaps.
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
+			// WrapTransport only adds verification of MicroFlow's own
+			// integrity trailer when the far end is another MicroFlow
+			// instance running compress.ResponseMiddleware; calls to
+			// OpenRouter/Sheets/YouTube/Gmail/etc. are unaffected -- see
+			// INTEGRATION.md.
+			Transport: compress.WrapTransport(&http.Transport{
 				MaxIdleConns:        4,
 				MaxIdleConnsPerHost: 2,
 				IdleConnTimeout:     20 * time.Second,
@@ -238,7 +244,7 @@ func main() {
 				// hostname-based private-address blocking has to
 				// live to avoid a DNS-rebinding gap.
 				DialContext: nodes.SafeDialContext,
-			},
+			}),
 		},
 		AllowedBinaries: allowedBinaries,
 		EnvAllowlist:    codeEnvAllowlist,
@@ -407,7 +413,14 @@ func main() {
 	mux.Handle("/webhook/", whServer.Handler())
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: gate.Wrap(mux), ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Minute}
+	// Response/request gzip compression wraps the whole app (including the
+	// login gate): negotiated via standard Accept-Encoding/Content-Encoding,
+	// so it's invisible to any client that doesn't ask for it, and SSE/
+	// WebSocket upgrade requests are passed through uncompressed untouched
+	// (see compress.isUpgradeOrStream). MICROFLOW_DISABLE_COMPRESSION=1
+	// disables both instantly with no rebuild -- see INTEGRATION.md.
+	handler := compress.RequestMiddleware(compress.ResponseMiddleware(gate.Wrap(mux)))
+	srv := &http.Server{Addr: addr, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Minute}
 
 	go func() {
 		log.Printf("MicroFlow listening on %s", addr)
