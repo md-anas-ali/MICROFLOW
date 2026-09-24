@@ -67,6 +67,15 @@
     return d.toLocaleString();
   }
 
+  // Execution.mode is stored as "manual" | "schedule" | ...; show the two
+  // trigger sources people care about as "Manual" / "Scheduled" (other
+  // modes are shown as-is).
+  function modeLabel(mode) {
+    if (mode === "manual") return "Manual";
+    if (mode === "schedule") return "Scheduled";
+    return mode || "";
+  }
+
   function fmtDurationMs(ns) {
     // Execution.Duration is encoded as a Go time.Duration -> JSON number
     // of *nanoseconds*.
@@ -301,7 +310,7 @@
         return '<tr class="clickable" data-exec-row="' + escapeHtml(ex.id) + '">' +
           '<td><div class="wf-name">' + escapeHtml(workflow) + '</div><div class="exec-id">' + escapeHtml(ex.id) + '</div></td>' +
           '<td><span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + '</span></td>' +
-          '<td>' + escapeHtml(ex.mode || "") + '</td>' +
+          '<td>' + escapeHtml(modeLabel(ex.mode)) + '</td>' +
           '<td>' + escapeHtml(fmtDate(ex.startedAt)) + '</td>' +
           '<td>' + (ex.finishedAt ? escapeHtml(fmtDate(ex.finishedAt)) : '<span class="live-dot">● running</span>') + '</td>' +
           '<td class="wf-actions">' + action + '</td></tr>';
@@ -358,7 +367,7 @@
       detailHost.innerHTML =
         '<div class="exec-detail-head"><div><h3>' + escapeHtml(workflowNames[workflowID] || workflowID) + '</h3><div class="exec-id">' + escapeHtml(ex.id) + '</div></div>' +
         '<span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + '</span></div>' +
-        '<div class="exec-detail-meta"><span>Mode: ' + escapeHtml(ex.mode || "") + '</span><span>Started: ' + escapeHtml(fmtDate(ex.startedAt)) + '</span>' +
+        '<div class="exec-detail-meta"><span>Mode: ' + escapeHtml(modeLabel(ex.mode)) + '</span><span>Started: ' + escapeHtml(fmtDate(ex.startedAt)) + '</span>' +
         (ex.finishedAt ? '<span>Finished: ' + escapeHtml(fmtDate(ex.finishedAt)) + '</span>' : '<span class="live-dot">● LIVE</span>') + '</div>' +
         (ex.error ? '<div class="err-text exec-detail-error">' + escapeHtml(ex.error) + '</div>' : '') +
         '<div class="exec-detail-actions">' +
@@ -1561,18 +1570,23 @@
         return;
       }
       const wasDisabled = !!node.disabled;
+      const oldParams = node.parameters;
       node.parameters = newParams;
       node.disabled = document.getElementById("nodeDisabled").checked;
       node.retryOnFail = document.getElementById("nodeRetry").checked;
-      // A Schedule Trigger's Enabled state lives in the workflow
-      // definition (node.disabled) and the server's scheduler only picks
-      // it up when the workflow is saved -- so persist immediately
-      // through the normal save endpoint instead of leaving it as
-      // in-memory state that is lost on refresh/navigation.
-      if (node.type === "scheduleTrigger" && !!node.disabled !== wasDisabled) {
+      // A Schedule Trigger's Enabled state (node.disabled) and its
+      // interval/cron config (node.parameters.rule) live in the workflow
+      // definition, and the server's scheduler only picks them up when the
+      // workflow is saved -- so persist immediately through the normal save
+      // endpoint instead of leaving them as in-memory state that is lost on
+      // refresh/navigation.
+      if (node.type === "scheduleTrigger" &&
+          (!!node.disabled !== wasDisabled || JSON.stringify(newParams) !== JSON.stringify(oldParams))) {
         const ok = await saveCurrentWorkflow();
         if (!ok) {
-          node.disabled = wasDisabled; // not persisted -- don't show a state the server doesn't have
+          // not persisted -- don't show a state the server doesn't have
+          node.disabled = wasDisabled;
+          node.parameters = oldParams;
         }
         drawCanvas();
         return;
@@ -1776,7 +1790,7 @@
     host.innerHTML =
       '<div class="exec-panel"><div class="exec-summary">' +
       '<span class="status-pill status-' + escapeHtml(ex.status) + '">' + escapeHtml(ex.status) + "</span>" +
-      "<span>mode: " + escapeHtml(ex.mode) + "</span>" +
+      "<span>mode: " + escapeHtml(modeLabel(ex.mode)) + "</span>" +
       "<span>started: " + escapeHtml(fmtDate(ex.startedAt)) + "</span>" +
       (ex.error ? '<span class="err-text">' + escapeHtml(ex.error) + "</span>" : "") +
       "</div>" +
