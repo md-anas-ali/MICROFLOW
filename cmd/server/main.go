@@ -404,6 +404,23 @@ func main() {
 	sch.Load(schedules)
 	go sch.Start(ctx)
 
+	// After every save/import/delete, re-register that workflow's Schedule
+	// Trigger nodes from the just-persisted definition (same
+	// scheduleFromNode the startup pass uses, so Enabled == !node.Disabled
+	// either way). wf == nil means the workflow was deleted.
+	apiServer.WithScheduleSync(func(workflowID string, wf *model.Workflow) {
+		var updated []scheduler.Schedule
+		if wf != nil {
+			for name, n := range wf.Nodes {
+				if n != nil && n.Type == model.TypeScheduleTrigger {
+					updated = append(updated, scheduleFromNode(workflowID, name, n))
+				}
+			}
+		}
+		sch.ReplaceWorkflow(workflowID, updated)
+		log.Printf("schedule sync: workflow %s now has %d schedule(s) registered", workflowID, len(updated))
+	})
+
 	mux.Handle("/webhook/", whServer.Handler())
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
