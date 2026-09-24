@@ -30,6 +30,10 @@ type Schedule struct {
 type Runner func(ctx context.Context, workflowID, nodeName string)
 
 type Scheduler struct {
+	// mu guards schedules and lastRun: ReplaceWorkflow (called from the
+	// workflow save/import/delete API path) mutates them while tick runs
+	// on the scheduler goroutine.
+	mu        sync.Mutex
 	schedules []Schedule
 	run       Runner
 	lastRun   map[string]time.Time
@@ -52,7 +56,47 @@ func New(run Runner) *Scheduler {
 }
 
 func (s *Scheduler) Load(schedules []Schedule) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.schedules = schedules
+}
+
+// ReplaceWorkflow atomically swaps every schedule belonging to
+// workflowID for the given set (nil/empty removes them all, e.g. after
+// the workflow is deleted). Called after a workflow is saved so the
+// running scheduler reflects the persisted definition without a
+// restart. Because the workflow's old entries are dropped before the new
+// ones are added, the same schedule can never be registered twice.
+// lastRun/inFlight are keyed by schedule ID and deliberately kept, so an
+// in-progress run still blocks an overlapping tick (overlap protection is
+// unchanged). An interval schedule that is newly enabled, or whose
+// interval changed, starts counting from now instead of firing on the
+// next tick.
+func (s *Scheduler) ReplaceWorkflow(workflowID string, schedules []Schedule) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := make(map[string]Schedule)
+	kept := make([]Schedule, 0, len(s.schedules)+len(schedules))
+	for _, sc := range s.schedules {
+		if sc.WorkflowID == workflowID {
+			old[sc.ID] = sc
+			continue
+		}
+		kept = append(kept, sc)
+	}
+	now := time.Now()
+	for _, sc := range schedules {
+		if sc.WorkflowID != workflowID {
+			continue
+		}
+		prev, existed := old[sc.ID]
+		if sc.Enabled && sc.CronExpr == "" && sc.IntervalSeconds > 0 &&
+			(!existed || !prev.Enabled || prev.IntervalSeconds != sc.IntervalSeconds) {
+			s.lastRun[sc.ID] = now
+		}
+		kept = append(kept, sc)
+	}
+	s.schedules = kept
 }
 
 // Start blocks until ctx is cancelled, ticking once a minute. A single
@@ -74,6 +118,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) tick(ctx context.Context, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, sc := range s.schedules {
 		if !sc.Enabled {
 			continue
