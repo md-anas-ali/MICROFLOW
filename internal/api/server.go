@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"microflow/internal/model"
@@ -90,6 +91,40 @@ type Server struct {
 	manager     *runner.Manager
 	execLoader  ExecutionLoader
 	execHistory ExecutionHistoryStore
+
+	// onWorkflowChanged, if set (see WithScheduleSync), is called after a
+	// workflow is durably saved/imported (wf != nil) or deleted (wf ==
+	// nil) so the in-memory scheduler reloads from the persisted
+	// definition. persistMu serializes "write to the store + notify" so
+	// two concurrent saves can never notify in the opposite order to how
+	// they were committed (which would leave the scheduler on the older
+	// definition).
+	persistMu         sync.Mutex
+	onWorkflowChanged func(workflowID string, wf *model.Workflow)
+}
+
+// WithScheduleSync registers the callback that re-registers a workflow's
+// Schedule Trigger nodes with the running scheduler after every save,
+// import, or delete. Nil-safe like WithAsync: without it (every existing
+// test helper) the handlers behave exactly as before.
+func (s *Server) WithScheduleSync(fn func(workflowID string, wf *model.Workflow)) *Server {
+	s.onWorkflowChanged = fn
+	return s
+}
+
+// persistWorkflow saves wf and, only if the save succeeded, notifies the
+// scheduler -- under one lock so the notification order matches the
+// commit order.
+func (s *Server) persistWorkflow(ctx context.Context, wf *model.Workflow) error {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	if err := s.workflows.SaveWorkflow(ctx, wf); err != nil {
+		return err
+	}
+	if s.onWorkflowChanged != nil {
+		s.onWorkflowChanged(wf.ID, wf)
+	}
+	return nil
 }
 
 // WithAsync enables the async execute/executions/events endpoints:
@@ -182,7 +217,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.workflows.SaveWorkflow(r.Context(), result.Workflow); err != nil {
+	if err := s.persistWorkflow(r.Context(), result.Workflow); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -207,7 +242,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wf.ID = r.PathValue("id")
-	if err := s.workflows.SaveWorkflow(r.Context(), &wf); err != nil {
+	if err := s.persistWorkflow(r.Context(), &wf); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -261,7 +296,12 @@ func (s *Server) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.persistMu.Lock()
 	err := s.workflows.DeleteWorkflow(r.Context(), id)
+	if err == nil && s.onWorkflowChanged != nil {
+		s.onWorkflowChanged(id, nil)
+	}
+	s.persistMu.Unlock()
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
