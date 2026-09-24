@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -432,15 +433,36 @@ func (r *Runner) SaveInitialCheckpoint(ctx context.Context, wf *model.Workflow, 
 }
 
 // FirstTriggerNode picks a start node when the caller doesn't specify
-// one (manual "Execute" button with nothing selected).
+// one (manual "Execute" button with nothing selected). Enabled triggers
+// win over disabled ones (a disabled Manual Trigger must not be chosen
+// over an active Schedule Trigger -- the engine skips a disabled start
+// node, so the run would do nothing), and names are visited in sorted
+// order so the choice is deterministic instead of depending on Go's
+// random map iteration. If every trigger is disabled, one is still
+// returned, as before.
 func FirstTriggerNode(wf *model.Workflow) string {
-	for name, n := range wf.Nodes {
+	names := make([]string, 0, len(wf.Nodes))
+	for name := range wf.Nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fallback := ""
+	for _, name := range names {
+		n := wf.Nodes[name]
+		if n == nil {
+			continue
+		}
 		switch n.Type {
 		case model.TypeManualTrigger, model.TypeScheduleTrigger, model.TypeWebhookTrigger:
-			return name
+			if !n.Disabled {
+				return name
+			}
+			if fallback == "" {
+				fallback = name
+			}
 		}
 	}
-	return ""
+	return fallback
 }
 
 func newID() string {
