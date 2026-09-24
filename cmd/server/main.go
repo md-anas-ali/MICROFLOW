@@ -378,7 +378,7 @@ func main() {
 		for name, n := range wf.Nodes {
 			switch n.Type {
 			case model.TypeScheduleTrigger:
-				schedules = append(schedules, scheduleFromNode(wf.ID, name, n))
+				schedules = append(schedules, schedulesFromNode(wf.ID, name, n)...)
 			case model.TypeWebhookTrigger:
 				registerWebhookRoute(whServer, webhookToken, run, wf.ID, name, n)
 			}
@@ -406,14 +406,14 @@ func main() {
 
 	// After every save/import/delete, re-register that workflow's Schedule
 	// Trigger nodes from the just-persisted definition (same
-	// scheduleFromNode the startup pass uses, so Enabled == !node.Disabled
+	// schedulesFromNode the startup pass uses, so Enabled == !node.Disabled
 	// either way). wf == nil means the workflow was deleted.
 	apiServer.WithScheduleSync(func(workflowID string, wf *model.Workflow) {
 		var updated []scheduler.Schedule
 		if wf != nil {
 			for name, n := range wf.Nodes {
 				if n != nil && n.Type == model.TypeScheduleTrigger {
-					updated = append(updated, scheduleFromNode(workflowID, name, n))
+					updated = append(updated, schedulesFromNode(workflowID, name, n)...)
 				}
 			}
 		}
@@ -444,31 +444,51 @@ func main() {
 	_ = srv.Shutdown(shutdownCtx)
 }
 
-// scheduleFromNode reads a Schedule Trigger node's n8n-shaped parameters
+// schedulesFromNode reads a Schedule Trigger node's n8n-shaped parameters
 // (rule interval config under parameters.rule.interval[], each item
 // either {field:"cronExpression", expression:"..."} or
 // {field:"seconds"/"minutes"/"hours", secondsInterval/...}) and produces
-// a scheduler.Schedule. Falls back to a direct "cronExpression"/
+// one scheduler.Schedule per recognised rule -- a node with several
+// rules (e.g. a weekday cron plus a separate Friday cron) fires for all
+// of them, not just the first. Falls back to a direct "cronExpression"/
 // "intervalSeconds" param for simplicity if the workflow used a flatter
-// shape.
-func scheduleFromNode(workflowID, nodeName string, n *model.Node) scheduler.Schedule {
-	sc := scheduler.Schedule{
-		ID:         workflowID + "/" + nodeName,
-		WorkflowID: workflowID,
-		NodeName:   nodeName,
-		Enabled:    !n.Disabled,
+// shape. The first schedule keeps the plain "workflow/node" ID; further
+// rules get a "#N" suffix so each has its own last-run bookkeeping.
+func schedulesFromNode(workflowID, nodeName string, n *model.Node) []scheduler.Schedule {
+	baseID := workflowID + "/" + nodeName
+	var out []scheduler.Schedule
+	add := func(sc scheduler.Schedule) {
+		sc.WorkflowID = workflowID
+		sc.NodeName = nodeName
+		sc.Enabled = !n.Disabled
+		sc.ID = baseID
+		if len(out) > 0 {
+			sc.ID = fmt.Sprintf("%s#%d", baseID, len(out)+1)
+		}
+		if sc.CronExpr == "" && sc.IntervalSeconds > 0 && sc.IntervalSeconds < 60 {
+			log.Printf("warning: Schedule Trigger node %q in workflow %q has an interval under 60s -- the scheduler has one-minute resolution, so it will run at most once a minute", nodeName, workflowID)
+		}
+		out = append(out, sc)
 	}
+	addCron := func(expr string) {
+		if !scheduler.CronValid(expr) {
+			log.Printf("warning: Schedule Trigger node %q in workflow %q has an invalid cron expression %q (need 5 fields: minute hour day month weekday) -- that rule will never fire", nodeName, workflowID, expr)
+			return
+		}
+		add(scheduler.Schedule{CronExpr: strings.TrimSpace(expr)})
+	}
+
 	if cronExpr, ok := n.Parameters["cronExpression"].(string); ok && cronExpr != "" {
-		sc.CronExpr = cronExpr
-		return sc
+		addCron(cronExpr)
+		return out
 	}
 	if secs, ok := n.Parameters["intervalSeconds"].(float64); ok && secs > 0 {
-		sc.IntervalSeconds = int(secs)
-		return sc
+		add(scheduler.Schedule{IntervalSeconds: int(secs)})
+		return out
 	}
 	// n8n's actual Schedule Trigger shape: parameters.rule.interval is an
-	// array of interval objects; we take the first one MicroFlow
-	// understands.
+	// array of interval objects; every one MicroFlow understands is
+	// registered.
 	if rule, ok := n.Parameters["rule"].(map[string]any); ok {
 		if intervals, ok := rule["interval"].([]any); ok {
 			for _, raw := range intervals {
@@ -480,24 +500,28 @@ func scheduleFromNode(workflowID, nodeName string, n *model.Node) scheduler.Sche
 				switch field {
 				case "cronExpression":
 					if expr, ok := item["expression"].(string); ok {
-						sc.CronExpr = expr
-						return sc
+						addCron(expr)
 					}
 				case "seconds":
-					sc.IntervalSeconds = intOr(item["secondsInterval"], 1)
-					return sc
+					if v := intOr(item["secondsInterval"], 1); v > 0 {
+						add(scheduler.Schedule{IntervalSeconds: v})
+					}
 				case "minutes":
-					sc.IntervalSeconds = intOr(item["minutesInterval"], 1) * 60
-					return sc
+					if v := intOr(item["minutesInterval"], 1); v > 0 {
+						add(scheduler.Schedule{IntervalSeconds: v * 60})
+					}
 				case "hours":
-					sc.IntervalSeconds = intOr(item["hoursInterval"], 1) * 3600
-					return sc
+					if v := intOr(item["hoursInterval"], 1); v > 0 {
+						add(scheduler.Schedule{IntervalSeconds: v * 3600})
+					}
 				}
 			}
 		}
 	}
-	log.Printf("warning: Schedule Trigger node %q in workflow %q has no recognized interval config -- it will never fire; check its parameters", nodeName, workflowID)
-	return sc
+	if len(out) == 0 {
+		log.Printf("warning: Schedule Trigger node %q in workflow %q has no recognized interval config -- it will never fire; check its parameters", nodeName, workflowID)
+	}
+	return out
 }
 
 func intOr(v any, def int) int {
