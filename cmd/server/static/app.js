@@ -1549,18 +1549,34 @@
   }
 
   function wireSidePanel(nodeName) {
-    document.getElementById("applyNodeBtn").addEventListener("click", () => {
+    document.getElementById("applyNodeBtn").addEventListener("click", async () => {
       const node = editorState.workflow.nodes[nodeName];
       const paramsErr = document.getElementById("paramsError");
       paramsErr.textContent = "";
+      let newParams;
       try {
-        node.parameters = JSON.parse(document.getElementById("nodeParams").value || "{}");
+        newParams = JSON.parse(document.getElementById("nodeParams").value || "{}");
       } catch (e) {
         paramsErr.textContent = "Invalid JSON: " + e.message;
         return;
       }
+      const wasDisabled = !!node.disabled;
+      node.parameters = newParams;
       node.disabled = document.getElementById("nodeDisabled").checked;
       node.retryOnFail = document.getElementById("nodeRetry").checked;
+      // A Schedule Trigger's Enabled state lives in the workflow
+      // definition (node.disabled) and the server's scheduler only picks
+      // it up when the workflow is saved -- so persist immediately
+      // through the normal save endpoint instead of leaving it as
+      // in-memory state that is lost on refresh/navigation.
+      if (node.type === "scheduleTrigger" && !!node.disabled !== wasDisabled) {
+        const ok = await saveCurrentWorkflow();
+        if (!ok) {
+          node.disabled = wasDisabled; // not persisted -- don't show a state the server doesn't have
+        }
+        drawCanvas();
+        return;
+      }
       toast("Applied \u2014 remember to Save", "success");
       drawCanvas();
     });
@@ -1610,8 +1626,10 @@
       });
       editorState.workflow = wf;
       toast("Saved", "success");
+      return true;
     } catch (e) {
       toast("Save failed: " + e.message, "error");
+      return false;
     } finally {
       btn.disabled = false;
       btn.textContent = "Save";
