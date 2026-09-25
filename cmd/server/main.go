@@ -378,7 +378,7 @@ func main() {
 		for name, n := range wf.Nodes {
 			switch n.Type {
 			case model.TypeScheduleTrigger:
-				schedules = append(schedules, schedulesFromNode(wf.ID, name, n)...)
+				schedules = append(schedules, schedulesFromNode(wf.ID, name, n, wf.Active)...)
 			case model.TypeWebhookTrigger:
 				registerWebhookRoute(whServer, webhookToken, run, wf.ID, name, n)
 			}
@@ -406,14 +406,14 @@ func main() {
 
 	// After every save/import/delete, re-register that workflow's Schedule
 	// Trigger nodes from the just-persisted definition (same
-	// schedulesFromNode the startup pass uses, so Enabled == !node.Disabled
-	// either way). wf == nil means the workflow was deleted.
+	// schedulesFromNode the startup pass uses, so Enabled == wf.Active &&
+	// !node.Disabled either way). wf == nil means the workflow was deleted.
 	apiServer.WithScheduleSync(func(workflowID string, wf *model.Workflow) {
 		var updated []scheduler.Schedule
 		if wf != nil {
 			for name, n := range wf.Nodes {
 				if n != nil && n.Type == model.TypeScheduleTrigger {
-					updated = append(updated, schedulesFromNode(workflowID, name, n)...)
+					updated = append(updated, schedulesFromNode(workflowID, name, n, wf.Active)...)
 				}
 			}
 		}
@@ -454,13 +454,17 @@ func main() {
 // "intervalSeconds" param for simplicity if the workflow used a flatter
 // shape. The first schedule keeps the plain "workflow/node" ID; further
 // rules get a "#N" suffix so each has its own last-run bookkeeping.
-func schedulesFromNode(workflowID, nodeName string, n *model.Node) []scheduler.Schedule {
+// wfActive mirrors n8n's own semantics: a Schedule Trigger only actually
+// fires when its *workflow* is switched Active, regardless of the node's
+// own Enabled flag -- both must be true, matching the "Active" toggle in
+// the editor toolbar (see cmd/server/static/app.js's #wfActive checkbox).
+func schedulesFromNode(workflowID, nodeName string, n *model.Node, wfActive bool) []scheduler.Schedule {
 	baseID := workflowID + "/" + nodeName
 	var out []scheduler.Schedule
 	add := func(sc scheduler.Schedule) {
 		sc.WorkflowID = workflowID
 		sc.NodeName = nodeName
-		sc.Enabled = !n.Disabled
+		sc.Enabled = wfActive && !n.Disabled
 		sc.ID = baseID
 		if len(out) > 0 {
 			sc.ID = fmt.Sprintf("%s#%d", baseID, len(out)+1)
