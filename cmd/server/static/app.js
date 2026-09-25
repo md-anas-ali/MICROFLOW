@@ -1120,7 +1120,7 @@
       (wf.active ? "checked" : "") + "> Active</label>" +
       '<div class="spacer"></div>' +
       '<select id="addNodeType" class="btn btn-sm" title="Node type to add">' +
-      NODE_TYPE_OPTIONS.map((o) => '<option value="' + o[0] + '">' + escapeHtml(o[1]) + "</option>").join("") +
+      NODE_TYPE_OPTIONS.map((o) => '<option value="' + o[0] + '"' + (o[0] === "scheduleTrigger" ? " selected" : "") + '>' + escapeHtml(o[1]) + "</option>").join("") +
       "</select>" +
       '<button id="btnAddNode" class="btn btn-sm">+ Add node</button>' +
       '<select id="startNodeSelect" class="btn btn-sm" style="max-width:200px;">' +
