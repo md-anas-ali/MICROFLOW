@@ -49,10 +49,33 @@ type Scheduler struct {
 	// to start a second one until the first returns.
 	inFlightMu sync.Mutex
 	inFlight   map[string]bool
+
+	// location is the timezone used to evaluate a CronExpr's minute/hour/
+	// weekday fields (e.g. "0 19 * * *" means 19:00 in this zone). Defaults
+	// to UTC -- matching every prior release's undocumented behavior -- so
+	// an existing deployment that already compensated by writing its cron
+	// expressions in UTC keeps working unchanged; call SetLocation to make
+	// cron fields read as local wall-clock time instead. IntervalSeconds
+	// schedules are unaffected either way: they only measure elapsed
+	// duration, which is timezone-independent.
+	location *time.Location
 }
 
 func New(run Runner) *Scheduler {
-	return &Scheduler{run: run, lastRun: map[string]time.Time{}, inFlight: map[string]bool{}}
+	return &Scheduler{run: run, lastRun: map[string]time.Time{}, inFlight: map[string]bool{}, location: time.UTC}
+}
+
+// SetLocation sets the timezone future cron-field matching uses. Safe to
+// call before or after Start; nil is ignored (keeps the current/default
+// UTC location) so a bad MICROFLOW_SCHEDULER_TIMEZONE value can't leave
+// the scheduler without a usable zone.
+func (s *Scheduler) SetLocation(loc *time.Location) {
+	if loc == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.location = loc
 }
 
 func (s *Scheduler) Load(schedules []Schedule) {
@@ -154,6 +177,12 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	minute := now.Truncate(time.Minute)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// .In() re-labels the same instant into s.location without changing
+	// which instant it is, so cronMatches reads hour/weekday as local
+	// wall-clock time in that zone while minute (used below for lastRun
+	// bookkeeping and the same-minute guard) stays a plain absolute
+	// instant, comparable regardless of zone.
+	localMinute := minute.In(s.location)
 	for _, sc := range s.schedules {
 		if !sc.Enabled {
 			continue
@@ -164,7 +193,7 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 		case sc.CronExpr != "":
 			// Never fire the same schedule twice for one wall-clock minute
 			// (e.g. the startup tick followed by the first boundary tick).
-			due = cronMatches(sc.CronExpr, minute) && !(ran && !last.Before(minute))
+			due = cronMatches(sc.CronExpr, localMinute) && !(ran && !last.Before(minute))
 		case sc.IntervalSeconds > 0:
 			due = !ran || now.Sub(last) >= time.Duration(sc.IntervalSeconds)*time.Second
 		}
