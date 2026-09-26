@@ -23,6 +23,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // embed the IANA zoneinfo database in the binary so
+	// time.LoadLocation (see schedulerLocation below) works even on a
+	// minimal image with no OS-level tzdata package installed (e.g. this
+	// repo's Alpine runtime stage, which only apk-adds ffmpeg/python3/etc,
+	// not tzdata) -- a few hundred KB of extra binary size, no added
+	// runtime heap, in exchange for never silently falling back to UTC
+	// on a host that happens to lack /usr/share/zoneinfo.
 
 	"microflow/internal/api"
 	"microflow/internal/engine"
@@ -401,6 +408,7 @@ func main() {
 		}
 		log.Printf("schedule run %s/%s finished: %s (execution %s)", workflowID, nodeName, ex.Status, ex.ID)
 	})
+	sch.SetLocation(schedulerLocation())
 	sch.Load(schedules)
 	go sch.Start(ctx)
 
@@ -442,6 +450,29 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// schedulerLocation reads MICROFLOW_SCHEDULER_TIMEZONE (an IANA zone name,
+// e.g. "Asia/Dhaka") and resolves it via time/tzdata's embedded database, so
+// a Schedule Trigger's cron expression is read as that zone's wall-clock
+// time (matching what a person typing "0 19 * * *" actually means) rather
+// than the server host's zone, which is UTC on most container platforms
+// (this repo's own Alpine runtime image included) regardless of where the
+// workflow's audience or owner is. Unset or invalid falls back to UTC --
+// the scheduler's behavior before this existed -- with a log line so a typo
+// doesn't silently mis-schedule every run.
+func schedulerLocation() *time.Location {
+	name := strings.TrimSpace(os.Getenv("MICROFLOW_SCHEDULER_TIMEZONE"))
+	if name == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		log.Printf("warning: MICROFLOW_SCHEDULER_TIMEZONE=%q is not a valid IANA zone name (%v) -- Schedule Trigger cron expressions will be evaluated in UTC instead", name, err)
+		return time.UTC
+	}
+	log.Printf("startup: Schedule Trigger cron expressions will be evaluated in %s", name)
+	return loc
 }
 
 // schedulesFromNode reads a Schedule Trigger node's n8n-shaped parameters
