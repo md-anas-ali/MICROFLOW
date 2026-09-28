@@ -101,13 +101,13 @@ func NewGoogleOAuthApp(clientID, clientSecret, redirectURL string) *GoogleOAuthA
 // usable refresh_token. select_account additionally forces Google's
 // account chooser even if the browser is only signed into one account,
 // matching n8n's "choose which Google account" step.
-func (g *GoogleOAuthApp) AuthURL(service string) (string, error) {
+func (g *GoogleOAuthApp) AuthURL(msvcID, service string) (string, error) {
 	scopes, ok := GoogleServiceScopes[service]
 	if !ok {
 		return "", fmt.Errorf("vault: unknown google service %q", service)
 	}
 	allScopes := append([]string{"openid", "https://www.googleapis.com/auth/userinfo.email"}, scopes...)
-	state, err := g.signState(service)
+	state, err := g.signState(msvcID, service)
 	if err != nil {
 		return "", err
 	}
@@ -125,17 +125,25 @@ func (g *GoogleOAuthApp) AuthURL(service string) (string, error) {
 }
 
 // signState produces a stateless, tamper-evident state parameter
-// ("service|unixTimestamp|nonce" + HMAC-SHA256 signature, base64url
-// throughout) instead of a server-side session/table: MicroFlow's API
-// is otherwise stateless, and a signed token avoids adding storage just
-// for a short-lived CSRF value. Signed with the OAuth client secret,
-// which only this server knows.
-func (g *GoogleOAuthApp) signState(service string) (string, error) {
+// ("msvcID|service|unixTimestamp|nonce" + HMAC-SHA256 signature,
+// base64url throughout) instead of a server-side session/table:
+// MicroFlow's API is otherwise stateless, and a signed token avoids
+// adding storage just for a short-lived CSRF value. Signed with the
+// OAuth client secret, which only this server knows. msvcID (the
+// MicroFlow Service this connection belongs to) rides in the same
+// signed state as the Google service -- Google's own redirect_uri must
+// be a single fixed, pre-registered URL, so it cannot carry a
+// per-Service path segment; the signed state is what lets one shared
+// OAuth callback route correctly attribute the resulting connection to
+// the right MicroFlow Service (isolation rule 4/13: the callback can't
+// be tricked into saving a connection under the wrong Service, since
+// msvcID is inside the HMAC-signed payload, not a client-supplied param).
+func (g *GoogleOAuthApp) signState(msvcID, service string) (string, error) {
 	nonce := make([]byte, 12)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", err
 	}
-	payload := service + "|" + strconv.FormatInt(time.Now().Unix(), 10) + "|" + base64.RawURLEncoding.EncodeToString(nonce)
+	payload := msvcID + "|" + service + "|" + strconv.FormatInt(time.Now().Unix(), 10) + "|" + base64.RawURLEncoding.EncodeToString(nonce)
 	return g.signRaw(payload), nil
 }
 
@@ -151,38 +159,42 @@ func (g *GoogleOAuthApp) signRaw(payload string) string {
 }
 
 // verifyState checks the HMAC signature and TTL and returns the
-// service the state was originally issued for.
-func (g *GoogleOAuthApp) verifyState(state string) (service string, err error) {
+// MicroFlow Service id and Google service the state was originally
+// issued for.
+func (g *GoogleOAuthApp) verifyState(state string) (msvcID, service string, err error) {
 	dot := strings.LastIndexByte(state, '.')
 	if dot < 0 {
-		return "", errors.New("malformed state")
+		return "", "", errors.New("malformed state")
 	}
 	payloadPart, sigPart := state[:dot], state[dot+1:]
 	payload, err := base64.RawURLEncoding.DecodeString(payloadPart)
 	if err != nil {
-		return "", errors.New("malformed state")
+		return "", "", errors.New("malformed state")
 	}
 	mac := hmac.New(sha256.New, []byte(g.ClientSecret))
 	mac.Write(payload)
 	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expected), []byte(sigPart)) {
-		return "", errors.New("state signature mismatch")
+		return "", "", errors.New("state signature mismatch")
 	}
-	fields := strings.SplitN(string(payload), "|", 3)
-	if len(fields) != 3 {
-		return "", errors.New("malformed state payload")
+	fields := strings.SplitN(string(payload), "|", 4)
+	if len(fields) != 4 {
+		return "", "", errors.New("malformed state payload")
 	}
-	if !IsGoogleService(fields[0]) {
-		return "", fmt.Errorf("unknown service %q in state", fields[0])
+	if fields[0] == "" {
+		return "", "", errors.New("malformed state: missing service id")
 	}
-	ts, err := strconv.ParseInt(fields[1], 10, 64)
+	if !IsGoogleService(fields[1]) {
+		return "", "", fmt.Errorf("unknown service %q in state", fields[1])
+	}
+	ts, err := strconv.ParseInt(fields[2], 10, 64)
 	if err != nil {
-		return "", errors.New("malformed state timestamp")
+		return "", "", errors.New("malformed state timestamp")
 	}
 	if time.Since(time.Unix(ts, 0)) > googleOAuthStateTTL {
-		return "", errors.New("connect link expired -- please click Connect again")
+		return "", "", errors.New("connect link expired -- please click Connect again")
 	}
-	return fields[0], nil
+	return fields[0], fields[1], nil
 }
 
 // googleTokenResponse is Google's token-endpoint response shape
@@ -201,10 +213,10 @@ type googleTokenResponse struct {
 // code for tokens, fetches the connected account's email, and returns
 // the secrets map ready for GoogleServiceAccounts.Put -- the exact
 // shape OAuthResolver/AccountResolver already know how to refresh.
-func (g *GoogleOAuthApp) Exchange(ctx context.Context, code, state string) (service string, secrets map[string]string, err error) {
-	service, err = g.verifyState(state)
+func (g *GoogleOAuthApp) Exchange(ctx context.Context, code, state string) (msvcID, service string, secrets map[string]string, err error) {
+	msvcID, service, err = g.verifyState(state)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 
 	form := url.Values{
@@ -216,28 +228,28 @@ func (g *GoogleOAuthApp) Exchange(ctx context.Context, code, state string) (serv
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", googleTokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("contacting google: %w", err)
+		return "", "", nil, fmt.Errorf("contacting google: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var body googleTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", nil, fmt.Errorf("decoding google token response: %w", err)
+		return "", "", nil, fmt.Errorf("decoding google token response: %w", err)
 	}
 	if resp.StatusCode >= 300 || body.Error != "" {
-		return "", nil, fmt.Errorf("google rejected the connect request: %s: %s", body.Error, body.ErrorDesc)
+		return "", "", nil, fmt.Errorf("google rejected the connect request: %s: %s", body.Error, body.ErrorDesc)
 	}
 	if body.RefreshToken == "" {
 		// Shouldn't happen given access_type=offline+prompt=consent, but
 		// fail loudly with a clear cause rather than silently storing an
 		// access-token-only credential that would stop working the
 		// moment it first expires.
-		return "", nil, errors.New("google did not return a refresh token -- please try connecting again")
+		return "", "", nil, errors.New("google did not return a refresh token -- please try connecting again")
 	}
 
 	email, err := g.fetchEmail(ctx, body.AccessToken)
@@ -260,7 +272,7 @@ func (g *GoogleOAuthApp) Exchange(ctx context.Context, code, state string) (serv
 		"tokenType":    tokenType,
 		"email":        email,
 	}
-	return service, secrets, nil
+	return msvcID, service, secrets, nil
 }
 
 func (g *GoogleOAuthApp) fetchEmail(ctx context.Context, accessToken string) (string, error) {

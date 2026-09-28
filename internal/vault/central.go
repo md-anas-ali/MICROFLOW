@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
+
+	"microflow/internal/tenant"
 )
 
 // CentralGoogleAccount is the fixed key under which MicroFlow's one
@@ -184,90 +187,143 @@ func IsGoogleService(s string) bool {
 // install's central credential.
 func serviceAccountKey(service string) string { return "svc:" + service }
 
-// GoogleServiceAccounts holds one AccountResolver per connectable
-// Google service, each backed by its own row (so Gmail, YouTube, and
-// Sheets can each be connected to the same Google account or to three
-// different ones, independently of each other), plus the legacy single
-// CentralGoogleAccount resolver as a migration fallback: an install
-// that already had the old single "log in once" credential configured
-// keeps working for every service, unmodified, until an operator
-// connects a specific service through the new per-service flow (at
-// which point that service's own row takes over and the legacy row is
-// no longer consulted for it).
+// tenantServiceAccountKey namespaces a connected Google account row by
+// BOTH the MicroFlow Service (tenant.Service.ID -- an isolated
+// workspace) and the Google service (gmail/youtube/sheets), e.g.
+// "svc:acme-shorts:youtube". This is the actual isolation boundary for
+// rule 4 ("YouTube account, Google account, ... কখনো mix হবে না"): two
+// different MicroFlow Services connecting YouTube independently land on
+// two entirely distinct rows in google_account_credentials, with no
+// shared key in common. Reuses the exact same table/column/AEAD cipher
+// as the pre-existing single-account design -- no new storage, no
+// duplicate implementation (rule: reuse existing storage).
+func tenantServiceAccountKey(msvcID, service string) string { return "svc:" + msvcID + ":" + service }
+
+// GoogleServiceAccounts holds one AccountResolver per (MicroFlow
+// Service, Google service) pair, created lazily and cached, so Gmail/
+// YouTube/Sheets can each be connected to a different Google account
+// per MicroFlow Service, fully isolated from every other Service.
+//
+// Backward compatibility (rule 14): a MicroFlow Service falls back to
+// the pre-existing single "log in once" resolvers ONLY when its ID is
+// tenant.DefaultID -- the Service every workflow that existed before
+// this feature was introduced is automatically migrated into (see
+// store schema migration). This means an existing single-tenant
+// deployment's already-connected Google accounts keep working
+// unmodified after upgrading, while every OTHER (newly created)
+// Service starts with no fallback at all: if it hasn't connected its
+// own account yet, execution fails clearly instead of silently
+// borrowing another Service's or the legacy account's credential --
+// nothing to accidentally leak across the isolation boundary.
 type GoogleServiceAccounts struct {
-	accounts  *AccountVault
-	resolvers map[string]*AccountResolver
-	legacy    *AccountResolver
+	accounts *AccountVault
+
+	mu        sync.Mutex
+	resolvers map[string]*AccountResolver // key: tenantServiceAccountKey(msvcID, service)
+
+	// legacyResolvers/legacyPerService back tenant.DefaultID's fallback
+	// chain exactly as before this feature existed: per-service rows
+	// first (serviceAccountKey), then the single original
+	// CentralGoogleAccount row.
+	legacyPerService map[string]*AccountResolver
+	legacy           *AccountResolver
 }
 
-// NewGoogleServiceAccounts builds resolvers for every GoogleServices
-// entry plus the legacy fallback, all sharing av's storage/cipher.
+// NewGoogleServiceAccounts builds the Default-Service legacy resolvers
+// eagerly (matching the pre-existing behavior exactly) and prepares an
+// empty cache for every other Service's resolvers, built on first use.
 func NewGoogleServiceAccounts(av *AccountVault) *GoogleServiceAccounts {
-	m := make(map[string]*AccountResolver, len(GoogleServices))
+	legacy := make(map[string]*AccountResolver, len(GoogleServices))
 	for _, svc := range GoogleServices {
-		m[svc] = NewAccountResolver(av, serviceAccountKey(svc))
+		legacy[svc] = NewAccountResolver(av, serviceAccountKey(svc))
 	}
 	return &GoogleServiceAccounts{
-		accounts:  av,
-		resolvers: m,
-		legacy:    NewAccountResolver(av, CentralGoogleAccount),
+		accounts:         av,
+		resolvers:        make(map[string]*AccountResolver),
+		legacyPerService: legacy,
+		legacy:           NewAccountResolver(av, CentralGoogleAccount),
 	}
 }
 
-// Put stores/replaces the connected-account credential for one service
-// (called by the OAuth callback once a code exchange succeeds).
-func (g *GoogleServiceAccounts) Put(ctx context.Context, service string, secrets map[string]string) error {
+// resolverFor returns (creating and caching if needed) the resolver for
+// one (MicroFlow Service, Google service) pair.
+func (g *GoogleServiceAccounts) resolverFor(msvcID, service string) *AccountResolver {
+	key := tenantServiceAccountKey(msvcID, service)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if r, ok := g.resolvers[key]; ok {
+		return r
+	}
+	r := NewAccountResolver(g.accounts, key)
+	g.resolvers[key] = r
+	return r
+}
+
+// Put stores/replaces the connected-account credential for one
+// (MicroFlow Service, Google service) pair (called by the OAuth
+// callback once a code exchange succeeds, or by the manual paste
+// endpoint).
+func (g *GoogleServiceAccounts) Put(ctx context.Context, msvcID, service string, secrets map[string]string) error {
 	if !IsGoogleService(service) {
 		return fmt.Errorf("vault: unknown google service %q", service)
 	}
-	return g.accounts.Put(ctx, serviceAccountKey(service), secrets)
+	return g.accounts.Put(ctx, tenantServiceAccountKey(msvcID, service), secrets)
 }
 
-// Disconnect removes only this service's own row -- it never touches
-// the legacy central row or any other service's row, so disconnecting
-// YouTube can't affect Gmail/Sheets.
-func (g *GoogleServiceAccounts) Disconnect(ctx context.Context, service string) error {
+// Disconnect removes only this (Service, Google service) pair's own
+// row -- it never touches any other Service's row, any other Google
+// service's row, or the legacy account (isolation rule 4/13).
+func (g *GoogleServiceAccounts) Disconnect(ctx context.Context, msvcID, service string) error {
 	if !IsGoogleService(service) {
 		return fmt.Errorf("vault: unknown google service %q", service)
 	}
-	return g.accounts.Delete(ctx, serviceAccountKey(service))
+	return g.accounts.Delete(ctx, tenantServiceAccountKey(msvcID, service))
 }
 
-// Resolve is what node executors call at run time: this service's own
-// connected account first, falling back to the legacy central account
-// only if this service was never individually connected (see type doc).
-func (g *GoogleServiceAccounts) Resolve(ctx context.Context, service string) (map[string]string, error) {
-	r, ok := g.resolvers[service]
-	if !ok {
+// Resolve is what node executors call at run time: this MicroFlow
+// Service's own connected account for `service` first; only for
+// tenant.DefaultID, fall back to the pre-existing legacy per-service
+// row and then the original single central account (see type doc).
+// Every other Service gets no fallback at all -- a clear "not
+// connected" error rather than ever silently reusing another Service's
+// credential.
+func (g *GoogleServiceAccounts) Resolve(ctx context.Context, msvcID, service string) (map[string]string, error) {
+	if !IsGoogleService(service) {
 		return nil, fmt.Errorf("vault: unknown google service %q", service)
 	}
-	secrets, err := r.Resolve(ctx)
+	secrets, err := g.resolverFor(msvcID, service).Resolve(ctx)
 	if err == nil {
 		return secrets, nil
 	}
-	legacySecrets, legacyErr := g.legacy.Resolve(ctx)
-	if legacyErr == nil {
+	if msvcID != tenant.DefaultID {
+		return nil, err
+	}
+	if legacySecrets, legacyErr := g.legacyPerService[service].Resolve(ctx); legacyErr == nil {
+		return legacySecrets, nil
+	}
+	if legacySecrets, legacyErr := g.legacy.Resolve(ctx); legacyErr == nil {
 		return legacySecrets, nil
 	}
 	return nil, err
 }
 
-// Status reports this service's OWN connection state for the "Google
-// Connections" UI (never the legacy fallback -- the UI should show
-// "Connect Google" for a service that hasn't been individually
-// connected yet, even if the legacy account would still work at
-// execution time). needsReconnect is true when a credential row exists
-// but Google has revoked/expired the refresh token (invalid_grant) --
-// the UI's cue to show "Reconnect" instead of "Connect".
-func (g *GoogleServiceAccounts) Status(ctx context.Context, service string) (email string, updatedAt time.Time, connected bool, needsReconnect bool, err error) {
+// Status reports this (Service, Google service) pair's OWN connection
+// state for the "Google Connections" UI (never a fallback -- the UI
+// should show "Connect Google" for a Service that hasn't individually
+// connected yet, even if a fallback would still work at execution
+// time). needsReconnect is true when a credential row exists but
+// Google has revoked/expired the refresh token (invalid_grant) -- the
+// UI's cue to show "Reconnect" instead of "Connect".
+func (g *GoogleServiceAccounts) Status(ctx context.Context, msvcID, service string) (email string, updatedAt time.Time, connected bool, needsReconnect bool, err error) {
 	if !IsGoogleService(service) {
 		return "", time.Time{}, false, false, fmt.Errorf("vault: unknown google service %q", service)
 	}
-	updatedAt, exists, err := g.accounts.Status(ctx, serviceAccountKey(service))
+	key := tenantServiceAccountKey(msvcID, service)
+	updatedAt, exists, err := g.accounts.Status(ctx, key)
 	if err != nil || !exists {
 		return "", updatedAt, false, false, err
 	}
-	secrets, rerr := g.resolvers[service].Resolve(ctx)
+	secrets, rerr := g.resolverFor(msvcID, service).Resolve(ctx)
 	if rerr != nil {
 		if errors.Is(rerr, ErrGoogleReauthRequired) {
 			return "", updatedAt, true, true, nil
