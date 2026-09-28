@@ -365,7 +365,7 @@ func main() {
 	// satisfies api.ExecutionLoader (GetExecution) -- the durable
 	// fallback for GET /api/executions/{id} once execManager evicts a
 	// finished execution from memory.
-	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager)
+	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword)
 
 	// "Connect with Google" (n8n-style OAuth Authorization Code flow)
 	// only turns on if a Google Cloud OAuth client is configured -- see

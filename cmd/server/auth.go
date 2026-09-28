@@ -150,6 +150,28 @@ func (g *authGate) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// verifyPassword re-checks the login password for a sensitive action
+// (used by the API's "delete Environment set" second step). It reuses
+// the login gate's secureEq, per-IP failure limiter and 1s slow-down --
+// no separate auth system. The request must also carry a valid session.
+// retryAfter > 0 means the IP is currently locked out.
+func (g *authGate) verifyPassword(r *http.Request, password string) (ok bool, retryAfter time.Duration) {
+	if !g.validSession(r) {
+		return false, 0
+	}
+	ip := clientIP(r)
+	if wait := g.lockedFor(ip); wait > 0 {
+		return false, wait
+	}
+	if secureEq(password, g.pass) {
+		g.clearFails(ip)
+		return true, 0
+	}
+	g.recordFail(ip)
+	time.Sleep(time.Second) // slow down guessing, same as login
+	return false, 0
+}
+
 func (g *authGate) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
