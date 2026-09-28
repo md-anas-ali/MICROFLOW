@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"microflow/internal/runall"
@@ -37,6 +39,9 @@ func (s *Server) routesTenancy() {
 	s.mux.HandleFunc("GET /api/services/{id}/env", s.handleListServiceEnv)
 	s.mux.HandleFunc("POST /api/services/{id}/env", s.handlePutServiceEnv)
 	s.mux.HandleFunc("DELETE /api/services/{id}/env/{key}", s.handleDeleteServiceEnv)
+	s.mux.HandleFunc("GET /api/services/{id}/env/{key}", s.handleRevealServiceEnv)
+	s.mux.HandleFunc("POST /api/services/{id}/env/import", s.handleImportServiceEnv)
+	s.mux.HandleFunc("POST /api/services/{id}/env/delete-all", s.handleDeleteAllServiceEnv)
 
 	s.mux.HandleFunc("POST /api/run-all", s.handleRunAll)
 	s.mux.HandleFunc("GET /api/run-all", s.handleRunAllStatus)
@@ -263,6 +268,11 @@ type envEntryRequest struct {
 	Key      string `json:"key"`
 	Value    string `json:"value"`
 	IsSecret bool   `json:"isSecret"`
+	// Mode is optional. "" keeps the original upsert behavior (Global
+	// Environment page, older clients). "create" rejects an existing key
+	// (409); "update" rejects a missing key (404) -- so Add can never
+	// overwrite and Edit can never create a duplicate.
+	Mode string `json:"mode"`
 }
 
 var validEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -319,7 +329,7 @@ func (s *Server) handleDeleteGlobalEnv(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListServiceEnv(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !s.requireService(w, r, id) {
+	if !s.requireEnvService(w, r, id) {
 		return
 	}
 	list, err := s.services.ListServiceEnv(r.Context(), id)
@@ -332,13 +342,34 @@ func (s *Server) handleListServiceEnv(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePutServiceEnv(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !s.requireService(w, r, id) {
+	if !s.requireEnvService(w, r, id) {
 		return
 	}
 	req, err := decodeEnvEntry(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if req.Mode != "" && req.Mode != "create" && req.Mode != "update" {
+		writeErr(w, http.StatusBadRequest, errors.New("mode must be create or update"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	if req.Mode != "" {
+		exists, err := s.serviceEnvHasKey(r, id, req.Key)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, errors.New("failed to check service environment"))
+			return
+		}
+		if req.Mode == "create" && exists {
+			writeErr(w, http.StatusConflict, errors.New("a variable with this name already exists in this Service -- use Edit to change it"))
+			return
+		}
+		if req.Mode == "update" && !exists {
+			writeErr(w, http.StatusNotFound, errors.New("variable not found in this Service"))
+			return
+		}
 	}
 	if err := s.envVault.PutService(r.Context(), id, req.Key, req.Value, req.IsSecret); err != nil {
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to save service environment value"))
@@ -349,7 +380,7 @@ func (s *Server) handlePutServiceEnv(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteServiceEnv(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !s.requireService(w, r, id) {
+	if !s.requireEnvService(w, r, id) {
 		return
 	}
 	key := r.PathValue("key")
@@ -358,6 +389,299 @@ func (s *Server) handleDeleteServiceEnv(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// envWriteMu serializes Service Environment check-then-write sequences
+// (Add's duplicate check, Edit's exists check, Import) so two concurrent
+// requests can't both pass the check.
+var envWriteMu sync.Mutex
+
+// ReauthFunc re-verifies the logged-in person's password (the existing
+// login gate; see cmd/server/auth.go). retryAfter > 0 means the caller
+// is temporarily locked out by the same brute-force limiter as login.
+type ReauthFunc func(r *http.Request, password string) (ok bool, retryAfter time.Duration)
+
+// requireEnvService is requireService plus a defense-in-depth isolation
+// check: when the dashboard's X-Microflow-Service header is present it
+// must name the same Service as the URL, so a Service context can never
+// be used to reach another Service's Environment. Mismatch => 404.
+func (s *Server) requireEnvService(w http.ResponseWriter, r *http.Request, id string) bool {
+	if want := r.Header.Get("X-Microflow-Service"); want != "" && want != id {
+		writeErr(w, http.StatusNotFound, errors.New("service not found"))
+		return false
+	}
+	return s.requireService(w, r, id)
+}
+
+func (s *Server) serviceEnvHasKey(r *http.Request, id, key string) (bool, error) {
+	list, err := s.services.ListServiceEnv(r.Context(), id)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range list {
+		if e.Key == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// handleRevealServiceEnv returns ONE decrypted value of this Service,
+// only when explicitly asked for by key (the dashboard's show/edit
+// action). List responses stay metadata-only. Never cached, never logged.
+func (s *Server) handleRevealServiceEnv(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireEnvService(w, r, id) {
+		return
+	}
+	key := r.PathValue("key")
+	if !validEnvKey.MatchString(key) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid key"))
+		return
+	}
+	val, found, err := s.envVault.GetService(r.Context(), id, key)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to read service environment value"))
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, errors.New("variable not found in this Service"))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": val})
+}
+
+const (
+	maxEnvImportBytes   = 256 * 1024
+	maxEnvImportEntries = 500
+)
+
+type envImportRequest struct {
+	Content   string `json:"content"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+type envKV struct{ Key, Value string }
+
+// envImportIssue never carries line content (it may hold a secret) --
+// only the line number and a fixed reason.
+type envImportIssue struct {
+	Line   int    `json:"line"`
+	Reason string `json:"reason"`
+}
+
+// parseDotEnv parses .env text: KEY=VALUE per line; blank lines and
+// #-comments ignored; optional "export " prefix; single/double quoted
+// values; unquoted values lose a trailing " # comment". Duplicate keys
+// inside the file: the last one wins (dotenv convention) and is counted.
+// Multi-line values are not supported.
+func parseDotEnv(content string) (entries []envKV, issues []envImportIssue, dupes int) {
+	content = strings.TrimPrefix(content, "\ufeff")
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	var order []string
+	vals := map[string]string{}
+	for i, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") || strings.HasPrefix(line, "export\t") {
+			line = strings.TrimSpace(line[len("export"):])
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			issues = append(issues, envImportIssue{Line: i + 1, Reason: "expected KEY=VALUE"})
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		if !validEnvKey.MatchString(key) {
+			issues = append(issues, envImportIssue{Line: i + 1, Reason: "invalid variable name"})
+			continue
+		}
+		val, ok := parseDotEnvValue(strings.TrimSpace(line[eq+1:]))
+		if !ok {
+			issues = append(issues, envImportIssue{Line: i + 1, Reason: "unterminated quote"})
+			continue
+		}
+		if len(val) > maxEnvValueBytes {
+			issues = append(issues, envImportIssue{Line: i + 1, Reason: "value is too large"})
+			continue
+		}
+		if _, seen := vals[key]; seen {
+			dupes++
+		} else {
+			order = append(order, key)
+		}
+		vals[key] = val
+	}
+	for _, k := range order {
+		entries = append(entries, envKV{Key: k, Value: vals[k]})
+	}
+	return entries, issues, dupes
+}
+
+func parseDotEnvValue(v string) (string, bool) {
+	if v == "" {
+		return "", true
+	}
+	switch v[0] {
+	case '"':
+		var b strings.Builder
+		for i := 1; i < len(v); i++ {
+			c := v[i]
+			if c == '\\' && i+1 < len(v) {
+				i++
+				switch v[i] {
+				case 'n':
+					b.WriteByte('\n')
+				case 't':
+					b.WriteByte('\t')
+				case '"', '\\':
+					b.WriteByte(v[i])
+				default:
+					b.WriteByte('\\')
+					b.WriteByte(v[i])
+				}
+				continue
+			}
+			if c == '"' {
+				return b.String(), true // anything after the closing quote (e.g. a comment) is ignored
+			}
+			b.WriteByte(c)
+		}
+		return "", false
+	case '\'':
+		end := strings.IndexByte(v[1:], '\'')
+		if end < 0 {
+			return "", false
+		}
+		return v[1 : 1+end], true
+	}
+	if i := strings.Index(v, " #"); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v), true
+}
+
+// handleImportServiceEnv imports .env text into THIS Service only.
+// Existing keys are kept unless overwrite=true. Imported values are
+// stored as secrets (safe default; Edit can change that). The response
+// reports counts and line numbers only -- never any value.
+func (s *Server) handleImportServiceEnv(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireEnvService(w, r, id) {
+		return
+	}
+	var req envImportRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxEnvImportBytes+4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	if len(req.Content) > maxEnvImportBytes {
+		writeErr(w, http.StatusBadRequest, errors.New(".env content is too large"))
+		return
+	}
+	entries, issues, dupes := parseDotEnv(req.Content)
+	if len(entries) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("no valid KEY=VALUE entries found"))
+		return
+	}
+	if len(entries) > maxEnvImportEntries {
+		writeErr(w, http.StatusBadRequest, errors.New("too many entries in one import"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	existing, err := s.services.ListServiceEnv(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to check service environment"))
+		return
+	}
+	have := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		have[e.Key] = true
+	}
+	added, updated, skipped := 0, 0, 0
+	for _, kv := range entries {
+		if have[kv.Key] && !req.Overwrite {
+			skipped++
+			continue
+		}
+		if err := s.envVault.PutService(r.Context(), id, kv.Key, kv.Value, true); err != nil {
+			writeErr(w, http.StatusInternalServerError, errors.New("failed to save service environment value"))
+			return
+		}
+		if have[kv.Key] {
+			updated++
+		} else {
+			added++
+		}
+	}
+	if issues == nil {
+		issues = []envImportIssue{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"added": added, "updated": updated, "skipped": skipped,
+		"duplicatesInFile": dupes, "invalid": issues,
+	})
+}
+
+type envDeleteAllRequest struct {
+	ConfirmName string `json:"confirmName"`
+	Password    string `json:"password"`
+}
+
+// handleDeleteAllServiceEnv deletes this Service's whole Environment set
+// (variables only). Two steps, both enforced HERE, not just in the UI:
+//  1. confirmation -- confirmName must equal the Service's name;
+//  2. the existing login gate's password re-check (s.reauth), rate
+//     limited by the same limiter as login.
+//
+// Fails closed if no re-check is wired.
+func (s *Server) handleDeleteAllServiceEnv(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireEnvService(w, r, id) {
+		return
+	}
+	if s.reauth == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("deleting an Environment set is not enabled on this server"))
+		return
+	}
+	var req envDeleteAllRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	svc, err := s.services.GetService(r.Context(), id)
+	if err != nil || svc == nil {
+		writeErr(w, http.StatusNotFound, errors.New("service not found"))
+		return
+	}
+	if req.ConfirmName == "" || req.ConfirmName != svc.Name {
+		writeErr(w, http.StatusBadRequest, errors.New("confirmation did not match -- nothing was deleted"))
+		return
+	}
+	ok, wait := s.reauth(r, req.Password)
+	if wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeErr(w, http.StatusTooManyRequests, errors.New("too many failed attempts -- try again later"))
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusForbidden, errors.New("verification failed -- nothing was deleted"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	n, err := s.envVault.DeleteAllService(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to delete service environment"))
+		return
+	}
+	log.Printf("service environment set deleted: service=%s variables=%d", id, n) // count only, never keys/values
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted": n})
 }
 
 // --- Run All Services ---

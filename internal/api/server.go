@@ -112,6 +112,12 @@ type Server struct {
 	services ServiceStore
 	envVault EnvResolver
 	runAll   RunAllController
+
+	// reauth re-verifies the logged-in person's password for sensitive
+	// actions (deleting a Service's whole Environment set). Wired by
+	// WithReauth from the existing login gate; nil => those actions are
+	// refused (fail closed), never silently allowed.
+	reauth ReauthFunc
 }
 
 // ServiceStore is the persistence interface Service (tenant) management
@@ -139,6 +145,10 @@ type EnvResolver interface {
 	DeleteGlobal(ctx context.Context, key string) error
 	PutService(ctx context.Context, serviceID, key, value string, isSecret bool) error
 	DeleteService(ctx context.Context, serviceID, key string) error
+	// GetService decrypts ONE value of serviceID (explicit reveal only).
+	GetService(ctx context.Context, serviceID, key string) (value string, found bool, err error)
+	// DeleteAllService removes every Environment variable of serviceID only.
+	DeleteAllService(ctx context.Context, serviceID string) (int, error)
 }
 
 // RunAllController is what the Run Service / Run All Services endpoints
@@ -162,6 +172,14 @@ func (s *Server) WithTenancy(services ServiceStore, env EnvResolver, runAll RunA
 	s.envVault = env
 	s.runAll = runAll
 	s.routesTenancy()
+	return s
+}
+
+// WithReauth wires the existing login gate's password re-check (see
+// cmd/server/auth.go) so destructive Environment actions can require a
+// second verification step enforced in the backend. Nil-safe.
+func (s *Server) WithReauth(fn ReauthFunc) *Server {
+	s.reauth = fn
 	return s
 }
 
