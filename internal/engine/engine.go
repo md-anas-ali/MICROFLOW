@@ -54,6 +54,17 @@ type RunContext struct {
 	StaticData  StaticDataStore
 	Credentials CredentialResolver
 	ScratchDir  string // per-execution temp dir; engine removes it on completion (rule 7: cleanup)
+
+	// ServiceEnv/GlobalEnv back Env(key) below: this Service's own
+	// Environment overrides and the deployment-wide Global Environment,
+	// both already decrypted once per run (see vault.EnvVault.ResolveAll
+	// via runner.Runner) rather than per lookup. Nil-safe: a Runner that
+	// never wires an env resolver (e.g. an older test helper) leaves
+	// both nil, and Env falls straight through to the process
+	// environment, exactly matching pre-Service-isolation behavior.
+	ServiceEnv map[string]string
+	GlobalEnv  map[string]string
+
 	mu          sync.Mutex
 	nodeOutputs map[string]map[string]any // last output's $json per node name, for $node[...] expressions
 
@@ -129,6 +140,46 @@ type RunContext struct {
 // without bound for the lifetime of a long-running execution. Also
 // fires OnNodeRun (if set) so live progress (SSE) reflects every node
 // transition, not just the terminal execution state.
+// Env resolves one environment variable name with MicroFlow's Global
+// Environment precedence (rule 2): this Service's own Environment
+// override first, then the deployment-wide Global Environment, then the
+// process environment (unchanged pre-Service-isolation behavior) --
+// never the other way around, and never mixing in another Service's
+// override. Used by both the Code node's $env allowlist and
+// nodes/google.go's GOOGLE_SHEETS_URL lookup, so every place MicroFlow
+// reads "an env var configured by the operator" goes through one
+// consistent precedence chain instead of two copies drifting apart.
+func (rc *RunContext) Env(key string) string {
+	if rc.ServiceEnv != nil {
+		if v, ok := rc.ServiceEnv[key]; ok {
+			return v
+		}
+	}
+	if rc.GlobalEnv != nil {
+		if v, ok := rc.GlobalEnv[key]; ok {
+			return v
+		}
+	}
+	return os.Getenv(key)
+}
+
+// LookupEnv is Env's (value, ok) counterpart, for callers (Code node's
+// $env allowlist) that need to distinguish "unset" from "set to empty
+// string" -- see nodes.CodeExecutor.envAllowlist's doc comment.
+func (rc *RunContext) LookupEnv(key string) (string, bool) {
+	if rc.ServiceEnv != nil {
+		if v, ok := rc.ServiceEnv[key]; ok {
+			return v, true
+		}
+	}
+	if rc.GlobalEnv != nil {
+		if v, ok := rc.GlobalEnv[key]; ok {
+			return v, true
+		}
+	}
+	return os.LookupEnv(key)
+}
+
 func (rc *RunContext) appendNodeRun(result model.NodeRunResult) {
 	limit := rc.NodeRunCap
 	if limit <= 0 {

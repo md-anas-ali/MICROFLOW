@@ -112,6 +112,17 @@ func NewSecretRedactorFromEnv() *SecretRedactor {
 	return r
 }
 
+// NoteEnvValue registers a Global/Service Environment value for redaction
+// using the same name-based rule NewSecretRedactorFromEnv applies to the
+// process environment (names that look like secrets/tokens/keys), so
+// values saved through the dashboard get the same log/report protection
+// as ones set in the hosting provider's env vars.
+func (r *SecretRedactor) NoteEnvValue(name, value string) {
+	if envSecretPattern.MatchString(name) {
+		r.noteValue(value)
+	}
+}
+
 // minSecretLen avoids blacklisting trivial/common short strings (empty,
 // "0", "true", ...) that could appear incidentally all over normal
 // output and would make redaction useless-noisy if treated as secrets.
