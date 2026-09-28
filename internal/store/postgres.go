@@ -769,6 +769,18 @@ func (s *Store) DeleteServiceEnv(ctx context.Context, serviceID, key string) err
 	return err
 }
 
+// DeleteAllServiceEnv removes every Environment row of ONE Service in a
+// single SQL statement, so it is all-or-nothing (Postgres runs one
+// statement atomically) -- no partial delete is possible. Scoped strictly
+// by service_id; returns how many rows were removed.
+func (s *Store) DeleteAllServiceEnv(ctx context.Context, serviceID string) (int, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM service_env WHERE service_id=$1`, serviceID)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *Store) ListServiceEnv(ctx context.Context, serviceID string) ([]EnvInfo, error) {
 	rows, err := s.pool.Query(ctx, `SELECT key, is_secret, updated_at FROM service_env WHERE service_id=$1 ORDER BY key`, serviceID)
 	if err != nil {
