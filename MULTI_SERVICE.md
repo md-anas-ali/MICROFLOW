@@ -19,7 +19,10 @@ environment overrides and executions.
 
 ## Environment precedence
 Service Environment > Global Environment > process environment
-(`engine.RunContext.Env`). Used by Code node `$env` and `GOOGLE_SHEETS_URL`.
+(`engine.RunContext.Env`). Used by Code node `$env`, `{{ $env.X }}` expressions,
+`GOOGLE_SHEETS_URL`, and every `executeCommand` child process
+(`engine.RunContext.ProcessEnv`: host/Render < Global < this Service's own
+Environment, built per run; another Service's variables are never loaded).
 Names stored in the dashboard are visible to that run's Code nodes; values
 whose names look like secrets are added to the log/report redactor.
 `GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL` may be stored in Global
