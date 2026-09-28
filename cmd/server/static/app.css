@@ -512,3 +512,20 @@ textarea.json-paste {
 .env-row-sub { font-size: 12px; color: var(--text-dim); }
 .env-inherited { background: var(--accent-dim); border: 1px dashed #c3c6f5; border-radius: 16px; padding: 14px; }
 .env-inherited .env-row { background: rgba(255,255,255,.7); }
+
+/* Environment section: three-dot menu + action panels (Service scope) */
+.env-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.env-head .env-section-title { margin-bottom: 0; }
+.env-menu-wrap { position: relative; }
+.env-menu-btn { font-size: 18px; line-height: 1; padding: 2px 12px; }
+.env-menu { position: absolute; right: 0; top: 38px; min-width: 190px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.12); padding: 6px; z-index: 40; }
+.env-menu[hidden] { display: none; }
+.env-menu-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; background: none; border: 0; border-radius: 10px; font: inherit; color: var(--text); text-align: left; cursor: pointer; min-height: 44px; }
+.env-menu-item:hover { background: var(--accent-dim); }
+.env-menu-item.danger { color: var(--error); }
+.env-panel { margin-bottom: 16px; }
+.env-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.env-panel-head .env-section-title { margin-bottom: 0; }
+.env-val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; letter-spacing: 1px; }
+.env-val.shown { letter-spacing: 0; color: var(--text); }
+

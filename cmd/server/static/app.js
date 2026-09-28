@@ -1867,8 +1867,9 @@
 
   // ---------------- Services, Environment, Run All ----------------
   //
-  // Everything below talks to internal/api/services.go. Secret values are
-  // write-only: the environment pages list key names/flags, never values.
+  // Everything below talks to internal/api/services.go. Environment lists
+  // carry key names/flags only; a value is fetched one key at a time, and
+  // only when the person explicitly clicks Show / Edit.
 
   async function loadServices() {
     servicesCache = (await apiJSON("/api/services")) || [];
@@ -2166,19 +2167,37 @@
     const sub = isGlobal
       ? "Shared by every Service. A Service's own value wins over it."
       : "Values for <b>" + escapeHtml(currentServiceName()) + "</b> only. Anything missing here comes from Global.";
+    const ENV_MENU = [
+      ["view", "\uD83D\uDC41\uFE0F", "View"], ["edit", "\u270F\uFE0F", "Edit"], ["add", "\u2795", "Add"],
+      ["import", "\uD83D\uDCE5", "Import"], ["remove", "\uD83D\uDDD1\uFE0F", "Remove"], ["delete", "\uD83D\uDD34", "Delete"],
+    ];
+    const sectionTitle = isGlobal ? "\uD83C\uDF10 Global Environment" : "\u2699\uFE0F Service Environment";
+    // Service scope: the section header carries the \u22EE menu. Global scope is unchanged.
+    const sectionHead = isGlobal
+      ? '<div class="env-section-title">' + sectionTitle + "</div>"
+      : '<div class="env-head"><div class="env-section-title">' + sectionTitle + "</div>" +
+        '<div class="env-menu-wrap"><button id="envMenuBtn" class="btn btn-sm env-menu-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Environment actions">\u22EE</button>' +
+        '<div id="envMenu" class="env-menu" role="menu" hidden>' +
+        ENV_MENU.map((m) => '<button class="env-menu-item' + (m[0] === "delete" ? " danger" : "") + '" role="menuitem" data-act="' + m[0] + '"><span class="menu-ico">' + m[1] + "</span>" + m[2] + "</button>").join("") +
+        "</div></div></div><div id=\"envPanel\"></div>";
     viewEl.innerHTML =
       '<div class="narrow"><div class="page-head"><div><h1>' + title + '</h1><div class="sub">' + sub + "</div></div></div>" +
-      '<div class="env-section"><div class="env-section-title">' + (isGlobal ? "\uD83C\uDF10 Global Environment" : "\u2699\uFE0F Service Environment") + "</div>" +
+      '<div class="env-section">' + sectionHead +
       '<div id="envTable">' + loadingRow() + "</div></div>" +
       (isGlobal ? "" : '<div class="env-section env-inherited"><div class="env-section-title">\uD83C\uDF10 Inherited from Global</div><div id="envInherited">' + loadingRow() + "</div></div>") +
-      '<div class="card"><div class="env-section-title">\u2795 Add or update</div>' +
-      '<div class="field"><label>Name</label><input type="text" id="envKey" placeholder="e.g. API_KEY" autocomplete="off"></div>' +
-      '<div class="field"><label>Value</label><input type="password" id="envVal" autocomplete="off"></div>' +
-      '<div class="field"><label><input type="checkbox" id="envSecret" checked> Secret (hide after saving)</label></div>' +
-      '<button id="envSave" class="btn btn-primary btn-big">Save</button>' +
-      '<div class="cred-section-note" style="margin-top:8px;">Values are encrypted and never shown again after saving. ' +
-      (isGlobal ? "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL take effect after a server restart." : "") +
-      "</div></div></div>";
+      (isGlobal
+        ? '<div class="card"><div class="env-section-title">\u2795 Add or update</div>' +
+          '<div class="field"><label>Name</label><input type="text" id="envKey" placeholder="e.g. API_KEY" autocomplete="off"></div>' +
+          '<div class="field"><label>Value</label><input type="password" id="envVal" autocomplete="off"></div>' +
+          '<div class="field"><label><input type="checkbox" id="envSecret" checked> Secret (hide after saving)</label></div>' +
+          '<button id="envSave" class="btn btn-primary btn-big">Save</button>' +
+          '<div class="cred-section-note" style="margin-top:8px;">Values are encrypted and never shown again after saving. ' +
+          "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL take effect after a server restart." +
+          "</div></div>"
+        : "") +
+      "</div>";
+
+    let envList = [];
 
     async function loadInherited(own) {
       const host = document.getElementById("envInherited");
@@ -2201,12 +2220,15 @@
       let list = [];
       try {
         list = (await apiJSON(base)) || [];
+        envList = list;
         host.innerHTML = list.length
           ? '<div class="env-list">' + list.map((e) =>
               '<div class="env-row"><div class="env-row-main"><code>' + escapeHtml(e.key) + '</code><div class="env-row-sub">' +
               (e.isSecret ? "\uD83D\uDD12 secret" : "plain") + " \u00B7 " + escapeHtml(fmtDate(e.updatedAt)) +
-              '</div></div><button class="btn btn-sm btn-danger env-del" data-key="' + escapeHtml(e.key) + '">Delete</button></div>').join("") + "</div>"
-          : emptyState("Nothing set yet", "Add a name and value below.", "\u2699\uFE0F");
+              "</div></div>" +
+              (isGlobal ? '<button class="btn btn-sm btn-danger env-del" data-key="' + escapeHtml(e.key) + '">Delete</button>' : "") +
+              "</div>").join("") + "</div>"
+          : emptyState("Nothing set yet", isGlobal ? "Add a name and value below." : "Use the \u22EE menu to add one.", "\u2699\uFE0F");
         host.querySelectorAll(".env-del").forEach((b) => b.addEventListener("click", async () => {
           if (!confirm("Delete " + b.dataset.key + "?")) return;
           try { await apiJSON(base + "/" + encodeURIComponent(b.dataset.key), { method: "DELETE" }); refresh(); }
@@ -2217,22 +2239,229 @@
       }
       loadInherited(list);
     }
-    document.getElementById("envSave").addEventListener("click", async () => {
-      const key = document.getElementById("envKey").value.trim();
-      const value = document.getElementById("envVal").value;
-      if (!key) { toast("Enter a name", "error"); return; }
-      try {
-        await apiJSON(base, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ key, value, isSecret: document.getElementById("envSecret").checked }),
-        });
-        document.getElementById("envKey").value = "";
-        document.getElementById("envVal").value = "";
-        toast("Saved", "success");
-        refresh();
-      } catch (e) { toast(e.message, "error"); }
+
+    if (isGlobal) {
+      document.getElementById("envSave").addEventListener("click", async () => {
+        const key = document.getElementById("envKey").value.trim();
+        const value = document.getElementById("envVal").value;
+        if (!key) { toast("Enter a name", "error"); return; }
+        try {
+          await apiJSON(base, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key, value, isSecret: document.getElementById("envSecret").checked }),
+          });
+          document.getElementById("envKey").value = "";
+          document.getElementById("envVal").value = "";
+          toast("Saved", "success");
+          refresh();
+        } catch (e) { toast(e.message, "error"); }
+      });
+      refresh();
+      return;
+    }
+
+    // ---------- Service scope: \u22EE menu + panels ----------
+    // Values are only ever fetched per key, on an explicit Show/Edit, and
+    // live only in DOM nodes / input fields (never in variables that
+    // outlive the panel, never logged).
+    const MASK = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
+    const jsonPost = (path, body, method) => apiJSON(path, {
+      method: method || "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
+    const fetchValue = async (key) => {
+      const r = await apiJSON(svcPath("/env/" + encodeURIComponent(key)));
+      return r && r.value != null ? r.value : "";
+    };
+    const panelHost = () => document.getElementById("envPanel");
+    const closePanel = () => { const h = panelHost(); if (h) h.innerHTML = ""; };
+    const panelShell = (heading, body) =>
+      '<div class="card env-panel"><div class="env-panel-head"><div class="env-section-title">' + heading + "</div>" +
+      '<button class="btn btn-sm" id="envPanelClose">Close</button></div>' + body + "</div>";
+    const openPanel = (heading, body) => {
+      panelHost().innerHTML = panelShell(heading, body);
+      document.getElementById("envPanelClose").addEventListener("click", closePanel);
+      panelHost().scrollIntoView({ block: "nearest" });
+    };
+    const keyOptions = () => envList.map((e) => '<option value="' + escapeHtml(e.key) + '">' + escapeHtml(e.key) + "</option>").join("");
+    const needKeys = (heading, msg) => {
+      if (envList.length) return false;
+      openPanel(heading, '<div class="sub">' + msg + "</div>");
+      return true;
+    };
+    const showToggle = (inputId, toggleId) => {
+      document.getElementById(toggleId).addEventListener("change", (ev) => {
+        document.getElementById(inputId).type = ev.target.checked ? "text" : "password";
+      });
+    };
+
+    function openView() {
+      if (needKeys("\uD83D\uDC41\uFE0F View", "No variables in this Service yet.")) return;
+      openPanel("\uD83D\uDC41\uFE0F View",
+        '<div class="env-list">' + envList.map((e) =>
+          '<div class="env-row" data-key="' + escapeHtml(e.key) + '" data-secret="' + (e.isSecret ? "1" : "0") + '">' +
+          '<div class="env-row-main"><code>' + escapeHtml(e.key) + '</code><div class="env-row-sub env-val">' + MASK + "</div></div>" +
+          '<button class="btn btn-sm env-eye">Show</button></div>').join("") + "</div>" +
+        '<div class="cred-section-note" style="margin-top:8px;">Secret values are hidden by default and hide again after 30 seconds.</div>');
+      panelHost().querySelectorAll(".env-row").forEach((row) => {
+        const key = row.dataset.key, isSecret = row.dataset.secret === "1";
+        const out = row.querySelector(".env-val"), btn = row.querySelector(".env-eye");
+        let shown = false, timer = null;
+        const hide = () => { clearTimeout(timer); out.textContent = MASK; out.classList.remove("shown"); btn.textContent = "Show"; shown = false; };
+        const show = async () => {
+          try {
+            const v = await fetchValue(key);
+            out.textContent = v === "" ? "(empty)" : v;
+            out.classList.add("shown"); btn.textContent = "Hide"; shown = true;
+            if (isSecret) timer = setTimeout(hide, 30000);
+          } catch (e) { toast(e.message, "error"); }
+        };
+        btn.addEventListener("click", () => (shown ? hide() : show()));
+        if (!isSecret) show();
+      });
+    }
+
+    function openEdit() {
+      if (needKeys("\u270F\uFE0F Edit", "No variables to edit yet.")) return;
+      openPanel("\u270F\uFE0F Edit",
+        '<div class="field"><label>Variable</label><select id="envEditKey">' + keyOptions() + "</select></div>" +
+        '<div class="field"><label>Value</label><input type="password" id="envEditVal" autocomplete="off"></div>' +
+        '<div class="field"><label><input type="checkbox" id="envEditShow"> Show value</label></div>' +
+        '<div class="field"><label><input type="checkbox" id="envEditSecret"> Secret</label></div>' +
+        '<button id="envEditSave" class="btn btn-primary btn-big">Save changes</button>');
+      showToggle("envEditVal", "envEditShow");
+      const sel = document.getElementById("envEditKey"), val = document.getElementById("envEditVal");
+      const load = async () => {
+        const meta = envList.find((e) => e.key === sel.value);
+        document.getElementById("envEditSecret").checked = !meta || meta.isSecret;
+        val.value = "";
+        try { val.value = await fetchValue(sel.value); } catch (e) { toast(e.message, "error"); }
+      };
+      sel.addEventListener("change", load);
+      load();
+      document.getElementById("envEditSave").addEventListener("click", async () => {
+        try {
+          await jsonPost(base, { key: sel.value, value: val.value, isSecret: document.getElementById("envEditSecret").checked, mode: "update" });
+          toast("Updated", "success");
+          closePanel(); refresh();
+        } catch (e) { toast(e.message, "error"); }
+      });
+    }
+
+    function openAdd() {
+      openPanel("\u2795 Add",
+        '<div class="field"><label>Name</label><input type="text" id="envAddKey" placeholder="e.g. API_KEY" autocomplete="off"></div>' +
+        '<div class="field"><label>Value</label><input type="password" id="envAddVal" autocomplete="off"></div>' +
+        '<div class="field"><label><input type="checkbox" id="envAddShow"> Show value</label></div>' +
+        '<div class="field"><label><input type="checkbox" id="envAddSecret" checked> Secret</label></div>' +
+        '<button id="envAddSave" class="btn btn-primary btn-big">Add variable</button>');
+      showToggle("envAddVal", "envAddShow");
+      document.getElementById("envAddSave").addEventListener("click", async () => {
+        const key = document.getElementById("envAddKey").value.trim();
+        if (!key) { toast("Enter a name", "error"); return; }
+        try {
+          await jsonPost(base, { key, value: document.getElementById("envAddVal").value, isSecret: document.getElementById("envAddSecret").checked, mode: "create" });
+          toast("Added", "success");
+          closePanel(); refresh();
+        } catch (e) { toast(e.message, "error"); }
+      });
+    }
+
+    function openImport() {
+      openPanel("\uD83D\uDCE5 Import .env",
+        '<div class="field"><label>.env file</label><input type="file" id="envImpFile" accept=".env,text/plain"></div>' +
+        '<div class="field"><label>or paste KEY=VALUE lines</label><textarea id="envImpText" class="json-paste" rows="7" spellcheck="false" autocomplete="off" placeholder="API_KEY=abc123&#10;# comments and blank lines are ignored"></textarea></div>' +
+        '<div class="field"><label><input type="checkbox" id="envImpOver"> Overwrite variables that already exist (otherwise they are kept)</label></div>' +
+        '<button id="envImpGo" class="btn btn-primary btn-big">Import into ' + escapeHtml(currentServiceName()) + "</button>" +
+        '<div id="envImpResult" class="cred-section-note" style="margin-top:8px;">Imported values are stored as secrets. Multi-line values are not supported.</div>');
+      const text = document.getElementById("envImpText");
+      document.getElementById("envImpFile").addEventListener("change", async (ev) => {
+        const f = ev.target.files && ev.target.files[0];
+        if (!f) return;
+        if (f.size > 256 * 1024) { toast("File is too large (max 256 KB)", "error"); ev.target.value = ""; return; }
+        text.value = await f.text();
+      });
+      document.getElementById("envImpGo").addEventListener("click", async () => {
+        if (!text.value.trim()) { toast("Choose a .env file or paste some lines", "error"); return; }
+        try {
+          const r = await jsonPost(svcPath("/env/import"), { content: text.value, overwrite: document.getElementById("envImpOver").checked });
+          text.value = ""; // don't leave secrets sitting in the page
+          const bad = (r.invalid || []).map((i) => "line " + i.line + " (" + i.reason + ")");
+          document.getElementById("envImpResult").textContent =
+            "Added " + r.added + " \u00B7 Updated " + r.updated + " \u00B7 Kept existing " + r.skipped +
+            (r.duplicatesInFile ? " \u00B7 Repeated in file " + r.duplicatesInFile + " (last one used)" : "") +
+            (bad.length ? " \u00B7 Ignored: " + bad.join(", ") : "");
+          toast("Import finished", "success");
+          refresh();
+        } catch (e) { toast(e.message, "error"); }
+      });
+    }
+
+    function openRemove() {
+      if (needKeys("\uD83D\uDDD1\uFE0F Remove", "No variables to remove.")) return;
+      openPanel("\uD83D\uDDD1\uFE0F Remove",
+        '<div class="field"><label>Variable</label><select id="envRmKey">' + keyOptions() + "</select></div>" +
+        '<button id="envRmGo" class="btn btn-danger btn-big">Remove variable</button>' +
+        '<div class="cred-section-note" style="margin-top:8px;">Removes only the selected variable from this Service.</div>');
+      document.getElementById("envRmGo").addEventListener("click", async () => {
+        const key = document.getElementById("envRmKey").value;
+        if (!confirm('Remove "' + key + '" from ' + currentServiceName() + "?\nOnly this variable is removed.")) return;
+        try {
+          await apiJSON(base + "/" + encodeURIComponent(key), { method: "DELETE" });
+          toast("Removed", "success");
+          closePanel(); refresh();
+        } catch (e) { toast(e.message, "error"); }
+      });
+    }
+
+    function openDelete() {
+      const name = currentServiceName();
+      openPanel("\uD83D\uDD34 Delete Environment set",
+        '<div class="sub" style="margin-bottom:10px;">Deletes <b>all ' + envList.length + " variable(s)</b> of <b>" + escapeHtml(name) +
+        "</b>. The Service, its workflows, credentials, Global Environment and other Services are not touched. This cannot be undone.</div>" +
+        '<div class="field"><label>Step 1 \u2014 type the Service name to confirm</label><input type="text" id="envDelName" autocomplete="off" placeholder="' + escapeHtml(name) + '"></div>' +
+        '<div class="field"><label>Step 2 \u2014 verify with your login password</label><input type="password" id="envDelPw" autocomplete="current-password" disabled></div>' +
+        '<button id="envDelGo" class="btn btn-danger btn-big" disabled>Delete Environment set</button>');
+      const nameIn = document.getElementById("envDelName"), pwIn = document.getElementById("envDelPw"), go = document.getElementById("envDelGo");
+      const sync = () => {
+        const ok = nameIn.value === name;
+        pwIn.disabled = !ok;
+        go.disabled = !(ok && pwIn.value.length > 0);
+      };
+      nameIn.addEventListener("input", sync);
+      pwIn.addEventListener("input", sync);
+      go.addEventListener("click", async () => {
+        go.disabled = true;
+        try {
+          const r = await jsonPost(svcPath("/env/delete-all"), { confirmName: nameIn.value, password: pwIn.value });
+          pwIn.value = "";
+          toast("Deleted " + (r && r.deleted != null ? r.deleted : 0) + " variable(s)", "success");
+          closePanel(); refresh();
+        } catch (e) {
+          pwIn.value = ""; sync();
+          toast(e.message, "error");
+        }
+      });
+    }
+
+    const ACTIONS = { view: openView, edit: openEdit, add: openAdd, import: openImport, remove: openRemove, delete: openDelete };
+    const menuBtn = document.getElementById("envMenuBtn"), menu = document.getElementById("envMenu");
+    function outsideClick(ev) { if (!menu.contains(ev.target) && !menuBtn.contains(ev.target)) closeMenu(); }
+    function closeMenu() {
+      menu.hidden = true;
+      menuBtn.setAttribute("aria-expanded", "false");
+      document.removeEventListener("click", outsideClick);
+    }
+    menuBtn.addEventListener("click", () => {
+      if (!menu.hidden) { closeMenu(); return; }
+      menu.hidden = false;
+      menuBtn.setAttribute("aria-expanded", "true");
+      document.addEventListener("click", outsideClick);
+    });
+    menu.querySelectorAll(".env-menu-item").forEach((b) => b.addEventListener("click", () => {
+      closeMenu();
+      ACTIONS[b.dataset.act]();
+    }));
     refresh();
   }
 
