@@ -117,3 +117,55 @@ func (ev *EnvVault) ResolveAll(ctx context.Context, serviceID string) (serviceEn
 	}
 	return serviceEnv, globalEnv, nil
 }
+
+// GetService decrypts and returns ONE Service Environment value for
+// serviceID (found=false if that Service has no such key). It only ever
+// reads serviceID's own rows, and decrypts only the requested key. Used
+// solely by the explicit, per-key "reveal" endpoint -- never by list
+// responses.
+func (ev *EnvVault) GetService(ctx context.Context, serviceID, key string) (value string, found bool, err error) {
+	all, err := ev.store.AllServiceEnvCiphertext(ctx, serviceID)
+	if err != nil {
+		return "", false, err
+	}
+	ct, ok := all[key]
+	if !ok {
+		return "", false, nil
+	}
+	v, err := ev.open(ct)
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+// DeleteAllService removes every Service Environment override that
+// belongs to serviceID -- and nothing else (Global Environment, other
+// Services, workflows and credentials are never touched). Returns how
+// many variables were removed. Idempotent: safe to retry after a
+// partial failure.
+func (ev *EnvVault) DeleteAllService(ctx context.Context, serviceID string) (int, error) {
+	if serviceID == "" {
+		return 0, errors.New("vault: service id is required")
+	}
+	// Preferred path: the store deletes the whole set in ONE statement
+	// (atomic). Optional interface so EnvStore and its other
+	// implementations/fakes stay unchanged.
+	if a, ok := ev.store.(interface {
+		DeleteAllServiceEnv(ctx context.Context, serviceID string) (int, error)
+	}); ok {
+		return a.DeleteAllServiceEnv(ctx, serviceID)
+	}
+	all, err := ev.store.AllServiceEnvCiphertext(ctx, serviceID)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for k := range all {
+		if err := ev.store.DeleteServiceEnv(ctx, serviceID, k); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
