@@ -10,34 +10,25 @@
 <body>
 <div id="app">
   <header class="topbar">
-    <button id="navToggle" class="icon-btn" aria-label="Toggle menu">&#9776;</button>
-    <div class="brand">
+    <a class="brand" href="#/dashboard" aria-label="MicroFlow home">
       <span class="brand-mark">M</span>
       <span class="brand-name">MicroFlow</span>
-    </div>
+    </a>
     <div class="topbar-spacer"></div>
-    <select id="serviceSwitch" class="service-switch" aria-label="Current Service" title="Current Service"></select>
     <span id="connStatus" class="conn-status conn-unknown">connecting&hellip;</span>
+    <div class="settings-wrap">
+      <button id="settingsBtn" class="gear-btn" aria-label="Settings" aria-expanded="false">&#9881;&#65039;</button>
+      <div id="settingsMenu" class="settings-menu" hidden>
+        <a href="#/global-env" class="settings-item">&#127760; Global Environment</a>
+        <a href="/logout" class="settings-item">&#128682; Logout</a>
+      </div>
+    </div>
   </header>
 
-  <div class="shell">
-    <nav id="sidebar" class="sidebar">
-      <a href="#/dashboard" class="nav-link" data-route="dashboard">Dashboard</a>
-      <a href="#/services" class="nav-link" data-route="services">Services</a>
-      <a href="#/global-env" class="nav-link" data-route="global-env">Global Environment</a>
-      <a href="#/service-env" class="nav-link" data-route="service-env">Service Environment</a>
-      <a href="#/workflows" class="nav-link" data-route="workflows">Workflows</a>
-      <a href="#/executions" class="nav-link" data-route="executions">Executions</a>
-      <a href="#/import" class="nav-link" data-route="import">Import</a>
-      <a href="#/credentials" class="nav-link" data-route="credentials">Google Connections</a>
-      <a href="/logout" class="nav-link">Logout</a>
-    </nav>
-    <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
-
-    <main id="view" class="view">
-      <!-- rendered by app.js -->
-    </main>
-  </div>
+  <div id="pageNav" class="page-nav"></div>
+  <main id="view" class="view">
+    <!-- rendered by app.js -->
+  </main>
 </div>
 
 <template id="tpl-toast">

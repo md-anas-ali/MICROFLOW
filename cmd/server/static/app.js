@@ -45,9 +45,9 @@
 
   const viewEl = document.getElementById("view");
   const connEl = document.getElementById("connStatus");
-  const sidebar = document.getElementById("sidebar");
-  const sidebarBackdrop = document.getElementById("sidebarBackdrop");
-  const navToggle = document.getElementById("navToggle");
+  const settingsBtn = document.getElementById("settingsBtn");
+  const settingsMenu = document.getElementById("settingsMenu");
+  const pageNavEl = document.getElementById("pageNav");
   let executionsMonitorES = null;
   let executionsMonitorTimer = null;
   let executionDetailES = null;
@@ -62,8 +62,6 @@
   function setCurrentService(id) {
     currentService = id || "default";
     try { localStorage.setItem("mf.service", currentService); } catch (_) {}
-    const sel = document.getElementById("serviceSwitch");
-    if (sel) sel.value = currentService;
   }
   function currentServiceName() {
     const sv = servicesCache.find((x) => x.id === currentService);
@@ -159,22 +157,42 @@
     connEl.textContent = ok ? "connected" : "unreachable";
   }
 
-  // ---------------- sidebar (mobile) ----------------
+  // ---------------- header settings menu + page navigation ----------------
 
-  navToggle.addEventListener("click", () => {
-    sidebar.classList.toggle("open");
-    sidebarBackdrop.classList.toggle("open");
-  });
-  sidebarBackdrop.addEventListener("click", closeSidebar);
-  function closeSidebar() {
-    sidebar.classList.remove("open");
-    sidebarBackdrop.classList.remove("open");
+  function closeSettings() {
+    settingsMenu.hidden = true;
+    settingsBtn.setAttribute("aria-expanded", "false");
   }
+  settingsBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const open = settingsMenu.hidden;
+    settingsMenu.hidden = !open;
+    settingsBtn.setAttribute("aria-expanded", String(open));
+  });
+  document.addEventListener("click", (ev) => {
+    if (!ev.target.closest(".settings-wrap")) closeSettings();
+  });
 
-  function setActiveNav(route) {
-    document.querySelectorAll(".nav-link").forEach((a) => {
-      a.classList.toggle("active", a.dataset.route === route);
-    });
+  // Back link (+ optional header HTML) shown above every non-home page.
+  function setPageNav(backHref, backLabel, headHTML) {
+    pageNavEl.innerHTML =
+      (backHref ? '<a class="back-link" href="' + backHref + '">\u2190 ' + escapeHtml(backLabel) + "</a>" : "") +
+      (headHTML || "");
+  }
+  const serviceHref = (id, tab) => "#/services/" + encodeURIComponent(id) + (tab ? "/" + tab : "");
+
+  // Service Active/Inactive is a display + Run-guard flag kept in this
+  // browser (the backend Service record has no such field). Every Service
+  // is Active unless listed here; nothing is ever deleted by toggling it.
+  const INACTIVE_KEY = "mf.inactiveServices";
+  function inactiveSet() {
+    try { return new Set(JSON.parse(localStorage.getItem(INACTIVE_KEY) || "[]")); } catch (_) { return new Set(); }
+  }
+  function isServiceActive(id) { return !inactiveSet().has(id); }
+  function setServiceActive(id, on) {
+    const s = inactiveSet();
+    if (on) s.delete(id); else s.add(id);
+    try { localStorage.setItem(INACTIVE_KEY, JSON.stringify(Array.from(s))); } catch (_) {}
   }
 
   // ---------------- router ----------------
@@ -192,45 +210,37 @@
   }
 
   async function route() {
-    closeSidebar();
+    closeSettings();
     stopExecutionMonitoring();
     const parts = parseHash();
+    const seg = (i) => (parts[i] ? decodeURIComponent(parts[i].split("?")[0]) : "");
+    const p0 = seg(0), p1 = seg(1), p2 = seg(2), p3 = seg(3);
     try {
-      if (parts.length === 0 || parts[0] === "dashboard") {
-        setActiveNav("dashboard");
+      if (!p0 || p0 === "dashboard" || (p0 === "services" && parts.length === 1)) {
         await renderDashboard();
-      } else if (parts[0] === "workflows" && parts.length === 1) {
-        setActiveNav("workflows");
-        await renderWorkflowsList();
-      } else if (parts[0] === "workflows" && parts.length >= 2) {
-        setActiveNav("workflows");
+      } else if (p0 === "services") {
+        // Includes Google's OAuth callback: #/services/{id}/credentials?...
+        await renderServiceTab(p1, p2, p3);
+      } else if (p0 === "workflows" && parts.length === 1) {
+        await renderServiceTab(currentService, "workflow", "");
+      } else if (p0 === "workflows") {
+        setPageNav(serviceHref(currentService, "workflow"), "Workflow");
         const executionId = new URLSearchParams(location.hash.split("?")[1] || "").get("execution") || "";
-        await renderEditor(decodeURIComponent(parts[1]), executionId);
-      } else if (parts[0] === "executions") {
-        setActiveNav("executions");
-        await renderExecutions(parts[1] ? decodeURIComponent(parts[1]) : "");
-      } else if (parts[0] === "import") {
-        setActiveNav("import");
+        await renderEditor(p1, executionId);
+      } else if (p0 === "executions") {
+        await renderServiceTab(currentService, "executions", p1);
+      } else if (p0 === "credentials") {
+        await renderServiceTab(currentService, "credentials", "");
+      } else if (p0 === "service-env") {
+        await renderServiceTab(currentService, "env", "");
+      } else if (p0 === "import") {
+        setPageNav(serviceHref(currentService, "workflow"), "Workflow");
         renderImport();
-      } else if (parts[0] === "credentials") {
-        setActiveNav("credentials");
-        await renderCentralCredentialsPage();
-      } else if (parts[0] === "services" && parts.length === 1) {
-        setActiveNav("services");
-        await renderServicesPage();
-      } else if (parts[0] === "services" && (parts[2] || "").split("?")[0] === "credentials") {
-        // Google's OAuth callback redirects here; select that Service first.
-        setCurrentService(decodeURIComponent(parts[1]));
-        setActiveNav("credentials");
-        await renderCentralCredentialsPage();
-      } else if (parts[0] === "global-env") {
-        setActiveNav("global-env");
+      } else if (p0 === "global-env") {
+        setPageNav("#/dashboard", "Home");
         await renderEnvPage("global");
-      } else if (parts[0] === "service-env") {
-        setActiveNav("service-env");
-        await renderEnvPage("service");
       } else {
-        setActiveNav("");
+        setPageNav("#/dashboard", "Home");
         viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
       }
     } catch (e) {
@@ -250,48 +260,78 @@
     );
   }
 
-  // ---------------- dashboard ----------------
+  // ---------------- home dashboard ----------------
+
+  function lastRunText(ex) {
+    if (!ex) return "No runs yet";
+    const map = { success: "\u2705 Success", error: "\u274C Failed", cancelled: "\u26A0\uFE0F Cancelled", running: "\u23F3 Running", queued: "\u23F3 Queued", waiting: "\u23F3 Waiting" };
+    return (map[ex.status] || ex.status) + " \u00B7 " + fmtDate(ex.startedAt);
+  }
+
+  function tileHTML(icon, num, label) {
+    return '<div class="tile"><div class="tile-ico">' + icon + '</div><div class="tile-num">' + escapeHtml(num) +
+      '</div><div class="tile-label">' + escapeHtml(label) + "</div></div>";
+  }
+
+  async function createServiceFlow() {
+    const name = (prompt("Name for the new Service:") || "").trim();
+    if (!name) return;
+    try {
+      const created = await apiJSON("/api/services", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      await loadServices();
+      setCurrentService(created.id);
+      toast("Service created", "success");
+      location.hash = serviceHref(created.id);
+    } catch (e) { toast(e.message, "error"); }
+  }
 
   async function renderDashboard() {
-    viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Dashboard</h1><div class="sub">MicroFlow at a glance</div></div></div>' +
-      loadingRow("Loading workflows\u2026");
-
-    let wfs;
+    setPageNav("");
+    viewEl.innerHTML = loadingRow();
+    let list;
     try {
-      wfs = await apiJSON("/api/workflows?" + svcQS());
+      list = await loadServices();
     } catch (e) {
-      viewEl.innerHTML =
-        '<div class="page-head"><div><h1>Dashboard</h1></div></div>' +
-        emptyState("Can't reach the API", escapeHtml(e.message));
+      viewEl.innerHTML = emptyState("Can't reach the API", escapeHtml(e.message));
       return;
     }
-    wfs = wfs || [];
+    const lastRuns = await Promise.all(list.map((x) =>
+      apiJSON("/api/services/" + encodeURIComponent(x.id) + "/executions?limit=1")
+        .then((a) => (a && a[0]) || null).catch(() => null)));
 
-    const active = wfs.filter((w) => w.active).length;
-    let totalNodes = 0;
-    wfs.forEach((w) => { totalNodes += Object.keys(w.nodes || {}).length; });
+    const activeCount = list.filter((x) => isServiceActive(x.id)).length;
+    const attention = list.filter((x, i) => isServiceActive(x.id) && lastRuns[i] && lastRuns[i].status === "error").length;
 
-    const recent = wfs
-      .slice()
-      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))
-      .slice(0, 6);
+    const cards = list.map((x, i) => {
+      const on = isServiceActive(x.id);
+      return (
+        '<a class="svc-card' + (on ? "" : " off") + '" href="' + serviceHref(x.id) + '">' +
+        '<div class="svc-card-ico">\uD83E\uDDE9</div>' +
+        '<div class="svc-card-body"><div class="svc-card-name">' + escapeHtml(x.name) + "</div>" +
+        '<div class="svc-card-sub">' + escapeHtml(lastRunText(lastRuns[i])) + "</div></div>" +
+        '<span class="pill ' + (on ? "pill-on" : "pill-off") + '">' + (on ? "\uD83D\uDFE2 Active" : "\u26AA Inactive") + "</span>" +
+        '<span class="menu-arrow">\u203A</span></a>'
+      );
+    }).join("");
 
     viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Dashboard</h1><div class="sub">MicroFlow at a glance</div></div>' +
-      '<div><a class="btn btn-primary" href="#/import">+ Import workflow</a></div></div>' +
-      serviceHeaderHTML() +
-      '<div class="grid-stats">' +
-      statCard(wfs.length, "Workflows") +
-      statCard(active, "Active") +
-      statCard(totalNodes, "Total nodes") +
+      '<div class="narrow">' +
+      '<div class="tiles">' +
+      tileHTML("\uD83E\uDDE9", list.length, "Services") +
+      tileHTML("\uD83D\uDFE2", activeCount, "Active") +
+      tileHTML("\u26AA", list.length - activeCount, "Inactive") +
+      tileHTML("\uD83D\uDD34", attention, "Need attention") +
       "</div>" +
-      "<h3>Recently updated</h3>" +
-      (recent.length
-        ? renderWorkflowTable(recent, false)
-        : emptyState("No workflows yet", 'Import an n8n export to get started, or <a href="#/import">go to Import</a>.'));
-    const rs = document.getElementById("runServiceBtn");
-    if (rs) rs.addEventListener("click", () => runCurrentService(rs));
+      '<h2 class="section-title">\uD83E\uDDE9 Services</h2>' +
+      '<div class="svc-list">' + cards +
+      '<button id="svcCreateBtn" class="svc-card svc-new">\u2795 New Service</button></div>' +
+      '<details class="runall-details"><summary>\u25B6\uFE0F Run all Services</summary>' + runAllPanelHTML() + "</details>" +
+      "</div>";
+    document.getElementById("svcCreateBtn").addEventListener("click", createServiceFlow);
     wireRunAllPanel();
   }
 
@@ -572,101 +612,6 @@
 
   // ---------------- workflows list ----------------
 
-  async function renderWorkflowsList() {
-    viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Workflows</h1><div class="sub">All saved workflows</div></div>' +
-      '<div><a class="btn btn-primary" href="#/import">+ Import workflow</a></div></div>' +
-      loadingRow();
-
-    let wfs;
-    try {
-      wfs = await apiJSON("/api/workflows?" + svcQS());
-    } catch (e) {
-      viewEl.innerHTML =
-        '<div class="page-head"><div><h1>Workflows</h1></div></div>' +
-        emptyState("Can't reach the API", escapeHtml(e.message));
-      return;
-    }
-    wfs = wfs || [];
-
-    viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Workflows</h1><div class="sub">' + wfs.length + " total</div></div>" +
-      '<div><a class="btn btn-primary" href="#/import">+ Import workflow</a></div></div>' +
-      (wfs.length
-        ? renderWorkflowTable(wfs, true)
-        : emptyState("No workflows yet", 'Import an n8n export to get started, or <a href="#/import">go to Import</a>.'));
-
-    wireWorkflowTable();
-  }
-
-  function renderWorkflowTable(wfs, withActions) {
-    const rows = wfs.map((w) => {
-      const nodeCount = Object.keys(w.nodes || {}).length;
-      return (
-        '<tr class="clickable" data-id="' + escapeHtml(w.id) + '">' +
-        '<td class="wf-name">' + escapeHtml(w.name || "(untitled)") + "</td>" +
-        "<td>" + (w.active
-          ? '<span class="badge badge-active">active</span>'
-          : '<span class="badge badge-inactive">inactive</span>') + "</td>" +
-        "<td>" + nodeCount + "</td>" +
-        "<td>" + escapeHtml(fmtDate(w.updatedAt)) + "</td>" +
-        (withActions
-          ? '<td class="wf-actions">' +
-            '<button class="btn btn-sm" data-act="execute" data-id="' + escapeHtml(w.id) + '">Execute</button>' +
-            '<button class="btn btn-sm" data-act="export" data-id="' + escapeHtml(w.id) + '">Export</button>' +
-            '<button class="btn btn-sm btn-danger" data-act="delete" data-id="' + escapeHtml(w.id) + '" data-name="' + escapeHtml(w.name || "(untitled)") + '">Delete</button>' +
-            "</td>"
-          : "") +
-        "</tr>"
-      );
-    }).join("");
-
-    return (
-      '<table class="wf-table"><thead><tr><th>Name</th><th>Status</th><th>Nodes</th><th>Updated</th>' +
-      (withActions ? "<th>Actions</th>" : "") + "</tr></thead><tbody>" + rows + "</tbody></table>"
-    );
-  }
-
-  function wireWorkflowTable() {
-    viewEl.querySelectorAll("tr.clickable").forEach((tr) => {
-      tr.addEventListener("click", (ev) => {
-        if (ev.target.closest("button")) return;
-        location.hash = "#/workflows/" + encodeURIComponent(tr.dataset.id);
-      });
-    });
-    viewEl.querySelectorAll('button[data-act="export"]').forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        exportWorkflow(btn.dataset.id);
-      });
-    });
-    viewEl.querySelectorAll('button[data-act="execute"]').forEach((btn) => {
-      btn.addEventListener("click", async (ev) => {
-        ev.stopPropagation();
-        btn.disabled = true;
-        btn.textContent = "Running\u2026";
-        try {
-          const ex = await apiJSON("/api/workflows/" + encodeURIComponent(btn.dataset.id) + "/execute", { method: "POST" });
-          toast("Execution queued", "success");
-          location.hash = "#/executions/" + encodeURIComponent(ex.executionId);
-        } catch (e) {
-          toast(e.message, "error");
-        } finally {
-          btn.disabled = false;
-          btn.textContent = "Execute";
-        }
-      });
-    });
-    viewEl.querySelectorAll('button[data-act="delete"]').forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        deleteWorkflow(btn.dataset.id, btn.dataset.name, btn, {
-          onSuccess: () => renderWorkflowsList(),
-        });
-      });
-    });
-  }
-
   // deleteWorkflow is the single place that calls DELETE
   // /api/workflows/{id}, shared by the list's row action and the
   // editor's toolbar button. Handles confirmation, double-click
@@ -806,10 +751,8 @@
 
   async function renderCentralCredentialsPage() {
     viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Google Connections</h1>' +
-      '<div class="sub">Service: <b>' + escapeHtml(currentServiceName()) + '</b> \u2014 connect each Google service to its own Google account, no copying refresh tokens, ' +
-      "no manual setup. Once connected, every workflow's Gmail/YouTube/Sheets nodes use it automatically, " +
-      "including scheduled runs with no browser open.</div></div></div>" +
+      '<div class="page-head"><div><h1>\uD83D\uDD10 Credentials</h1>' +
+      '<div class="sub">Connect Gmail, YouTube and Google Sheets for <b>' + escapeHtml(currentServiceName()) + "</b>.</div></div></div>" +
       '<div id="googleConnCards" class="google-conn-cards">' + loadingRow("Checking connections\u2026") + "</div>" +
       '<div id="googleConnNotConfigured" class="field-error" style="display:none;"></div>' +
       (currentService === "default"
@@ -1932,13 +1875,6 @@
     if (!servicesCache.some((x) => x.id === currentService)) {
       setCurrentService("default");
     }
-    const sel = document.getElementById("serviceSwitch");
-    if (sel) {
-      sel.innerHTML = servicesCache
-        .map((x) => '<option value="' + escapeHtml(x.id) + '">' + escapeHtml(x.name) + "</option>")
-        .join("");
-      sel.value = currentService;
-    }
     return servicesCache;
   }
 
@@ -2033,9 +1969,11 @@
 
   async function runCurrentService(btn) {
     btn.disabled = true;
+    let ok = false;
     try {
       await apiJSON(svcPath("/run"), { method: "POST" });
       toast("Started " + currentServiceName(), "success");
+      ok = true;
       const st = document.getElementById("runAllStatus");
       if (st) wireRunAllPanel();
     } catch (e) {
@@ -2043,116 +1981,232 @@
     } finally {
       btn.disabled = false;
     }
+    return ok;
   }
 
-  async function renderServicesPage() {
+  // ---------------- Service pages (inside a Service) ----------------
+
+  const SERVICE_TABS = [
+    ["overview", "Overview", "\uD83D\uDCCA"],
+    ["env", "Environment", "\u2699\uFE0F"],
+    ["credentials", "Credentials", "\uD83D\uDD10"],
+    ["workflow", "Workflow", "\uD83D\uDD04"],
+    ["executions", "Executions", "\u25B6\uFE0F"],
+    ["logs", "Logs", "\uD83D\uDCCB"],
+    ["settings", "Settings", "\u2699\uFE0F"],
+  ];
+
+  function serviceHeadHTML(svc) {
+    const on = isServiceActive(svc.id);
+    return (
+      '<div class="svc-head' + (on ? "" : " off") + '"><span class="svc-head-dot">' + (on ? "\uD83D\uDFE2" : "\u26AA") + "</span>" +
+      '<div><div class="svc-head-name">' + escapeHtml(svc.name) + "</div>" +
+      '<div class="svc-head-status">' + (on ? "Active" : "Inactive") + "</div></div></div>"
+    );
+  }
+
+  async function renderServiceTab(id, tab, extra) {
+    if (!servicesCache.length) { try { await loadServices(); } catch (_) {} }
+    const svc = servicesCache.find((x) => x.id === id);
+    if (!svc) {
+      setPageNav("#/dashboard", "Services");
+      viewEl.innerHTML = emptyState("Service not found", "This Service doesn't exist.", "\uD83E\uDDE9");
+      return;
+    }
+    setCurrentService(id);
+    if (!tab) {
+      setPageNav("#/dashboard", "Services", serviceHeadHTML(svc));
+      viewEl.innerHTML =
+        '<div class="menu-list">' +
+        SERVICE_TABS.map((t) =>
+          '<a class="menu-item" href="' + serviceHref(id, t[0]) + '"><span class="menu-ico">' + t[2] +
+          '</span><span class="menu-label">' + t[1] + '</span><span class="menu-arrow">\u203A</span></a>').join("") +
+        "</div>";
+      return;
+    }
+    if (!SERVICE_TABS.some((t) => t[0] === tab)) {
+      setPageNav(serviceHref(id), svc.name);
+      viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
+      return;
+    }
+    setPageNav(serviceHref(id), svc.name);
+    if (tab === "overview") return renderServiceOverview(svc);
+    if (tab === "env") return renderEnvPage("service");
+    if (tab === "credentials") return renderCentralCredentialsPage();
+    if (tab === "workflow") return renderServiceWorkflow(svc);
+    if (tab === "executions") return renderExecutions(extra || "");
+    if (tab === "logs") return renderServiceLogs(svc);
+    return renderServiceSettings(svc);
+  }
+
+  async function renderServiceOverview(svc) {
+    viewEl.innerHTML = loadingRow();
+    const on = isServiceActive(svc.id);
+    let wfs = [], runs = [];
+    try { wfs = (await apiJSON("/api/workflows?" + svcQS())) || []; } catch (_) {}
+    try { runs = (await apiJSON(svcPath("/executions?limit=20"))) || []; } catch (_) {}
+    const okCount = runs.filter((r) => r.status === "success").length;
+    const failCount = runs.filter((r) => r.status === "error").length;
     viewEl.innerHTML =
-      '<div class="page-head"><div><h1>Services</h1><div class="sub">Isolated workspaces \u2014 each has its own workflows, Google accounts and environment</div></div>' +
-      '<div><button id="svcCreateBtn" class="btn btn-primary">+ Create Service</button></div></div>' +
-      runAllPanelHTML() + '<div id="svcTable">' + loadingRow() + "</div>";
-    wireRunAllPanel();
-
-    document.getElementById("svcCreateBtn").addEventListener("click", async () => {
-      const name = (prompt("Name for the new Service:") || "").trim();
-      if (!name) return;
-      try {
-        const created = await apiJSON("/api/services", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name }),
-        });
-        await loadServices();
-        setCurrentService(created.id);
-        toast("Service created", "success");
-        renderServicesPage();
-      } catch (e) { toast(e.message, "error"); }
+      '<div class="narrow"><div class="tiles">' +
+      tileHTML(on ? "\uD83D\uDFE2" : "\u26AA", on ? "Active" : "Inactive", "Status") +
+      tileHTML("\uD83D\uDD04", wfs.length ? "Ready" : "None", "Workflow") +
+      tileHTML("\u2705", okCount, "Recent successes") +
+      tileHTML("\u274C", failCount, "Recent failures") +
+      "</div>" +
+      '<div class="card"><div class="svc-card-sub">Last run</div><div class="last-run">' + escapeHtml(lastRunText(runs[0])) + "</div></div>" +
+      '<button id="runNowBtn" class="btn btn-primary btn-big btn-block"' + (on ? "" : " disabled") + ">\u25B6\uFE0F Run now</button>" +
+      (on ? "" : '<div class="hint">Turn this Service on in Settings to run it.</div>') +
+      "</div>";
+    const rb = document.getElementById("runNowBtn");
+    rb.addEventListener("click", async () => {
+      if (await runCurrentService(rb)) location.hash = serviceHref(svc.id, "executions");
     });
+  }
 
-    const list = await loadServices();
-    const counts = await Promise.all(list.map((x) =>
-      apiJSON("/api/services/" + encodeURIComponent(x.id)).then((d) => d.workflowCount).catch(() => "?")));
-    const rows = list.map((x, i) =>
-      "<tr><td><b>" + escapeHtml(x.name) + "</b>" + (x.id === currentService ? ' <span class="badge badge-active">selected</span>' : "") +
-      '</td><td><code>' + escapeHtml(x.id) + "</code></td><td>" + escapeHtml(counts[i]) + "</td><td>" +
-      '<button class="btn btn-sm svc-open" data-id="' + escapeHtml(x.id) + '">Open</button> ' +
-      '<button class="btn btn-sm svc-run" data-id="' + escapeHtml(x.id) + '">Run</button> ' +
-      '<button class="btn btn-sm svc-rename" data-id="' + escapeHtml(x.id) + '">Rename</button> ' +
-      (x.id === "default" ? "" : '<button class="btn btn-sm btn-danger svc-del" data-id="' + escapeHtml(x.id) + '">Delete</button>') +
-      "</td></tr>"
-    ).join("");
-    document.getElementById("svcTable").innerHTML =
-      '<table class="wf-table"><thead><tr><th>Service</th><th>ID</th><th>Workflows</th><th></th></tr></thead><tbody>' + rows + "</tbody></table>";
+  async function renderServiceWorkflow(svc) {
+    viewEl.innerHTML = loadingRow();
+    let wfs;
+    try {
+      wfs = (await apiJSON("/api/workflows?" + svcQS())) || [];
+    } catch (e) {
+      viewEl.innerHTML = emptyState("Can't load", escapeHtml(e.message));
+      return;
+    }
+    // Every Service has exactly one Workflow; show the most recently updated one.
+    const wf = wfs.slice().sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))[0];
+    if (!wf) {
+      viewEl.innerHTML = '<div class="narrow">' +
+        emptyState("No workflow yet", 'Bring one in with <a href="#/import">Import</a>.', "\uD83D\uDD04") + "</div>";
+      return;
+    }
+    const on = isServiceActive(svc.id);
+    viewEl.innerHTML =
+      '<div class="narrow"><div class="card wf-card"><div class="wf-card-ico">\uD83D\uDD04</div>' +
+      '<div class="wf-card-title">Workflow</div>' +
+      '<div class="wf-card-name">' + escapeHtml(wf.name || "(untitled)") + "</div>" +
+      '<div class="wf-card-status">' + (on ? "\uD83D\uDFE2 Ready" : "\u26AA Service inactive") + "</div>" +
+      '<a class="btn btn-primary btn-big" href="#/workflows/' + encodeURIComponent(wf.id) + '">Open Workflow</a>' +
+      "</div></div>";
+  }
 
-    const byId = (id) => list.find((x) => x.id === id);
-    document.querySelectorAll(".svc-open").forEach((b) => b.addEventListener("click", () => {
-      setCurrentService(b.dataset.id);
-      location.hash = "#/dashboard";
-    }));
-    document.querySelectorAll(".svc-run").forEach((b) => b.addEventListener("click", async () => {
-      setCurrentService(b.dataset.id);
-      await runCurrentService(b);
-    }));
-    document.querySelectorAll(".svc-rename").forEach((b) => b.addEventListener("click", async () => {
-      const cur = byId(b.dataset.id);
-      const name = (prompt("New name:", cur.name) || "").trim();
-      if (!name || name === cur.name) return;
+  async function renderServiceLogs(svc) {
+    viewEl.innerHTML = loadingRow();
+    let runs;
+    try {
+      runs = (await apiJSON(svcPath("/executions?limit=30"))) || [];
+    } catch (e) {
+      viewEl.innerHTML = emptyState("Can't load", escapeHtml(e.message));
+      return;
+    }
+    if (!runs.length) {
+      viewEl.innerHTML = '<div class="narrow">' + emptyState("No logs yet", "Run the Service and its log will show up here.", "\uD83D\uDCCB") + "</div>";
+      return;
+    }
+    viewEl.innerHTML = '<div class="narrow"><div class="svc-list">' + runs.map((r) =>
+      '<a class="menu-item log-row" href="' + serviceHref(svc.id, "executions") + "/" + encodeURIComponent(r.id) + '">' +
+      '<div class="svc-card-body"><div class="svc-card-name">' + escapeHtml(lastRunText(r)) + "</div>" +
+      '<div class="svc-card-sub">' + escapeHtml(modeLabel(r.mode)) + "</div>" +
+      (r.error ? '<div class="log-err">' + escapeHtml(String(r.error).slice(0, 160)) + "</div>" : "") +
+      '</div><span class="menu-arrow">\u203A</span></a>').join("") + "</div></div>";
+  }
+
+  function renderServiceSettings(svc) {
+    const on = isServiceActive(svc.id);
+    viewEl.innerHTML =
+      '<div class="narrow">' +
+      '<div class="card toggle-card"><div><div class="toggle-title">' + (on ? "\uD83D\uDFE2 Active" : "\u26AA Inactive") + "</div>" +
+      '<div class="svc-card-sub">Switching off never deletes Environment, Credentials, Workflow or data.</div></div>' +
+      '<button id="svcToggle" class="switch' + (on ? " on" : "") + '" role="switch" aria-checked="' + on + '" aria-label="Active"><span></span></button></div>' +
+      '<button id="svcRename" class="menu-item"><span class="menu-ico">\u270F\uFE0F</span><span class="menu-label">Rename Service</span></button>' +
+      (svc.id === "default" ? "" : '<button id="svcDelete" class="menu-item danger"><span class="menu-ico">\uD83D\uDDD1\uFE0F</span><span class="menu-label">Delete Service</span></button>') +
+      "</div>";
+
+    document.getElementById("svcToggle").addEventListener("click", () => {
+      setServiceActive(svc.id, !on);
+      toast(!on ? "Service is Active" : "Service is Inactive", "success");
+      setPageNav(serviceHref(svc.id), svc.name);
+      renderServiceSettings(svc);
+    });
+    document.getElementById("svcRename").addEventListener("click", async () => {
+      const name = (prompt("New name:", svc.name) || "").trim();
+      if (!name || name === svc.name) return;
       try {
-        await apiJSON("/api/services/" + encodeURIComponent(cur.id), {
+        await apiJSON("/api/services/" + encodeURIComponent(svc.id), {
           method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
         });
-        renderServicesPage();
+        await loadServices();
+        toast("Renamed", "success");
+        renderServiceTab(svc.id, "settings", "");
       } catch (e) { toast(e.message, "error"); }
-    }));
-    document.querySelectorAll(".svc-del").forEach((b) => b.addEventListener("click", async () => {
-      const cur = byId(b.dataset.id);
+    });
+    const del = document.getElementById("svcDelete");
+    if (del) del.addEventListener("click", async () => {
       const typed = prompt(
-        'Deleting "' + cur.name + '" permanently removes its workflows, Google connections and environment.\n' +
+        'Deleting "' + svc.name + '" permanently removes its workflows, Google connections and environment.\n' +
         "Type the Service name exactly to confirm:");
       if (typed === null) return;
-      if (typed !== cur.name) { toast("Name did not match \u2014 nothing was deleted", "error"); return; }
+      if (typed !== svc.name) { toast("Name did not match \u2014 nothing was deleted", "error"); return; }
       try {
-        await apiJSON("/api/services/" + encodeURIComponent(cur.id) + "?confirmName=" + encodeURIComponent(cur.name), { method: "DELETE" });
-        if (currentService === cur.id) setCurrentService("default");
+        await apiJSON("/api/services/" + encodeURIComponent(svc.id) + "?confirmName=" + encodeURIComponent(svc.name), { method: "DELETE" });
+        setServiceActive(svc.id, true);
+        setCurrentService("default");
         toast("Service deleted", "success");
         await loadServices();
-        renderServicesPage();
+        location.hash = "#/dashboard";
       } catch (e) { toast(e.message, "error"); }
-    }));
+    });
   }
 
-  // scope: "global" (Global Environment) or "service" (current Service's overrides)
+  // scope: "global" (Global Environment) or "service" (current Service's own values)
   async function renderEnvPage(scope) {
     const isGlobal = scope === "global";
     const base = isGlobal ? "/api/global-env" : svcPath("/env");
-    const title = isGlobal ? "Global Environment" : "Service Environment";
+    const title = isGlobal ? "\uD83C\uDF10 Global Environment" : "\u2699\uFE0F Environment";
     const sub = isGlobal
-      ? "Shared configuration used by every Service. A Service's own value (Service Environment) overrides it."
-      : 'Overrides for <b>' + escapeHtml(currentServiceName()) + "</b> only. Anything not set here falls back to Global Environment, then the server's own environment.";
+      ? "Shared by every Service. A Service's own value wins over it."
+      : "Values for <b>" + escapeHtml(currentServiceName()) + "</b> only. Anything missing here comes from Global.";
     viewEl.innerHTML =
-      '<div class="page-head"><div><h1>' + title + '</h1><div class="sub">' + sub + "</div></div></div>" +
-      '<div class="card" style="margin-bottom:16px;">' +
-      '<div class="field"><label>Name</label><input type="text" id="envKey" placeholder="e.g. GOOGLE_SHEETS_URL" autocomplete="off"></div>' +
+      '<div class="narrow"><div class="page-head"><div><h1>' + title + '</h1><div class="sub">' + sub + "</div></div></div>" +
+      '<div class="env-section"><div class="env-section-title">' + (isGlobal ? "\uD83C\uDF10 Global Environment" : "\u2699\uFE0F Service Environment") + "</div>" +
+      '<div id="envTable">' + loadingRow() + "</div></div>" +
+      (isGlobal ? "" : '<div class="env-section env-inherited"><div class="env-section-title">\uD83C\uDF10 Inherited from Global</div><div id="envInherited">' + loadingRow() + "</div></div>") +
+      '<div class="card"><div class="env-section-title">\u2795 Add or update</div>' +
+      '<div class="field"><label>Name</label><input type="text" id="envKey" placeholder="e.g. API_KEY" autocomplete="off"></div>' +
       '<div class="field"><label>Value</label><input type="password" id="envVal" autocomplete="off"></div>' +
       '<div class="field"><label><input type="checkbox" id="envSecret" checked> Secret (hide after saving)</label></div>' +
-      '<button id="envSave" class="btn btn-primary">Save</button>' +
-      '<div class="cred-section-note" style="margin-top:8px;">Values are encrypted at rest and are never shown again after saving. ' +
-      "Saving an existing name replaces its value." +
-      (isGlobal ? " Changes to GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL take effect after a server restart." : "") +
-      "</div></div>" +
-      '<div id="envTable">' + loadingRow() + "</div>";
+      '<button id="envSave" class="btn btn-primary btn-big">Save</button>' +
+      '<div class="cred-section-note" style="margin-top:8px;">Values are encrypted and never shown again after saving. ' +
+      (isGlobal ? "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL take effect after a server restart." : "") +
+      "</div></div></div>";
+
+    async function loadInherited(own) {
+      const host = document.getElementById("envInherited");
+      if (!host) return;
+      try {
+        const g = (await apiJSON("/api/global-env")) || [];
+        const ownKeys = new Set(own.map((e) => e.key));
+        host.innerHTML = g.length
+          ? '<div class="env-list">' + g.map((e) =>
+              '<div class="env-row"><div class="env-row-main"><code>' + escapeHtml(e.key) + "</code>" +
+              (ownKeys.has(e.key) ? '<div class="env-row-sub">overridden by this Service</div>' : "") +
+              "</div></div>").join("") + "</div>"
+          : '<div class="sub">Nothing set in Global.</div>';
+      } catch (e) { host.innerHTML = '<div class="sub">' + escapeHtml(e.message) + "</div>"; }
+    }
 
     async function refresh() {
       const host = document.getElementById("envTable");
       if (!host) return;
+      let list = [];
       try {
-        const list = (await apiJSON(base)) || [];
+        list = (await apiJSON(base)) || [];
         host.innerHTML = list.length
-          ? '<table class="wf-table"><thead><tr><th>Name</th><th>Type</th><th>Updated</th><th></th></tr></thead><tbody>' +
-            list.map((e) =>
-              "<tr><td><code>" + escapeHtml(e.key) + "</code></td><td>" + (e.isSecret ? "secret" : "plain") + "</td><td>" +
-              escapeHtml(fmtDate(e.updatedAt)) + '</td><td><button class="btn btn-sm btn-danger env-del" data-key="' +
-              escapeHtml(e.key) + '">Delete</button></td></tr>').join("") + "</tbody></table>"
-          : emptyState("Nothing set yet", "Add a name and value above.");
+          ? '<div class="env-list">' + list.map((e) =>
+              '<div class="env-row"><div class="env-row-main"><code>' + escapeHtml(e.key) + '</code><div class="env-row-sub">' +
+              (e.isSecret ? "\uD83D\uDD12 secret" : "plain") + " \u00B7 " + escapeHtml(fmtDate(e.updatedAt)) +
+              '</div></div><button class="btn btn-sm btn-danger env-del" data-key="' + escapeHtml(e.key) + '">Delete</button></div>').join("") + "</div>"
+          : emptyState("Nothing set yet", "Add a name and value below.", "\u2699\uFE0F");
         host.querySelectorAll(".env-del").forEach((b) => b.addEventListener("click", async () => {
           if (!confirm("Delete " + b.dataset.key + "?")) return;
           try { await apiJSON(base + "/" + encodeURIComponent(b.dataset.key), { method: "DELETE" }); refresh(); }
@@ -2161,6 +2215,7 @@
       } catch (e) {
         host.innerHTML = emptyState("Can't load", escapeHtml(e.message));
       }
+      loadInherited(list);
     }
     document.getElementById("envSave").addEventListener("click", async () => {
       const key = document.getElementById("envKey").value.trim();
@@ -2179,22 +2234,6 @@
       } catch (e) { toast(e.message, "error"); }
     });
     refresh();
-  }
-
-  // Service dashboard extras: shown above the stats on the Dashboard.
-  function serviceHeaderHTML() {
-    return (
-      '<div class="card" style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
-      "<div><b>Service:</b> " + escapeHtml(currentServiceName()) + "</div>" +
-      '<div style="flex:1"></div>' +
-      '<button id="runServiceBtn" class="btn btn-primary">Run Service</button>' +
-      '<a class="btn" href="#/service-env">Service Environment</a>' +
-      '<a class="btn" href="#/credentials">Google / YouTube / Gmail</a>' +
-      '<a class="btn" href="#/import">Import Workflow</a>' +
-      '<a class="btn" href="#/services">All Services</a>' +
-      '<a class="btn" href="#/global-env">Global Environment</a></div>' +
-      runAllPanelHTML()
-    );
   }
 
   // Transient UI state (toasts, live-monitor connections, run-status
@@ -2218,14 +2257,6 @@
   // ---------------- boot ----------------
 
   (async function boot() {
-    const sel = document.getElementById("serviceSwitch");
-    if (sel) {
-      sel.addEventListener("change", () => {
-        setCurrentService(sel.value);
-        if (parseHash()[0] === "workflows" && parseHash().length >= 2) location.hash = "#/workflows";
-        else route();
-      });
-    }
     try { await loadServices(); } catch (_) { /* server without tenancy: stay on "default" */ }
     route();
   })();
