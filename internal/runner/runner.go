@@ -39,6 +39,17 @@ type ExecutionDeleter interface {
 	DeleteExecution(ctx context.Context, executionID string) error
 }
 
+// EnvResolver decrypts and returns one run's Global/Service Environment
+// maps (see vault.EnvVault.ResolveAll). Optional: a Runner with no
+// EnvResolver leaves RunContext.ServiceEnv/GlobalEnv nil, so
+// RunContext.Env/LookupEnv fall straight through to the process
+// environment -- identical to every pre-Service-isolation behavior
+// (rule 14), and every existing test helper that builds a bare Runner
+// keeps working unchanged.
+type EnvResolver interface {
+	ResolveAll(ctx context.Context, serviceID string) (serviceEnv, globalEnv map[string]string, err error)
+}
+
 type Runner struct {
 	Workflows   WorkflowLoader
 	Execs       ExecutionSaver
@@ -54,6 +65,12 @@ type Runner struct {
 	MemGuard *engine.MemGuard
 	// Recovery is the durable PostgreSQL-backed checkpoint store. Optional for tests.
 	Recovery CheckpointStore
+
+	// Env resolves each run's Global/Service Environment (rule 2),
+	// looked up once per run by the workflow's owning ServiceID and
+	// attached to RunContext -- see runOnce. Optional; nil preserves
+	// pre-Service-isolation behavior (process environment only).
+	Env EnvResolver
 
 	// NodeRunCap is attached to every RunContext this Runner creates
 	// (see engine.RunContext.NodeRunCap). Zero/unset falls back to the
@@ -225,6 +242,15 @@ func (r *Runner) WithNodeRunCap(n int) *Runner {
 	return r
 }
 
+// WithEnv attaches the Global/Service Environment resolver (see
+// vault.EnvVault) used to populate every future RunFromNode call's
+// RunContext.ServiceEnv/GlobalEnv. Optional -- a Runner with no
+// resolver behaves exactly as before (rule 14).
+func (r *Runner) WithEnv(e EnvResolver) *Runner {
+	r.Env = e
+	return r
+}
+
 // RunFromNode loads workflowID, starts execution at startNode with the
 // given mode ("manual" | "schedule" | "webhook" | "error") and seed
 // input, persists the resulting execution record (win or lose), and
@@ -310,7 +336,7 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 	}
 
 	startAt := time.Now()
-	execution := &model.Execution{ID: execID, WorkflowID: wf.ID, Mode: mode, Status: model.StatusRunning, StartedAt: startAt}
+	execution := &model.Execution{ID: execID, WorkflowID: wf.ID, ServiceID: wf.ServiceID, Mode: mode, Status: model.StatusRunning, StartedAt: startAt}
 	if resume != nil {
 		if !resume.StartedAt.IsZero() {
 			execution.StartedAt = resume.StartedAt
@@ -335,6 +361,28 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		Redactor:   engine.NewSecretRedactorFromEnv(),
 		OnNodeRun:  onNodeRun,
 		NodeRunCap: r.NodeRunCap,
+	}
+	// One decrypt pass per run, not per $env lookup (rule: don't hit the
+	// database/AEAD once per Code-node call in a hot per-item loop -- see
+	// vault.EnvVault.ResolveAll's doc comment). A resolve failure is
+	// logged and left as nil rather than failing the whole run: falling
+	// through to the process environment is the documented, safe
+	// pre-Service-isolation behavior (rule 14), not a silent secret leak
+	// -- it only ever narrows what a Code node/Sheets node can see.
+	if r.Env != nil {
+		serviceEnv, globalEnv, err := r.Env.ResolveAll(ctx, wf.ServiceID)
+		if err != nil {
+			log.Printf("runner: environment resolve failed for service %q (execution %s): %v -- falling back to process environment", wf.ServiceID, execID, err)
+		} else {
+			rc.ServiceEnv = serviceEnv
+			rc.GlobalEnv = globalEnv
+			for k, v := range globalEnv {
+				rc.Redactor.NoteEnvValue(k, v)
+			}
+			for k, v := range serviceEnv {
+				rc.Redactor.NoteEnvValue(k, v)
+			}
+		}
 	}
 
 	// Persist the execution row before the first checkpoint. The checkpoint
