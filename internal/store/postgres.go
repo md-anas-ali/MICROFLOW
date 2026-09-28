@@ -12,12 +12,14 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"microflow/internal/model"
+	"microflow/internal/tenant"
 )
 
 type Store struct {
@@ -68,18 +70,147 @@ func (s *Store) ApplySchema(ctx context.Context, schemaSQL string) error {
 	return err
 }
 
+// --- services (tenants -- see internal/tenant) ---
+
+// ErrServiceNotFound is returned by RenameService/DeleteService/
+// GetService when no Service with the given id exists (mapped to 404).
+var ErrServiceNotFound = errors.New("store: service not found")
+
+// ErrServiceHasActiveExecutions is returned by DeleteService when any
+// workflow belonging to the Service still has a queued/running/waiting
+// execution -- mirrors ErrWorkflowHasActiveExecutions's protection but
+// checked across every workflow in the Service at once (rule: protect
+// against accidental destructive action).
+var ErrServiceHasActiveExecutions = errors.New("store: service has a running or queued execution and cannot be deleted")
+
+// CreateService inserts a new Service. id must already be a generated,
+// unique, URL/path-safe identifier (the API layer generates it).
+func (s *Store) CreateService(ctx context.Context, svc *tenant.Service) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO services (id, name, created_at, updated_at) VALUES ($1, $2, now(), now())
+	`, svc.ID, svc.Name)
+	return err
+}
+
+func (s *Store) GetService(ctx context.Context, id string) (*tenant.Service, error) {
+	var svc tenant.Service
+	err := s.pool.QueryRow(ctx, `SELECT id, name, created_at, updated_at FROM services WHERE id=$1`, id).
+		Scan(&svc.ID, &svc.Name, &svc.CreatedAt, &svc.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrServiceNotFound
+		}
+		return nil, err
+	}
+	return &svc, nil
+}
+
+// ListServices returns every Service, oldest first (stable, predictable
+// order for both the dashboard list and Run All Services' default order).
+func (s *Store) ListServices(ctx context.Context) ([]*tenant.Service, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, name, created_at, updated_at FROM services ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*tenant.Service{}
+	for rows.Next() {
+		var svc tenant.Service
+		if err := rows.Scan(&svc.ID, &svc.Name, &svc.CreatedAt, &svc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &svc)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RenameService(ctx context.Context, id, name string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE services SET name=$2, updated_at=now() WHERE id=$1`, id, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrServiceNotFound
+	}
+	return nil
+}
+
+// DeleteService removes a Service and, via ON DELETE CASCADE, every
+// workflow/credential/execution/schedule/env-override scoped to it
+// (rule 4: complete isolation cuts both ways -- deleting a Service
+// deletes everything inside it, nothing outside it). Guarded the same
+// way DeleteWorkflow is guarded: the Service row is locked first, then
+// every workflow belonging to it is checked for in-flight executions
+// inside the same transaction, so a run cannot start in the gap
+// between the check and the DELETE.
+func (s *Store) DeleteService(ctx context.Context, id string) error {
+	if id == tenant.DefaultID {
+		return errors.New("store: the Default service cannot be deleted")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	err = tx.QueryRow(ctx, `SELECT true FROM services WHERE id=$1 FOR UPDATE`, id).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServiceNotFound
+		}
+		return err
+	}
+
+	var activeCount int
+	err = tx.QueryRow(ctx, `
+		SELECT count(*) FROM executions e
+		JOIN workflows w ON w.id = e.workflow_id
+		WHERE w.service_id = $1 AND e.finished_at IS NULL
+		  AND e.status IN ('queued', 'running', 'waiting')
+	`, id).Scan(&activeCount)
+	if err != nil {
+		return err
+	}
+	if activeCount > 0 {
+		return ErrServiceHasActiveExecutions
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM services WHERE id=$1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// CountWorkflowsInService is a cheap pre-delete check the API surfaces
+// to the person before they confirm deleting a Service (rule: protect
+// against accidental destructive action).
+func (s *Store) CountWorkflowsInService(ctx context.Context, id string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM workflows WHERE service_id=$1`, id).Scan(&n)
+	return n, err
+}
+
 // --- workflows ---
 
 func (s *Store) SaveWorkflow(ctx context.Context, wf *model.Workflow) error {
+	if wf.ServiceID == "" {
+		wf.ServiceID = tenant.DefaultID
+	}
 	def, err := json.Marshal(wf)
 	if err != nil {
 		return err
 	}
+	// service_id is deliberately part of the INSERT but NOT the UPDATE
+	// clause: once a workflow is created inside a Service, an ordinary
+	// save/re-import of that same id can never silently move it to a
+	// different Service (isolation rule 4/13) -- only DeleteWorkflow +
+	// a fresh import elsewhere can do that.
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO workflows (id, name, active, definition, updated_at)
-		VALUES ($1, $2, $3, $4, now())
-		ON CONFLICT (id) DO UPDATE SET name = $2, active = $3, definition = $4, updated_at = now()
-	`, wf.ID, wf.Name, wf.Active, def)
+		INSERT INTO workflows (id, name, service_id, active, definition, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (id) DO UPDATE SET name = $2, active = $4, definition = $5, updated_at = now()
+	`, wf.ID, wf.Name, wf.ServiceID, wf.Active, def)
 	if err != nil {
 		return err
 	}
@@ -92,21 +223,27 @@ func (s *Store) SaveWorkflow(ctx context.Context, wf *model.Workflow) error {
 
 func (s *Store) LoadWorkflow(ctx context.Context, id string) (*model.Workflow, error) {
 	var def []byte
-	if err := s.pool.QueryRow(ctx, `SELECT definition FROM workflows WHERE id=$1`, id).Scan(&def); err != nil {
+	var serviceID string
+	if err := s.pool.QueryRow(ctx, `SELECT definition, service_id FROM workflows WHERE id=$1`, id).Scan(&def, &serviceID); err != nil {
 		return nil, err
 	}
 	var wf model.Workflow
 	if err := json.Unmarshal(def, &wf); err != nil {
 		return nil, err
 	}
+	// service_id from the column, not the embedded JSON, is always the
+	// source of truth -- see SaveWorkflow's ON CONFLICT clause above.
+	wf.ServiceID = serviceID
 	return &wf, nil
 }
 
-// ListWorkflows returns every saved workflow, used at server startup to
-// register schedules (from each workflow's Schedule Trigger nodes) and
-// webhook routes (from Webhook Trigger nodes) -- see cmd/server/main.go.
+// ListWorkflows returns every saved workflow across every Service, used
+// at server startup to register schedules (from each workflow's
+// Schedule Trigger nodes) and webhook routes (from Webhook Trigger
+// nodes) -- see cmd/server/main.go. Deliberately not Service-scoped:
+// startup registration must cover every Service's triggers.
 func (s *Store) ListWorkflows(ctx context.Context) ([]*model.Workflow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT definition FROM workflows`)
+	rows, err := s.pool.Query(ctx, `SELECT definition, service_id FROM workflows`)
 	if err != nil {
 		return nil, err
 	}
@@ -114,13 +251,43 @@ func (s *Store) ListWorkflows(ctx context.Context) ([]*model.Workflow, error) {
 	var out []*model.Workflow
 	for rows.Next() {
 		var def []byte
-		if err := rows.Scan(&def); err != nil {
+		var serviceID string
+		if err := rows.Scan(&def, &serviceID); err != nil {
 			return nil, err
 		}
 		var wf model.Workflow
 		if err := json.Unmarshal(def, &wf); err != nil {
 			return nil, err
 		}
+		wf.ServiceID = serviceID
+		out = append(out, &wf)
+	}
+	return out, rows.Err()
+}
+
+// ListWorkflowsByService returns only the workflows belonging to one
+// Service, ordered oldest first -- the Service Dashboard's workflow
+// list, and what Run Service / Run All Services iterate over. This is
+// the enforcement point for isolation rule 4 on the read side: a
+// Service's dashboard only ever learns about its own workflows.
+func (s *Store) ListWorkflowsByService(ctx context.Context, serviceID string) ([]*model.Workflow, error) {
+	rows, err := s.pool.Query(ctx, `SELECT definition, service_id FROM workflows WHERE service_id=$1 ORDER BY created_at ASC`, serviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*model.Workflow{}
+	for rows.Next() {
+		var def []byte
+		var svcID string
+		if err := rows.Scan(&def, &svcID); err != nil {
+			return nil, err
+		}
+		var wf model.Workflow
+		if err := json.Unmarshal(def, &wf); err != nil {
+			return nil, err
+		}
+		wf.ServiceID = svcID
 		out = append(out, &wf)
 	}
 	return out, rows.Err()
@@ -255,11 +422,21 @@ func (s *Store) SaveExecution(ctx context.Context, ex *model.Execution) error {
 	if err != nil {
 		return err
 	}
+	serviceID := ex.ServiceID
+	if serviceID == "" {
+		// Old caller/test that never set ServiceID: look it up from the
+		// owning workflow rather than defaulting blind, so history stays
+		// correctly attributed even for code paths not yet updated.
+		_ = s.pool.QueryRow(ctx, `SELECT service_id FROM workflows WHERE id=$1`, ex.WorkflowID).Scan(&serviceID)
+		if serviceID == "" {
+			serviceID = tenant.DefaultID
+		}
+	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO executions (id, workflow_id, mode, status, started_at, finished_at, error, node_runs)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		ON CONFLICT (id) DO UPDATE SET status=$4, finished_at=$6, error=$7, node_runs=$8
-	`, ex.ID, ex.WorkflowID, ex.Mode, ex.Status, ex.StartedAt, ex.FinishedAt, ex.Error, nodeRunsJSON)
+		INSERT INTO executions (id, workflow_id, service_id, mode, status, started_at, finished_at, error, node_runs)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		ON CONFLICT (id) DO UPDATE SET status=$5, finished_at=$7, error=$8, node_runs=$9
+	`, ex.ID, ex.WorkflowID, serviceID, ex.Mode, ex.Status, ex.StartedAt, ex.FinishedAt, ex.Error, nodeRunsJSON)
 	return err
 }
 
@@ -280,7 +457,7 @@ func (s *Store) ListExecutions(ctx context.Context, limit int) ([]*model.Executi
 		limit = 500
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, workflow_id, mode, status, started_at, finished_at, error, node_runs
+		SELECT id, workflow_id, service_id, mode, status, started_at, finished_at, error, node_runs
 		FROM executions
 		ORDER BY started_at DESC
 		LIMIT $1
@@ -294,7 +471,45 @@ func (s *Store) ListExecutions(ctx context.Context, limit int) ([]*model.Executi
 	for rows.Next() {
 		var ex model.Execution
 		var nodeRunsJSON []byte
-		if err := rows.Scan(&ex.ID, &ex.WorkflowID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON); err != nil {
+		if err := rows.Scan(&ex.ID, &ex.WorkflowID, &ex.ServiceID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON); err != nil {
+			return nil, err
+		}
+		if len(nodeRunsJSON) > 0 {
+			if err := json.Unmarshal(nodeRunsJSON, &ex.NodeRuns); err != nil {
+				return nil, fmt.Errorf("store: decode node_runs for execution %q: %w", ex.ID, err)
+			}
+		}
+		out = append(out, &ex)
+	}
+	return out, rows.Err()
+}
+
+// ListExecutionsByService is ListExecutions scoped to one Service --
+// backs the Service Dashboard's execution/status list (isolation rule
+// 4/5 on the read side).
+func (s *Store) ListExecutionsByService(ctx context.Context, serviceID string, limit int) ([]*model.Execution, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, workflow_id, service_id, mode, status, started_at, finished_at, error, node_runs
+		FROM executions
+		WHERE service_id = $1
+		ORDER BY started_at DESC
+		LIMIT $2
+	`, serviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*model.Execution, 0, limit)
+	for rows.Next() {
+		var ex model.Execution
+		var nodeRunsJSON []byte
+		if err := rows.Scan(&ex.ID, &ex.WorkflowID, &ex.ServiceID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON); err != nil {
 			return nil, err
 		}
 		if len(nodeRunsJSON) > 0 {
@@ -352,9 +567,9 @@ func (s *Store) GetExecution(ctx context.Context, id string) (*model.Execution, 
 	var ex model.Execution
 	var nodeRunsJSON []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, workflow_id, mode, status, started_at, finished_at, error, node_runs
+		SELECT id, workflow_id, service_id, mode, status, started_at, finished_at, error, node_runs
 		FROM executions WHERE id=$1
-	`, id).Scan(&ex.ID, &ex.WorkflowID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON)
+	`, id).Scan(&ex.ID, &ex.WorkflowID, &ex.ServiceID, &ex.Mode, &ex.Status, &ex.StartedAt, &ex.FinishedAt, &ex.Error, &nodeRunsJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -462,6 +677,260 @@ func (s *Store) ListCredentials(ctx context.Context, workflowID string) ([]Crede
 		out = append(out, ci)
 	}
 	return out, rows.Err()
+}
+
+// --- Global / Service Environment (vault.EnvStore) ---
+//
+// Both tables store AEAD ciphertext only, same cipher/master key as
+// every other secret in this codebase (see vault.EnvVault) -- rule 2:
+// "Sensitive values নিরাপদভাবে store করবে". EnvInfo below is the only
+// shape ever handed back over HTTP: name/is_secret/updated_at, never
+// the value (rule 13 applies to configuration the same as credentials).
+
+// EnvInfo is one environment entry's metadata, safe to serialize to
+// JSON -- never the decrypted value.
+type EnvInfo struct {
+	Key       string    `json:"key"`
+	IsSecret  bool      `json:"isSecret"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func (s *Store) PutGlobalEnv(ctx context.Context, key string, ciphertext []byte, isSecret bool) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO global_env (key, ciphertext, is_secret, updated_at) VALUES ($1,$2,$3,now())
+		ON CONFLICT (key) DO UPDATE SET ciphertext=$2, is_secret=$3, updated_at=now()
+	`, key, ciphertext, isSecret)
+	return err
+}
+
+func (s *Store) GetGlobalEnv(ctx context.Context, key string) ([]byte, error) {
+	var ct []byte
+	err := s.pool.QueryRow(ctx, `SELECT ciphertext FROM global_env WHERE key=$1`, key).Scan(&ct)
+	return ct, err
+}
+
+func (s *Store) DeleteGlobalEnv(ctx context.Context, key string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM global_env WHERE key=$1`, key)
+	return err
+}
+
+// ListGlobalEnv returns every configured Global Environment key's
+// metadata (never values), ordered by key for a stable dashboard list.
+func (s *Store) ListGlobalEnv(ctx context.Context) ([]EnvInfo, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, is_secret, updated_at FROM global_env ORDER BY key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EnvInfo{}
+	for rows.Next() {
+		var e EnvInfo
+		if err := rows.Scan(&e.Key, &e.IsSecret, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// AllGlobalEnvCiphertext loads every Global Environment row's raw
+// ciphertext in one query -- used once per workflow run (see
+// vault.EnvVault.ResolveAll) rather than one query per $env lookup, so
+// a Code node reading several allowlisted names inside a hot per-item
+// loop never causes N database round trips per node.
+func (s *Store) AllGlobalEnvCiphertext(ctx context.Context) (map[string][]byte, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, ciphertext FROM global_env`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var key string
+		var ct []byte
+		if err := rows.Scan(&key, &ct); err != nil {
+			return nil, err
+		}
+		out[key] = ct
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) PutServiceEnv(ctx context.Context, serviceID, key string, ciphertext []byte, isSecret bool) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO service_env (service_id, key, ciphertext, is_secret, updated_at) VALUES ($1,$2,$3,$4,now())
+		ON CONFLICT (service_id, key) DO UPDATE SET ciphertext=$3, is_secret=$4, updated_at=now()
+	`, serviceID, key, ciphertext, isSecret)
+	return err
+}
+
+func (s *Store) DeleteServiceEnv(ctx context.Context, serviceID, key string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM service_env WHERE service_id=$1 AND key=$2`, serviceID, key)
+	return err
+}
+
+func (s *Store) ListServiceEnv(ctx context.Context, serviceID string) ([]EnvInfo, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, is_secret, updated_at FROM service_env WHERE service_id=$1 ORDER BY key`, serviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EnvInfo{}
+	for rows.Next() {
+		var e EnvInfo
+		if err := rows.Scan(&e.Key, &e.IsSecret, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// AllServiceEnvCiphertext mirrors AllGlobalEnvCiphertext, scoped to one
+// Service -- the Service-Environment half of the precedence chain.
+func (s *Store) AllServiceEnvCiphertext(ctx context.Context, serviceID string) (map[string][]byte, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, ciphertext FROM service_env WHERE service_id=$1`, serviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var key string
+		var ct []byte
+		if err := rows.Scan(&key, &ct); err != nil {
+			return nil, err
+		}
+		out[key] = ct
+	}
+	return out, rows.Err()
+}
+
+// --- Run All Services (durable sequential sweep -- runall.Manager) ---
+
+// ErrRunAllAlreadyActive maps the schema's partial unique index
+// violation to a clear, typed error the API turns into 409 (rule:
+// "Duplicate Run All execution prevent করো").
+var ErrRunAllAlreadyActive = errors.New("store: a Run All Services sweep is already queued or running")
+
+// RunAllJobRow is the durable row backing one Run All Services sweep.
+// Results is kept as raw JSON (not unmarshaled here) because its shape
+// is owned by package runall, not store -- store only needs to persist
+// and hand back opaque bytes.
+type RunAllJobRow struct {
+	ID            string
+	Status        string
+	ServiceIDs    []string
+	StopOnFailure bool
+	Results       json.RawMessage
+	Error         string
+	StartedAt     time.Time
+	UpdatedAt     time.Time
+	FinishedAt    *time.Time
+}
+
+func (s *Store) CreateRunAllJob(ctx context.Context, id string, serviceIDs []string, stopOnFailure bool) error {
+	idsJSON, err := json.Marshal(serviceIDs)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO run_all_jobs (id, status, service_ids, stop_on_failure, results, started_at, updated_at)
+		VALUES ($1, 'queued', $2, $3, '[]'::jsonb, now(), now())
+	`, id, idsJSON, stopOnFailure)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrRunAllAlreadyActive
+		}
+		return err
+	}
+	return nil
+}
+
+// UpdateRunAllJob persists progress -- called after every service/
+// workflow step completes so a restart can resume from `results`
+// instead of re-running already-recorded work (rule 17).
+func (s *Store) UpdateRunAllJob(ctx context.Context, id, status string, results json.RawMessage, jobErr string) error {
+	var finishedAt any
+	if status == "success" || status == "error" || status == "cancelled" {
+		finishedAt = time.Now()
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE run_all_jobs SET status=$2, results=$3, error=$4, updated_at=now(), finished_at=COALESCE($5, finished_at)
+		WHERE id=$1
+	`, id, status, results, nullableString(jobErr), finishedAt)
+	if err != nil {
+		return err
+	}
+	if finishedAt != nil {
+		// Retention (rule 10/11): keep only the 20 newest finished sweeps so
+		// this table never accumulates; active rows are never touched.
+		_, _ = s.pool.Exec(ctx, `
+			DELETE FROM run_all_jobs
+			WHERE status NOT IN ('queued','running')
+			  AND id NOT IN (SELECT id FROM run_all_jobs ORDER BY started_at DESC LIMIT 20)
+		`)
+	}
+	return nil
+}
+
+func (s *Store) GetRunAllJob(ctx context.Context, id string) (*RunAllJobRow, error) {
+	return s.scanRunAllJob(s.pool.QueryRow(ctx, `
+		SELECT id, status, service_ids, stop_on_failure, results, COALESCE(error,''), started_at, updated_at, finished_at
+		FROM run_all_jobs WHERE id=$1`, id))
+}
+
+// GetActiveRunAllJob returns the currently queued/running sweep, if
+// any -- what a restart's recovery pass resumes, and what the
+// dashboard polls for live progress. Returns (nil, nil) when idle.
+func (s *Store) GetActiveRunAllJob(ctx context.Context) (*RunAllJobRow, error) {
+	row, err := s.scanRunAllJob(s.pool.QueryRow(ctx, `
+		SELECT id, status, service_ids, stop_on_failure, results, COALESCE(error,''), started_at, updated_at, finished_at
+		FROM run_all_jobs WHERE status IN ('queued','running') LIMIT 1`))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return row, err
+}
+
+func (s *Store) scanRunAllJob(row pgx.Row) (*RunAllJobRow, error) {
+	var j RunAllJobRow
+	var idsJSON []byte
+	if err := row.Scan(&j.ID, &j.Status, &idsJSON, &j.StopOnFailure, &j.Results, &j.Error, &j.StartedAt, &j.UpdatedAt, &j.FinishedAt); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(idsJSON, &j.ServiceIDs); err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// ListRunAllJobs returns recent sweeps, newest first, for a simple
+// history view (bounded -- rule 10/18).
+func (s *Store) ListRunAllJobs(ctx context.Context, limit int) ([]*RunAllJobRow, error) {
+	if limit < 1 || limit > 50 {
+		limit = 20
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, status, service_ids, stop_on_failure, results, COALESCE(error,''), started_at, updated_at, finished_at
+		FROM run_all_jobs ORDER BY started_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*RunAllJobRow{}
+	for rows.Next() {
+		j, err := s.scanRunAllJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "23505")
 }
 
 // SaveExecutionCheckpoint upserts the single latest checkpoint for an
