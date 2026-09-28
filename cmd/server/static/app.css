@@ -488,3 +488,10 @@ textarea.json-paste {
   max-height: 360px;
   overflow: auto;
 }
+
+/* Service switcher (top bar) */
+.service-switch {
+  max-width: 200px; margin-right: 12px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: inherit; font-size: 13px;
+}

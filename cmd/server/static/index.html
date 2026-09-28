@@ -16,12 +16,16 @@
       <span class="brand-name">MicroFlow</span>
     </div>
     <div class="topbar-spacer"></div>
+    <select id="serviceSwitch" class="service-switch" aria-label="Current Service" title="Current Service"></select>
     <span id="connStatus" class="conn-status conn-unknown">connecting&hellip;</span>
   </header>
 
   <div class="shell">
     <nav id="sidebar" class="sidebar">
       <a href="#/dashboard" class="nav-link" data-route="dashboard">Dashboard</a>
+      <a href="#/services" class="nav-link" data-route="services">Services</a>
+      <a href="#/global-env" class="nav-link" data-route="global-env">Global Environment</a>
+      <a href="#/service-env" class="nav-link" data-route="service-env">Service Environment</a>
       <a href="#/workflows" class="nav-link" data-route="workflows">Workflows</a>
       <a href="#/executions" class="nav-link" data-route="executions">Executions</a>
       <a href="#/import" class="nav-link" data-route="import">Import</a>

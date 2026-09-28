@@ -52,6 +52,26 @@
   let executionsMonitorTimer = null;
   let executionDetailES = null;
 
+  // Currently selected Service (isolated workspace). Only the *selection*
+  // lives in the browser; every request carries it in X-Microflow-Service
+  // and the backend re-checks ownership, so tampering with this value can
+  // never expose another Service's workflows/credentials.
+  let currentService = "default";
+  try { currentService = localStorage.getItem("mf.service") || "default"; } catch (_) {}
+  let servicesCache = [];
+  function setCurrentService(id) {
+    currentService = id || "default";
+    try { localStorage.setItem("mf.service", currentService); } catch (_) {}
+    const sel = document.getElementById("serviceSwitch");
+    if (sel) sel.value = currentService;
+  }
+  function currentServiceName() {
+    const sv = servicesCache.find((x) => x.id === currentService);
+    return sv ? sv.name : currentService;
+  }
+  const svcQS = () => "serviceId=" + encodeURIComponent(currentService);
+  const svcPath = (suffix) => "/api/services/" + encodeURIComponent(currentService) + (suffix || "");
+
   // ---------------- small helpers ----------------
 
   function escapeHtml(s) {
@@ -101,6 +121,9 @@
 
   async function api(path, opts) {
     opts = opts || {};
+    if (path.indexOf("/api/") === 0) {
+      opts.headers = Object.assign({}, opts.headers || {}, { "X-Microflow-Service": currentService });
+    }
     let res;
     try {
       res = await fetch(path, opts);
@@ -192,6 +215,20 @@
       } else if (parts[0] === "credentials") {
         setActiveNav("credentials");
         await renderCentralCredentialsPage();
+      } else if (parts[0] === "services" && parts.length === 1) {
+        setActiveNav("services");
+        await renderServicesPage();
+      } else if (parts[0] === "services" && (parts[2] || "").split("?")[0] === "credentials") {
+        // Google's OAuth callback redirects here; select that Service first.
+        setCurrentService(decodeURIComponent(parts[1]));
+        setActiveNav("credentials");
+        await renderCentralCredentialsPage();
+      } else if (parts[0] === "global-env") {
+        setActiveNav("global-env");
+        await renderEnvPage("global");
+      } else if (parts[0] === "service-env") {
+        setActiveNav("service-env");
+        await renderEnvPage("service");
       } else {
         setActiveNav("");
         viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
@@ -222,7 +259,7 @@
 
     let wfs;
     try {
-      wfs = await apiJSON("/api/workflows");
+      wfs = await apiJSON("/api/workflows?" + svcQS());
     } catch (e) {
       viewEl.innerHTML =
         '<div class="page-head"><div><h1>Dashboard</h1></div></div>' +
@@ -243,6 +280,7 @@
     viewEl.innerHTML =
       '<div class="page-head"><div><h1>Dashboard</h1><div class="sub">MicroFlow at a glance</div></div>' +
       '<div><a class="btn btn-primary" href="#/import">+ Import workflow</a></div></div>' +
+      serviceHeaderHTML() +
       '<div class="grid-stats">' +
       statCard(wfs.length, "Workflows") +
       statCard(active, "Active") +
@@ -252,6 +290,9 @@
       (recent.length
         ? renderWorkflowTable(recent, false)
         : emptyState("No workflows yet", 'Import an n8n export to get started, or <a href="#/import">go to Import</a>.'));
+    const rs = document.getElementById("runServiceBtn");
+    if (rs) rs.addEventListener("click", () => runCurrentService(rs));
+    wireRunAllPanel();
   }
 
   function statCard(num, label) {
@@ -276,7 +317,7 @@
 
     const workflowNames = {};
     try {
-      const wfs = await apiJSON("/api/workflows");
+      const wfs = await apiJSON("/api/workflows?" + svcQS());
       (wfs || []).forEach((wf) => { workflowNames[wf.id] = wf.name || wf.id; });
     } catch (_) {}
 
@@ -341,6 +382,9 @@
       try {
         const data = await apiJSON("/api/executions?limit=100");
         renderStats(data.queue || {});
+        // Only this Service's executions (workflowNames was built from the
+        // Service-scoped workflow list above).
+        data.executions = (data.executions || []).filter((x) => workflowNames[x.workflowId]);
         renderRows(data.executions || []);
         if (selected) {
           const found = (data.executions || []).find((x) => x.id === selected);
@@ -536,7 +580,7 @@
 
     let wfs;
     try {
-      wfs = await apiJSON("/api/workflows");
+      wfs = await apiJSON("/api/workflows?" + svcQS());
     } catch (e) {
       viewEl.innerHTML =
         '<div class="page-head"><div><h1>Workflows</h1></div></div>' +
@@ -763,12 +807,14 @@
   async function renderCentralCredentialsPage() {
     viewEl.innerHTML =
       '<div class="page-head"><div><h1>Google Connections</h1>' +
-      '<div class="sub">Connect each service to its own Google account \u2014 no copying refresh tokens, ' +
+      '<div class="sub">Service: <b>' + escapeHtml(currentServiceName()) + '</b> \u2014 connect each Google service to its own Google account, no copying refresh tokens, ' +
       "no manual setup. Once connected, every workflow's Gmail/YouTube/Sheets nodes use it automatically, " +
       "including scheduled runs with no browser open.</div></div></div>" +
       '<div id="googleConnCards" class="google-conn-cards">' + loadingRow("Checking connections\u2026") + "</div>" +
       '<div id="googleConnNotConfigured" class="field-error" style="display:none;"></div>' +
-      '<details class="cred-advanced"><summary>Advanced: manual credential (override)</summary>' +
+      (currentService === "default"
+        ? '<details class="cred-advanced"><summary>Advanced: manual credential (Default Service only)</summary>'
+        : '<details class="cred-advanced" style="display:none"><summary></summary>') +
       '<div class="card cred-page-card">' +
       '<div class="cred-section-note">Only needed if you already have a Google OAuth client ID/secret/refresh ' +
       "token from elsewhere and want to paste it in directly, instead of using Connect above. Most people never " +
@@ -828,11 +874,11 @@
     let actionsHTML;
     if (view.connected) {
       actionsHTML =
-        '<a class="btn btn-secondary btn-sm" href="/api/google/connect/' + encodeURIComponent(view.service) + '">' +
+        '<a class="btn btn-secondary btn-sm" href="' + svcPath("/google/connect/" + encodeURIComponent(view.service)) + '">' +
         (view.needsReconnect ? "Reconnect" : "Reconnect") + "</a> " +
         '<button class="btn btn-danger btn-sm google-disconnect-btn" data-service="' + escapeHtml(view.service) + '">Disconnect</button>';
     } else {
-      actionsHTML = '<a class="btn btn-primary btn-sm" href="/api/google/connect/' + encodeURIComponent(view.service) + '">Connect Google</a>';
+      actionsHTML = '<a class="btn btn-primary btn-sm" href="' + svcPath("/google/connect/" + encodeURIComponent(view.service)) + '">Connect Google</a>';
     }
 
     return (
@@ -849,7 +895,7 @@
     const notConfiguredEl = document.getElementById("googleConnNotConfigured");
     if (!cardsEl) return; // navigated away
     try {
-      const services = await apiJSON("/api/google/connections");
+      const services = await apiJSON(svcPath("/google/connections"));
       const byService = {};
       (services || []).forEach((v) => { byService[v.service] = v; });
       cardsEl.innerHTML = GOOGLE_SERVICE_ORDER
@@ -878,7 +924,7 @@
         if (!confirm("Disconnect " + label + "? Workflows using it will stop working until it's reconnected.")) return;
         btn.disabled = true;
         try {
-          await apiJSON("/api/google/disconnect/" + encodeURIComponent(service), { method: "POST" });
+          await apiJSON(svcPath("/google/disconnect/" + encodeURIComponent(service)), { method: "POST" });
           toast(label + " disconnected", "success");
           refreshGoogleConnections();
         } catch (e) {
@@ -1876,7 +1922,311 @@
   }
 
 
+  // ---------------- Services, Environment, Run All ----------------
+  //
+  // Everything below talks to internal/api/services.go. Secret values are
+  // write-only: the environment pages list key names/flags, never values.
+
+  async function loadServices() {
+    servicesCache = (await apiJSON("/api/services")) || [];
+    if (!servicesCache.some((x) => x.id === currentService)) {
+      setCurrentService("default");
+    }
+    const sel = document.getElementById("serviceSwitch");
+    if (sel) {
+      sel.innerHTML = servicesCache
+        .map((x) => '<option value="' + escapeHtml(x.id) + '">' + escapeHtml(x.name) + "</option>")
+        .join("");
+      sel.value = currentService;
+    }
+    return servicesCache;
+  }
+
+  let runAllTimer = null;
+  function stopRunAllPolling() {
+    if (runAllTimer) { clearInterval(runAllTimer); runAllTimer = null; }
+  }
+
+  function runAllPanelHTML() {
+    return (
+      '<div class="card" id="runAllPanel" style="margin-bottom:16px;">' +
+      "<h3>Run All Services</h3>" +
+      '<div class="sub" style="margin-bottom:10px;">Runs every Service one at a time (never in parallel). ' +
+      "Each Service finishes and is cleaned up before the next starts. Progress survives a server restart.</div>" +
+      '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
+      '<button id="runAllBtn" class="btn btn-primary">Run All Services</button>' +
+      '<button id="runAllCancelBtn" class="btn btn-danger" style="display:none;">Cancel</button>' +
+      '<label style="font-size:12px;"><input type="checkbox" id="runAllStop"> Stop if a Service fails</label>' +
+      "</div>" +
+      '<div id="runAllStatus" style="margin-top:12px;"></div></div>'
+    );
+  }
+
+  function runAllStatusHTML(st) {
+    if (!st || st.status === "idle") return '<div class="sub">No run yet.</div>';
+    const names = {};
+    servicesCache.forEach((x) => { names[x.id] = x.name; });
+    const rows = (st.results || []).map((r) =>
+      "<tr><td>" + escapeHtml(r.serviceName || names[r.serviceId] || r.serviceId) + "</td><td>" +
+      escapeHtml(r.workflowName || "\u2014") + '</td><td><span class="badge ' +
+      (r.status === "success" ? "badge-active" : "badge-inactive") + '">' + escapeHtml(r.status) + "</span></td><td>" +
+      escapeHtml(r.error || "") + "</td></tr>"
+    ).join("");
+    const done = new Set((st.results || []).map((r) => r.serviceId)).size;
+    return (
+      "<div><b>Status:</b> " + escapeHtml(st.status) +
+      " &middot; " + done + " / " + (st.serviceIds || []).length + " service(s) reached" +
+      (st.error ? ' &middot; <span class="field-error">' + escapeHtml(st.error) + "</span>" : "") + "</div>" +
+      (rows
+        ? '<table class="wf-table" style="margin-top:8px;"><thead><tr><th>Service</th><th>Workflow</th><th>Result</th><th>Error</th></tr></thead><tbody>' + rows + "</tbody></table>"
+        : "")
+    );
+  }
+
+  function wireRunAllPanel() {
+    const btn = document.getElementById("runAllBtn");
+    const cancelBtn = document.getElementById("runAllCancelBtn");
+    const statusEl = document.getElementById("runAllStatus");
+    if (!btn) return;
+    async function refresh() {
+      if (!document.getElementById("runAllStatus")) { stopRunAllPolling(); return; }
+      try {
+        const st = await apiJSON("/api/run-all");
+        statusEl.innerHTML = runAllStatusHTML(st);
+        const active = st.status === "queued" || st.status === "running";
+        btn.disabled = active;
+        cancelBtn.style.display = active ? "" : "none";
+        if (!active) stopRunAllPolling();
+      } catch (e) {
+        statusEl.innerHTML = '<div class="field-error">' + escapeHtml(e.message) + "</div>";
+        stopRunAllPolling();
+      }
+    }
+    function startPolling() {
+      stopRunAllPolling();
+      runAllTimer = setInterval(refresh, 3000);
+    }
+    btn.addEventListener("click", async () => {
+      if (!confirm("Run every Service one after another now?")) return;
+      btn.disabled = true;
+      try {
+        await apiJSON("/api/run-all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stopOnFailure: document.getElementById("runAllStop").checked }),
+        });
+        toast("Run All started", "success");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+      await refresh();
+      startPolling();
+    });
+    cancelBtn.addEventListener("click", async () => {
+      try { await apiJSON("/api/run-all/cancel", { method: "POST" }); toast("Cancelling after the current workflow\u2026"); }
+      catch (e) { toast(e.message, "error"); }
+    });
+    refresh().then(() => {
+      if (btn.disabled) startPolling();
+    });
+  }
+
+  async function runCurrentService(btn) {
+    btn.disabled = true;
+    try {
+      await apiJSON(svcPath("/run"), { method: "POST" });
+      toast("Started " + currentServiceName(), "success");
+      const st = document.getElementById("runAllStatus");
+      if (st) wireRunAllPanel();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function renderServicesPage() {
+    viewEl.innerHTML =
+      '<div class="page-head"><div><h1>Services</h1><div class="sub">Isolated workspaces \u2014 each has its own workflows, Google accounts and environment</div></div>' +
+      '<div><button id="svcCreateBtn" class="btn btn-primary">+ Create Service</button></div></div>' +
+      runAllPanelHTML() + '<div id="svcTable">' + loadingRow() + "</div>";
+    wireRunAllPanel();
+
+    document.getElementById("svcCreateBtn").addEventListener("click", async () => {
+      const name = (prompt("Name for the new Service:") || "").trim();
+      if (!name) return;
+      try {
+        const created = await apiJSON("/api/services", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        await loadServices();
+        setCurrentService(created.id);
+        toast("Service created", "success");
+        renderServicesPage();
+      } catch (e) { toast(e.message, "error"); }
+    });
+
+    const list = await loadServices();
+    const counts = await Promise.all(list.map((x) =>
+      apiJSON("/api/services/" + encodeURIComponent(x.id)).then((d) => d.workflowCount).catch(() => "?")));
+    const rows = list.map((x, i) =>
+      "<tr><td><b>" + escapeHtml(x.name) + "</b>" + (x.id === currentService ? ' <span class="badge badge-active">selected</span>' : "") +
+      '</td><td><code>' + escapeHtml(x.id) + "</code></td><td>" + escapeHtml(counts[i]) + "</td><td>" +
+      '<button class="btn btn-sm svc-open" data-id="' + escapeHtml(x.id) + '">Open</button> ' +
+      '<button class="btn btn-sm svc-run" data-id="' + escapeHtml(x.id) + '">Run</button> ' +
+      '<button class="btn btn-sm svc-rename" data-id="' + escapeHtml(x.id) + '">Rename</button> ' +
+      (x.id === "default" ? "" : '<button class="btn btn-sm btn-danger svc-del" data-id="' + escapeHtml(x.id) + '">Delete</button>') +
+      "</td></tr>"
+    ).join("");
+    document.getElementById("svcTable").innerHTML =
+      '<table class="wf-table"><thead><tr><th>Service</th><th>ID</th><th>Workflows</th><th></th></tr></thead><tbody>' + rows + "</tbody></table>";
+
+    const byId = (id) => list.find((x) => x.id === id);
+    document.querySelectorAll(".svc-open").forEach((b) => b.addEventListener("click", () => {
+      setCurrentService(b.dataset.id);
+      location.hash = "#/dashboard";
+    }));
+    document.querySelectorAll(".svc-run").forEach((b) => b.addEventListener("click", async () => {
+      setCurrentService(b.dataset.id);
+      await runCurrentService(b);
+    }));
+    document.querySelectorAll(".svc-rename").forEach((b) => b.addEventListener("click", async () => {
+      const cur = byId(b.dataset.id);
+      const name = (prompt("New name:", cur.name) || "").trim();
+      if (!name || name === cur.name) return;
+      try {
+        await apiJSON("/api/services/" + encodeURIComponent(cur.id), {
+          method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
+        });
+        renderServicesPage();
+      } catch (e) { toast(e.message, "error"); }
+    }));
+    document.querySelectorAll(".svc-del").forEach((b) => b.addEventListener("click", async () => {
+      const cur = byId(b.dataset.id);
+      const typed = prompt(
+        'Deleting "' + cur.name + '" permanently removes its workflows, Google connections and environment.\n' +
+        "Type the Service name exactly to confirm:");
+      if (typed === null) return;
+      if (typed !== cur.name) { toast("Name did not match \u2014 nothing was deleted", "error"); return; }
+      try {
+        await apiJSON("/api/services/" + encodeURIComponent(cur.id) + "?confirmName=" + encodeURIComponent(cur.name), { method: "DELETE" });
+        if (currentService === cur.id) setCurrentService("default");
+        toast("Service deleted", "success");
+        await loadServices();
+        renderServicesPage();
+      } catch (e) { toast(e.message, "error"); }
+    }));
+  }
+
+  // scope: "global" (Global Environment) or "service" (current Service's overrides)
+  async function renderEnvPage(scope) {
+    const isGlobal = scope === "global";
+    const base = isGlobal ? "/api/global-env" : svcPath("/env");
+    const title = isGlobal ? "Global Environment" : "Service Environment";
+    const sub = isGlobal
+      ? "Shared configuration used by every Service. A Service's own value (Service Environment) overrides it."
+      : 'Overrides for <b>' + escapeHtml(currentServiceName()) + "</b> only. Anything not set here falls back to Global Environment, then the server's own environment.";
+    viewEl.innerHTML =
+      '<div class="page-head"><div><h1>' + title + '</h1><div class="sub">' + sub + "</div></div></div>" +
+      '<div class="card" style="margin-bottom:16px;">' +
+      '<div class="field"><label>Name</label><input type="text" id="envKey" placeholder="e.g. GOOGLE_SHEETS_URL" autocomplete="off"></div>' +
+      '<div class="field"><label>Value</label><input type="password" id="envVal" autocomplete="off"></div>' +
+      '<div class="field"><label><input type="checkbox" id="envSecret" checked> Secret (hide after saving)</label></div>' +
+      '<button id="envSave" class="btn btn-primary">Save</button>' +
+      '<div class="cred-section-note" style="margin-top:8px;">Values are encrypted at rest and are never shown again after saving. ' +
+      "Saving an existing name replaces its value." +
+      (isGlobal ? " Changes to GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL take effect after a server restart." : "") +
+      "</div></div>" +
+      '<div id="envTable">' + loadingRow() + "</div>";
+
+    async function refresh() {
+      const host = document.getElementById("envTable");
+      if (!host) return;
+      try {
+        const list = (await apiJSON(base)) || [];
+        host.innerHTML = list.length
+          ? '<table class="wf-table"><thead><tr><th>Name</th><th>Type</th><th>Updated</th><th></th></tr></thead><tbody>' +
+            list.map((e) =>
+              "<tr><td><code>" + escapeHtml(e.key) + "</code></td><td>" + (e.isSecret ? "secret" : "plain") + "</td><td>" +
+              escapeHtml(fmtDate(e.updatedAt)) + '</td><td><button class="btn btn-sm btn-danger env-del" data-key="' +
+              escapeHtml(e.key) + '">Delete</button></td></tr>').join("") + "</tbody></table>"
+          : emptyState("Nothing set yet", "Add a name and value above.");
+        host.querySelectorAll(".env-del").forEach((b) => b.addEventListener("click", async () => {
+          if (!confirm("Delete " + b.dataset.key + "?")) return;
+          try { await apiJSON(base + "/" + encodeURIComponent(b.dataset.key), { method: "DELETE" }); refresh(); }
+          catch (e) { toast(e.message, "error"); }
+        }));
+      } catch (e) {
+        host.innerHTML = emptyState("Can't load", escapeHtml(e.message));
+      }
+    }
+    document.getElementById("envSave").addEventListener("click", async () => {
+      const key = document.getElementById("envKey").value.trim();
+      const value = document.getElementById("envVal").value;
+      if (!key) { toast("Enter a name", "error"); return; }
+      try {
+        await apiJSON(base, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, value, isSecret: document.getElementById("envSecret").checked }),
+        });
+        document.getElementById("envKey").value = "";
+        document.getElementById("envVal").value = "";
+        toast("Saved", "success");
+        refresh();
+      } catch (e) { toast(e.message, "error"); }
+    });
+    refresh();
+  }
+
+  // Service dashboard extras: shown above the stats on the Dashboard.
+  function serviceHeaderHTML() {
+    return (
+      '<div class="card" style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
+      "<div><b>Service:</b> " + escapeHtml(currentServiceName()) + "</div>" +
+      '<div style="flex:1"></div>' +
+      '<button id="runServiceBtn" class="btn btn-primary">Run Service</button>' +
+      '<a class="btn" href="#/service-env">Service Environment</a>' +
+      '<a class="btn" href="#/credentials">Google / YouTube / Gmail</a>' +
+      '<a class="btn" href="#/import">Import Workflow</a>' +
+      '<a class="btn" href="#/services">All Services</a>' +
+      '<a class="btn" href="#/global-env">Global Environment</a></div>' +
+      runAllPanelHTML()
+    );
+  }
+
+  // Transient UI state (toasts, live-monitor connections, run-status
+  // pollers, cached service list) is dropped every ~2.5 hours so a
+  // long-lived tab never accumulates state. Only in-browser state is
+  // cleared -- Services, workflows, credentials and both Environments
+  // live in the database and are untouched. Skipped while the workflow
+  // editor is open so unsaved edits are never lost.
+  const TRANSIENT_RESET_MS = 2.5 * 60 * 60 * 1000;
+  setInterval(async () => {
+    const parts = parseHash();
+    if (parts[0] === "workflows" && parts.length >= 2) return;
+    stopRunAllPolling();
+    stopExecutionMonitoring();
+    toastHost.innerHTML = "";
+    servicesCache = [];
+    try { await loadServices(); } catch (_) {}
+    route();
+  }, TRANSIENT_RESET_MS);
+
   // ---------------- boot ----------------
 
-  route();
+  (async function boot() {
+    const sel = document.getElementById("serviceSwitch");
+    if (sel) {
+      sel.addEventListener("change", () => {
+        setCurrentService(sel.value);
+        if (parseHash()[0] === "workflows" && parseHash().length >= 2) location.hash = "#/workflows";
+        else route();
+      });
+    }
+    try { await loadServices(); } catch (_) { /* server without tenancy: stay on "default" */ }
+    route();
+  })();
 })();
