@@ -133,7 +133,7 @@ func (e CodeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *
 			}
 			mustSet(vm, "$node", nodeGetterProxy(nodeGetter))
 
-			mustSet(vm, "$env", e.envAllowlist())
+			mustSet(vm, "$env", e.envAllowlist(rc))
 			mustSet(vm, "$execution", map[string]any{"id": rc.Execution.ID, "mode": rc.Execution.Mode})
 			mustSet(vm, "$workflow", map[string]any{"id": rc.Workflow.ID, "name": rc.Workflow.Name})
 
@@ -550,17 +550,31 @@ func consoleLogger(redactor *engine.SecretRedactor, nodeName, level string) func
 // never the whole process environment (credential leakage prevention,
 // rule 11/22). The set of *names* an operator opted in to comes from
 // e.EnvAllowlist (wired at server startup, see cmd/server/main.go); this
-// reads the actual values from the process environment fresh on every
-// call so a value change (e.g. a rotated API key) takes effect without a
-// restart. A name in the allowlist with no matching process env var is
-// simply omitted, not exposed as an empty string, so scripts can use
-// `if ($env.X)` to detect it's unset.
-func (e CodeExecutor) envAllowlist() map[string]string {
+// reads the actual values through rc.LookupEnv -- this run's owning
+// Service's own Environment override first, then the deployment-wide
+// Global Environment, then the process environment (rule 2's
+// precedence) -- fresh on every call so a value change (e.g. a rotated
+// API key, or an operator editing the Global/Service Environment) takes
+// effect without a restart. A name in the allowlist with no matching
+// value anywhere in that chain is simply omitted, not exposed as an
+// empty string, so scripts can use `if ($env.X)` to detect it's unset.
+func (e CodeExecutor) envAllowlist(rc *engine.RunContext) map[string]string {
 	out := make(map[string]string, len(e.EnvAllowlist))
 	for _, name := range e.EnvAllowlist {
-		if v, ok := os.LookupEnv(name); ok {
+		if v, ok := rc.LookupEnv(name); ok {
 			out[name] = v
 		}
+	}
+	// Anything the operator explicitly stored in the dashboard's Global /
+	// Service Environment is opted in by that very act, so it is visible
+	// to this run's Code nodes without also having to be added to the
+	// fixed process-env allowlist above. Service values override Global
+	// ones (rule 2); another Service's values are never loaded into rc.
+	for k, v := range rc.GlobalEnv {
+		out[k] = v
+	}
+	for k, v := range rc.ServiceEnv {
+		out[k] = v
 	}
 	return out
 }

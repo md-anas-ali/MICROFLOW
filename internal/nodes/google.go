@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -60,12 +59,16 @@ func extractSpreadsheetIDFromURL(rawURL string) string {
 	return rest[:end]
 }
 
-// resolveSpreadsheetID reads GOOGLE_SHEETS_URL and returns the
+// resolveSpreadsheetID reads GOOGLE_SHEETS_URL (via rc's Service
+// Environment > Global Environment > process environment precedence --
+// see engine.RunContext.Env -- so two different MicroFlow Services can
+// point at two entirely different spreadsheets without ever touching
+// the process environment, isolation rule 4/2) and returns the
 // spreadsheet ID to use for every Sheets operation. Returns a clear,
 // actionable error if the variable is missing or doesn't contain a
 // recognizable/valid ID.
-func resolveSpreadsheetID() (string, error) {
-	raw := strings.TrimSpace(os.Getenv("GOOGLE_SHEETS_URL"))
+func resolveSpreadsheetID(rc *engine.RunContext) (string, error) {
+	raw := strings.TrimSpace(rc.Env("GOOGLE_SHEETS_URL"))
 	if raw == "" {
 		return "", errors.New(`GOOGLE_SHEETS_URL is not set -- set it to your Google Sheets URL, e.g. "https://docs.google.com/spreadsheets/d/<ID>/edit?usp=sharing"`)
 	}
@@ -107,21 +110,23 @@ func resolveSpreadsheetID() (string, error) {
 // GOOGLE_OAUTH_CLIENT_ID/SECRET configured on this server) is trivially
 // checked by callers instead of requiring a fake implementation in tests.
 type GoogleAccountResolver interface {
-	Resolve(ctx context.Context, service string) (map[string]string, error)
+	Resolve(ctx context.Context, msvcID, service string) (map[string]string, error)
 }
 
 // resolveGoogleCreds tries the per-node override first (Creds), then
-// falls back to the service's connected account (Accounts, may be nil
-// if Google OAuth isn't configured on this server). Any error is
-// translated so a revoked/expired Google connection never surfaces
-// Google's raw "invalid_grant" to a workflow's execution log.
-func resolveGoogleCreds(ctx context.Context, creds engine.CredentialResolver, accounts GoogleAccountResolver, service, workflowID, nodeName string) (map[string]string, error) {
+// falls back to the connected account for this node's owning MicroFlow
+// Service (Accounts, may be nil if Google OAuth isn't configured on
+// this server) -- never another Service's connected account (isolation
+// rule 4). Any error is translated so a revoked/expired Google
+// connection never surfaces Google's raw "invalid_grant" to a
+// workflow's execution log.
+func resolveGoogleCreds(ctx context.Context, creds engine.CredentialResolver, accounts GoogleAccountResolver, service, msvcID, workflowID, nodeName string) (map[string]string, error) {
 	secrets, err := creds.Resolve(ctx, workflowID, nodeName)
 	if err == nil {
 		return secrets, nil
 	}
 	if accounts != nil {
-		secrets, acctErr := accounts.Resolve(ctx, service)
+		secrets, acctErr := accounts.Resolve(ctx, msvcID, service)
 		if acctErr == nil {
 			return secrets, nil
 		}
@@ -140,12 +145,12 @@ type GoogleSheetsExecutor struct {
 }
 
 func (e *GoogleSheetsExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
-	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ID, node.Name)
+	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ServiceID, rc.Workflow.ID, node.Name)
 	if err != nil {
 		return nil, fmt.Errorf("googleSheets %q: credential error: %w", node.Name, err)
 	}
 	token := creds["accessToken"]
-	spreadsheetID, err := resolveSpreadsheetID()
+	spreadsheetID, err := resolveSpreadsheetID(rc)
 	if err != nil {
 		return nil, fmt.Errorf("googleSheets %q: %w", node.Name, err)
 	}
@@ -230,7 +235,7 @@ type YouTubeExecutor struct {
 }
 
 func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
-	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ID, node.Name)
+	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ServiceID, rc.Workflow.ID, node.Name)
 	if err != nil {
 		return nil, fmt.Errorf("youTube %q: credential error: %w", node.Name, err)
 	}
@@ -311,7 +316,7 @@ type GmailExecutor struct {
 }
 
 func (e *GmailExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
-	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ID, node.Name)
+	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ServiceID, rc.Workflow.ID, node.Name)
 	if err != nil {
 		return nil, fmt.Errorf("gmail %q: credential error: %w", node.Name, err)
 	}
