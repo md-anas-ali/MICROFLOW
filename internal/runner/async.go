@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"microflow/internal/model"
+	"microflow/internal/scheduler"
 )
 
 type EventType string
@@ -77,6 +78,10 @@ var (
 	// evicted (see finishedRetention); callers should fall back to the
 	// durable store for the latter case.
 	ErrExecutionNotFound = errors.New("runner: execution not found")
+	// ErrAlreadyQueued is returned by Start when the same workflow is already
+	// queued or running in the global scheduler -- a Service/Workflow is never
+	// queued or run twice. The API maps it to HTTP 409.
+	ErrAlreadyQueued = errors.New("runner: this workflow is already queued or running")
 )
 
 const (
@@ -225,6 +230,20 @@ type Manager struct {
 	states   map[string]*runState
 	stopping bool
 	all      *broadcaster // process-wide stream for the live executions monitor
+
+	// sched, when set (WithDispatcher), is the ONE global scheduler/queue:
+	// every accepted execution is submitted to it and started only when it
+	// reaches the front (max concurrency 1, cleanup + cooldown between runs,
+	// no duplicate of the same workflow). nil keeps the previous behavior
+	// (each accepted run waits for a worker slot on its own goroutine).
+	sched *scheduler.Scheduler
+}
+
+// WithDispatcher routes every execution this Manager accepts (manual Run and
+// crash recovery) through the global scheduler's single sequential queue.
+func (m *Manager) WithDispatcher(s *scheduler.Scheduler) *Manager {
+	m.sched = s
+	return m
 }
 
 // NewManager wires an async Manager around an existing *Runner (same
@@ -292,8 +311,20 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 		return "", fmt.Errorf("runner: workflow %q has no node named %q", workflowID, startNode)
 	}
 
+	// Claim this workflow's place in the global queue BEFORE creating any
+	// execution state: a workflow that is already queued or running is
+	// refused here, so no duplicate execution row/checkpoint is ever made.
+	var ticket *scheduler.Ticket
+	if m.sched != nil {
+		var terr error
+		if ticket, terr = m.sched.Reserve(wf.ID); terr != nil {
+			return "", ErrAlreadyQueued
+		}
+	}
+
 	if n := atomic.AddInt32(&m.queued, 1); n > m.maxQueued {
 		atomic.AddInt32(&m.queued, -1)
+		ticket.Release()
 		return "", ErrQueueFull
 	}
 
@@ -339,6 +370,7 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 			rs.ex.Error = fmt.Errorf("initial checkpoint: %w", err).Error()
 			rs.mu.Unlock()
 			_ = m.r.Execs.SaveExecution(context.Background(), rs.snapshot())
+			ticket.Release()
 			return "", fmt.Errorf("runner: initial checkpoint: %w", err)
 		}
 	}
@@ -351,9 +383,35 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 	// synchronous scheduler/webhook runs the same way.
 	m.r.markActive(wf.ID)
 
-	go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs, nil)
+	if ticket != nil {
+		withdraw := ticket.Submit("manual", func(context.Context) bool {
+			return m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs, nil)
+		})
+		m.watchQueuedCancel(queueCtx, withdraw, wf, execID, rs)
+	} else {
+		go m.runJob(queueCtx, wf, execID, startNode, mode, seed, rs, nil)
+	}
 
 	return execID, nil
+}
+
+// watchQueuedCancel keeps "cancel while queued" immediate now that queued
+// executions wait in the global scheduler's queue instead of on a semaphore:
+// if queueCtx is cancelled while the job is still waiting, the job is withdrawn
+// from the queue and finished as cancelled right away (the same bookkeeping
+// runJob's own queued-cancel path does). Once the job has been picked up,
+// runJob handles cancellation itself and this goroutine just exits.
+func (m *Manager) watchQueuedCancel(queueCtx context.Context, withdraw func() bool, wf *model.Workflow, execID string, rs *runState) {
+	go func() {
+		<-queueCtx.Done()
+		if !withdraw() {
+			return
+		}
+		m.finishCancelled(execID, rs, "cancelled while queued")
+		atomic.AddInt32(&m.queued, -1)
+		m.r.unmarkActive(wf.ID)
+		rs.cancel()
+	}()
 }
 
 // runJob waits for a worker slot on queueCtx (cancellable via
@@ -372,7 +430,11 @@ func (m *Manager) Start(ctx context.Context, workflowID, startNode, mode string,
 // actually started -- the run itself was healthy and made normal
 // progress, it simply never had a real Timeout's worth of time to
 // work with. The clock now only starts once the run can really begin.
-func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState, resume *model.ExecutionCheckpoint) {
+//
+// Returns true only if the execution actually ran (so the global scheduler
+// applies its cleanup + cooldown); false if it was cancelled while queued or
+// dropped because the server is shutting down.
+func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, startNode, mode string, seed model.NodeOutput, rs *runState, resume *model.ExecutionCheckpoint) bool {
 	defer rs.cancel()
 	defer atomic.AddInt32(&m.queued, -1)
 	defer m.r.unmarkActive(wf.ID)
@@ -381,7 +443,7 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 	case m.sem <- struct{}{}:
 	case <-queueCtx.Done():
 		m.finishCancelled(execID, rs, "cancelled while queued")
-		return
+		return false
 	}
 	defer func() { <-m.sem }()
 
@@ -399,7 +461,7 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 		m.mu.Lock()
 		delete(m.states, execID)
 		m.mu.Unlock()
-		return
+		return false
 	}
 
 	// Re-check: Cancel() may have fired while this job was waiting for
@@ -407,7 +469,7 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 	select {
 	case <-queueCtx.Done():
 		m.finishCancelled(execID, rs, "cancelled while queued")
-		return
+		return false
 	default:
 	}
 
@@ -491,6 +553,7 @@ func (m *Manager) runJob(queueCtx context.Context, wf *model.Workflow, execID, s
 	m.publish(rs, Event{Type: terminalEventFor(status), ExecutionID: execID, Time: time.Now(), Status: status, Error: errMsg})
 	rs.bcast.close()
 	m.scheduleEviction(execID)
+	return true
 }
 
 func (m *Manager) finishCancelled(execID string, rs *runState, reason string) {
@@ -623,8 +686,21 @@ func (m *Manager) recoverOne(ctx context.Context, owner string, cp *model.Execut
 	}
 	m.mu.Unlock()
 
+	// Same rule as Start: the workflow must not already be queued or running.
+	// If it is, leave the checkpoint for a later recovery pass (lease
+	// released) rather than starting a second run of the same workflow.
+	var ticket *scheduler.Ticket
+	if m.sched != nil {
+		var terr error
+		if ticket, terr = m.sched.Reserve(wf.ID); terr != nil {
+			_ = m.r.Recovery.ClearExecutionCheckpointLease(context.Background(), cp.ExecutionID, owner)
+			return nil
+		}
+	}
+
 	if n := atomic.AddInt32(&m.queued, 1); n > m.maxQueued {
 		atomic.AddInt32(&m.queued, -1)
+		ticket.Release()
 		return ErrQueueFull
 	}
 	queueCtx, cancel := context.WithCancel(context.Background())
@@ -634,12 +710,20 @@ func (m *Manager) recoverOne(ctx context.Context, owner string, cp *model.Execut
 		m.mu.Unlock()
 		atomic.AddInt32(&m.queued, -1)
 		cancel()
+		ticket.Release()
 		return errors.New("runner: manager is shutting down")
 	}
 	m.states[cp.ExecutionID] = rs
 	m.mu.Unlock()
 	m.r.markActive(wf.ID)
-	go m.runJob(queueCtx, wf, cp.ExecutionID, "", cp.Mode, nil, rs, cp)
+	if ticket != nil {
+		withdraw := ticket.Submit("recovery", func(context.Context) bool {
+			return m.runJob(queueCtx, wf, cp.ExecutionID, "", cp.Mode, nil, rs, cp)
+		})
+		m.watchQueuedCancel(queueCtx, withdraw, wf, cp.ExecutionID, rs)
+	} else {
+		go m.runJob(queueCtx, wf, cp.ExecutionID, "", cp.Mode, nil, rs, cp)
+	}
 	log.Printf("recovery: execution=%s resumed from step=%d status=%s", cp.ExecutionID, cp.State.Steps, cp.State.Status)
 	return nil
 }

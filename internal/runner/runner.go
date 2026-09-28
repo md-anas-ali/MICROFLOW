@@ -110,6 +110,12 @@ type Runner struct {
 	// resume or fail-and-delete an execution that is still running.
 	liveExecMu sync.Mutex
 	liveExecs  map[string]struct{}
+
+	// scratchWG counts scratch-directory removals still in flight (they are
+	// deleted in the background so a run's result is never delayed), so the
+	// global scheduler's between-run cleanup can wait for them (see
+	// WaitScratchCleanup) before the next Service starts.
+	scratchWG sync.WaitGroup
 }
 
 func (r *Runner) markExecutionLive(execID string) {
@@ -457,7 +463,7 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 			}
 		}
 	}
-	cleanupScratch(scratchDir)
+	r.cleanupScratch(scratchDir)
 
 	return ex, runErr
 }
@@ -519,8 +525,26 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-func cleanupScratch(dir string) {
+func (r *Runner) cleanupScratch(dir string) {
+	r.scratchWG.Add(1)
 	go func() {
+		defer r.scratchWG.Done()
 		_ = os.RemoveAll(dir)
 	}()
+}
+
+// WaitScratchCleanup blocks until every scratch directory removal started by a
+// finished run has completed, or ctx ends. Only directories of executions that
+// already finished are ever removed (never a live or checkpoint-recoverable
+// one), so this is the safe part of "clean temporary resources between runs".
+func (r *Runner) WaitScratchCleanup(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		r.scratchWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
