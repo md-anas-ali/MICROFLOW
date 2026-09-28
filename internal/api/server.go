@@ -552,6 +552,12 @@ func (s *Server) handleExecuteAsync(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, err)
 			return
 		}
+		if errors.Is(err, runner.ErrAlreadyQueued) {
+			// 409: the global scheduler never queues/runs the same
+			// workflow twice; the earlier run is left untouched.
+			writeErr(w, http.StatusConflict, err)
+			return
+		}
 		// Everything else Manager.Start can return (workflow not found,
 		// no trigger/startNode, unknown startNode) is a client error
 		// about this specific request, not a server failure.
