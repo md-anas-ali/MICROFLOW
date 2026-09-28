@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -180,6 +181,46 @@ func (rc *RunContext) LookupEnv(key string) (string, bool) {
 	return os.LookupEnv(key)
 }
 
+// ProcessEnv returns the complete merged environment for a child
+// process started on behalf of this run, in os/exec "KEY=VALUE" form:
+// the host/Render process environment, overlaid by the Global
+// Environment, overlaid by this run's own Service Environment (same
+// precedence as Env/LookupEnv: Service > Global > host). It only ever
+// reads rc.ServiceEnv/rc.GlobalEnv, which the runner loaded for this
+// run's own Service, so another Service's variables can never appear.
+// extra ("KEY=VALUE" pairs such as MICROFLOW_OPERATION_ID) are applied
+// last and win. Malformed names (empty, or containing '=' or NUL) are
+// skipped instead of corrupting the child's environment block.
+func (rc *RunContext) ProcessEnv(extra ...string) []string {
+	host := os.Environ()
+	merged := make(map[string]string, len(host)+len(rc.GlobalEnv)+len(rc.ServiceEnv)+len(extra))
+	for _, kv := range host {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			merged[kv[:i]] = kv[i+1:]
+		}
+	}
+	overlay := func(m map[string]string) {
+		for k, v := range m {
+			if k == "" || strings.ContainsAny(k, "=\x00") || strings.IndexByte(v, 0) >= 0 {
+				continue
+			}
+			merged[k] = v
+		}
+	}
+	overlay(rc.GlobalEnv)
+	overlay(rc.ServiceEnv)
+	for _, kv := range extra {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			merged[kv[:i]] = kv[i+1:]
+		}
+	}
+	out := make([]string, 0, len(merged))
+	for k, v := range merged {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
 func (rc *RunContext) appendNodeRun(result model.NodeRunResult) {
 	limit := rc.NodeRunCap
 	if limit <= 0 {
@@ -237,6 +278,9 @@ func (rc *RunContext) ExprContext(currentJSON map[string]any) expr.Context {
 			"id":   rc.Execution.ID,
 			"mode": rc.Execution.Mode,
 		},
+		// {{ $env.X }} resolves through the same Service > Global > host
+		// chain as every other environment lookup in this run.
+		Env: rc.Env,
 	}
 }
 
