@@ -75,8 +75,17 @@ type Connection struct {
 
 // Workflow is the full, parsed, executable representation of a workflow.
 type Workflow struct {
-	ID          string                  `json:"id"`
-	Name        string                  `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// ServiceID scopes this workflow to one logical Service (tenant)
+	// inside a MicroFlow deployment -- see package tenant. Every
+	// workflow belongs to exactly one Service; workflows in different
+	// Services never share credentials, environment overrides,
+	// execution context, or scratch data (isolation rule 4). Existing
+	// installs predating Services have every workflow backfilled to
+	// the auto-created "default" Service (see store schema migration),
+	// so old deployments keep working unchanged (rule 14).
+	ServiceID   string                  `json:"serviceId"`
 	Active      bool                    `json:"active"`
 	Nodes       map[string]*Node        `json:"nodes"`       // keyed by Name (n8n connections reference nodes by name)
 	Connections map[string][]Connection `json:"connections"` // keyed by SourceName
@@ -156,8 +165,14 @@ type NodeRunResult struct {
 
 // Execution is one run of a workflow, start to finish (or to error/cancel).
 type Execution struct {
-	ID         string          `json:"id"`
-	WorkflowID string          `json:"workflowId"`
+	ID         string `json:"id"`
+	WorkflowID string `json:"workflowId"`
+	// ServiceID mirrors the owning workflow's ServiceID at the time the
+	// execution was created, denormalized so execution history/listing
+	// can be filtered per-Service without a join, and so it survives a
+	// workflow being renamed/reassigned later (it never is today, but
+	// this keeps history honest either way).
+	ServiceID  string          `json:"serviceId,omitempty"`
 	Mode       string          `json:"mode"` // manual | schedule | webhook | error
 	Status     ExecutionStatus `json:"status"`
 	StartedAt  time.Time       `json:"startedAt"`
