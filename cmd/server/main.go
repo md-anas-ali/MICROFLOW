@@ -35,6 +35,7 @@ import (
 	"microflow/internal/engine"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
+	"microflow/internal/runall"
 	"microflow/internal/runner"
 	"microflow/internal/scheduler"
 	"microflow/internal/store"
@@ -161,6 +162,11 @@ func main() {
 	// internal/vault/central.go); st satisfies vault.AccountStore the
 	// same way it already satisfies vault.Store.
 	accountVault := baseVault.NewAccountVault(st)
+	// envVault backs Global Environment / Service Environment: AEAD-encrypted
+	// (same master key) app-level configuration that replaces setting every
+	// common variable in the hosting dashboard, with precedence Service >
+	// Global > process environment (see engine.RunContext.Env).
+	envVault := baseVault.NewEnvVault(st)
 
 	// creds is what every node executor actually calls: it tries a
 	// per-node/per-workflow override first (OAuthResolver, unchanged
@@ -172,8 +178,16 @@ func main() {
 	// to the node; plain API-key credentials (no refreshToken) pass
 	// through unchanged.
 	perNodeCreds := vault.NewOAuthResolver(baseVault)
-	accountCreds := vault.NewAccountResolver(accountVault, vault.CentralGoogleAccount)
-	creds := vault.NewCentralFallbackResolver(perNodeCreds, accountCreds)
+	// Per-node overrides are keyed by workflow id, so they are already
+	// isolated per Service. The legacy single central Google account is
+	// deliberately NOT chained in here any more (it used to be, via
+	// CentralFallbackResolver): that fallback had no notion of which
+	// Service a workflow belongs to and would have handed one shared
+	// account to every Service. Google nodes now get their account only
+	// via googleAccounts below, which is Service-scoped and keeps the
+	// legacy account as a fallback for the Default Service alone, so an
+	// existing single-Service deployment behaves exactly as before.
+	creds := perNodeCreds
 	// googleAccounts backs the new n8n-style "Connect with Google" flow:
 	// one connected account PER SERVICE (Gmail/YouTube/Sheets), each
 	// independently connect/reconnect/disconnect-able, falling back to
@@ -312,6 +326,7 @@ func main() {
 		WithRecovery(st).
 		WithMemGuard(memGuard).
 		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12)).
+		WithEnv(envVault).
 		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
 
 	// Async execution (spec sections M/N): bounded worker pool on top
@@ -336,6 +351,12 @@ func main() {
 	)
 	execManager.StartRecoveryLoop(ctx)
 
+	// Run Service / Run All Services: durable, strictly sequential sweeps
+	// through the same Runner. Resume picks up a sweep interrupted by a
+	// restart from its last persisted step (no duplicate re-runs).
+	runAllManager := runall.NewManager(st, run)
+	runAllManager.Resume(ctx)
+
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
 	// (not the OAuthResolver) is passed so per-node credential writes go
 	// through the same Put path cmd/setcred uses -- no token refresh
@@ -344,7 +365,7 @@ func main() {
 	// satisfies api.ExecutionLoader (GetExecution) -- the durable
 	// fallback for GET /api/executions/{id} once execManager evicts a
 	// finished execution from memory.
-	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st)
+	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager)
 
 	// "Connect with Google" (n8n-style OAuth Authorization Code flow)
 	// only turns on if a Google Cloud OAuth client is configured -- see
@@ -353,7 +374,22 @@ func main() {
 	// fine; only the "Connect Google" buttons are unavailable, and the
 	// legacy manual clientId/clientSecret/refreshToken paste (cmd/setcred
 	// or the central credentials endpoint) still works as a fallback.
-	if oauthApp, ok := vault.GoogleOAuthAppFromEnv(os.Getenv); ok {
+	// GOOGLE_OAUTH_* may live in the Global Environment (dashboard) instead
+	// of the hosting provider's env vars; Global wins over process env.
+	// Read once at startup because the OAuth routes are registered once.
+	globalEnvAtBoot := map[string]string{}
+	if _, g, err := envVault.ResolveAll(ctx, ""); err == nil {
+		globalEnvAtBoot = g
+	} else {
+		log.Printf("warning: could not read Global Environment at startup: %v", err)
+	}
+	configGetenv := func(k string) string {
+		if v, ok := globalEnvAtBoot[k]; ok {
+			return v
+		}
+		return os.Getenv(k)
+	}
+	if oauthApp, ok := vault.GoogleOAuthAppFromEnv(configGetenv); ok {
 		apiServer.EnableGoogleOAuth(oauthApp, googleAccounts)
 		log.Printf("Google OAuth configured -- \"Connect with Google\" is enabled for Gmail/YouTube/Sheets")
 	} else {
