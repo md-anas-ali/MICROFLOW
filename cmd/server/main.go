@@ -406,35 +406,47 @@ func main() {
 	// finished execution from memory.
 	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword)
 
-	// "Connect with Google" (n8n-style OAuth Authorization Code flow)
-	// only turns on if a Google Cloud OAuth client is configured -- see
-	// the GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URL doc comment in
-	// vault.GoogleOAuthAppFromEnv. Without it, the server still runs
-	// fine; only the "Connect Google" buttons are unavailable, and the
-	// legacy manual clientId/clientSecret/refreshToken paste (cmd/setcred
-	// or the central credentials endpoint) still works as a fallback.
-	// GOOGLE_OAUTH_* may live in the Global Environment (dashboard) instead
-	// of the hosting provider's env vars; Global wins over process env.
-	// Read once at startup because the OAuth routes are registered once.
-	globalEnvAtBoot := map[string]string{}
-	if _, g, err := envVault.ResolveAll(ctx, ""); err == nil {
-		globalEnvAtBoot = g
-	} else {
-		log.Printf("warning: could not read Global Environment at startup: %v", err)
-	}
-	configGetenv := func(k string) string {
-		if v, ok := globalEnvAtBoot[k]; ok {
-			return v
+	// "Connect with Google" (n8n-style OAuth Authorization Code flow) is
+	// always available and fully automatic: GOOGLE_OAUTH_CLIENT_ID /
+	// GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URL are resolved
+	// on every request, each key independently, from the merged
+	// Environment of the Service involved -- Service Environment first,
+	// then Global Environment, then the host/Render environment (the same
+	// precedence every node uses). So the three values may be split across
+	// those places in any combination, and adding or changing one takes
+	// effect immediately with no restart. The legacy manual
+	// clientId/clientSecret/refreshToken paste (cmd/setcred or the central
+	// credentials endpoint) still works as before.
+	oauthEnvKeys := []string{"GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URL"}
+	apiServer.EnableGoogleOAuthResolver(func(rctx context.Context, serviceID string) (*vault.GoogleOAuthApp, error) {
+		serviceEnv, globalEnv, err := envVault.ResolveAll(rctx, serviceID)
+		if err != nil {
+			// Never fail the connect flow just because the dashboard
+			// Environment could not be read: fall back to the host env.
+			log.Printf("warning: could not read Environment for google oauth (service=%q): %v", serviceID, err)
+			serviceEnv, globalEnv = nil, nil
 		}
-		return os.Getenv(k)
-	}
-	if oauthApp, ok := vault.GoogleOAuthAppFromEnv(configGetenv); ok {
-		apiServer.EnableGoogleOAuth(oauthApp, googleAccounts)
-		log.Printf("Google OAuth configured -- \"Connect with Google\" is enabled for Gmail/YouTube/Sheets")
-	} else {
-		log.Printf("warning: GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/GOOGLE_OAUTH_REDIRECT_URL not fully set -- " +
-			"\"Connect with Google\" buttons are disabled; existing manual credential paste still works")
-	}
+		// Per key: first non-empty of Service > Global > host.
+		get := func(k string) string {
+			if v := strings.TrimSpace(serviceEnv[k]); v != "" {
+				return v
+			}
+			if v := strings.TrimSpace(globalEnv[k]); v != "" {
+				return v
+			}
+			return os.Getenv(k)
+		}
+		if app, ok := vault.GoogleOAuthAppFromEnv(get); ok {
+			return app, nil
+		}
+		var missing []string
+		for _, k := range oauthEnvKeys {
+			if strings.TrimSpace(get(k)) == "" {
+				missing = append(missing, k)
+			}
+		}
+		return nil, fmt.Errorf("google oauth is not configured -- missing %s (set in Service Environment, Global Environment, or host environment)", strings.Join(missing, ", "))
+	}, googleAccounts)
 
 	whServer := webhook.NewServer()
 	webhookToken := envOr("MICROFLOW_WEBHOOK_TOKEN", "")
