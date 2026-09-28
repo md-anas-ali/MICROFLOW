@@ -2,6 +2,12 @@
 // Redis/Kafka needed). It wakes once a minute, on the minute (stdlib
 // time.Timer, no busy-loop -- rule 20), checks which schedules are due, and hands
 // matching workflow+node pairs to a Runner callback.
+//
+// It is also the ONE global execution gate (see queue.go): due schedules are
+// not run directly but appended to a single FIFO queue that one worker drains
+// strictly one job at a time (max concurrency 1), with cleanup and a cooldown
+// after every job. Manual runs, webhook runs, Run Service/Run All steps and
+// crash recovery submit to the same queue.
 package scheduler
 
 import (
@@ -38,17 +44,11 @@ type Scheduler struct {
 	run       Runner
 	lastRun   map[string]time.Time
 
-	// inFlight guards against overlapping runs of the *same* schedule: if
-	// a Schedule Trigger's workflow (e.g. a multi-minute FFmpeg render
-	// pipeline) is still running when the next minute-tick sees it's due
-	// again, we skip that tick rather than stacking another concurrent
-	// run on top (rule 20: bounded concurrency -- this was previously
-	// unbounded, since every due tick unconditionally spawned a new
-	// goroutine regardless of whether the prior run for that schedule had
-	// finished). The existing run is never interrupted; we only decline
-	// to start a second one until the first returns.
-	inFlightMu sync.Mutex
-	inFlight   map[string]bool
+	// The global queue/worker state (queue, keys, cooldown, cleanup hook)
+	// lives in queue.go. Overlap protection is now the queue's per-workflow
+	// key: a workflow that is already queued or running is never queued a
+	// second time, and the running one is never interrupted.
+	*gq
 
 	// location is the timezone used to evaluate a CronExpr's minute/hour/
 	// weekday fields (e.g. "0 19 * * *" means 19:00 in this zone). Defaults
@@ -62,7 +62,7 @@ type Scheduler struct {
 }
 
 func New(run Runner) *Scheduler {
-	return &Scheduler{run: run, lastRun: map[string]time.Time{}, inFlight: map[string]bool{}, location: time.UTC}
+	return &Scheduler{run: run, lastRun: map[string]time.Time{}, location: time.UTC, gq: newGQ()}
 }
 
 // SetLocation sets the timezone future cron-field matching uses. Safe to
@@ -100,9 +100,9 @@ func (s *Scheduler) Load(schedules []Schedule) {
 // running scheduler reflects the persisted definition without a
 // restart. Because the workflow's old entries are dropped before the new
 // ones are added, the same schedule can never be registered twice.
-// lastRun is keyed by schedule ID and inFlight by workflow/node, and both
-// are deliberately kept, so an in-progress run still blocks an overlapping
-// tick (overlap protection is unchanged). An interval schedule that is newly enabled, or whose
+// lastRun is keyed by schedule ID and is deliberately kept, and the global
+// queue's per-workflow key is untouched, so a queued or in-progress run
+// still blocks an overlapping tick. An interval schedule that is newly enabled, or whose
 // interval changed, starts counting from now instead of firing on the
 // next tick.
 func (s *Scheduler) ReplaceWorkflow(workflowID string, schedules []Schedule) {
@@ -156,6 +156,7 @@ func (s *Scheduler) ReplaceWorkflow(workflowID string, schedules []Schedule) {
 // One-minute resolution is inherent: an interval under 60s fires at most
 // once a minute.
 func (s *Scheduler) Start(ctx context.Context) {
+	s.setContext(ctx)
 	s.tick(ctx, time.Now()) // catch a cron minute that is already current at startup
 	for {
 		now := time.Now()
@@ -202,31 +203,46 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 			// instead of accumulating the tick's sub-second offset.
 			s.lastRun[sc.ID] = minute
 
-			// Overlap protection is per Schedule Trigger node, not per rule:
-			// a node with several rules must still never run twice at once.
-			key := sc.WorkflowID + "/" + sc.NodeName
-			s.inFlightMu.Lock()
-			if s.inFlight[key] {
-				s.inFlightMu.Unlock()
-				log.Printf("scheduler: %s/%s still running from a previous tick, skipping this one", sc.WorkflowID, sc.NodeName)
-				continue
+			// The Schedule Trigger node never starts a run itself: it only
+			// says WHEN its workflow is due. The run is appended to the one
+			// global queue (keyed by workflow, so a workflow that is already
+			// queued or running is skipped, never doubled up), and the single
+			// queue worker executes it when every earlier job has finished.
+			if err := s.Enqueue(sc.WorkflowID, "schedule", s.scheduledJob(sc)); err != nil {
+				log.Printf("scheduler: %s/%s is due but %v, skipping this tick", sc.WorkflowID, sc.NodeName, err)
 			}
-			s.inFlight[key] = true
-			s.inFlightMu.Unlock()
-
-			go func(sc Schedule, key string) {
-				defer func() {
-					s.inFlightMu.Lock()
-					delete(s.inFlight, key)
-					s.inFlightMu.Unlock()
-					if r := recover(); r != nil {
-						log.Printf("scheduler: run for %s/%s panicked: %v", sc.WorkflowID, sc.NodeName, r)
-					}
-				}()
-				s.run(ctx, sc.WorkflowID, sc.NodeName)
-			}(sc, key)
 		}
 	}
+}
+
+// scheduledJob wraps one due schedule as a queue job. Re-checks, at the
+// moment the job reaches the front of the queue, that the schedule is still
+// enabled (workflow still active, trigger not disabled): a Service
+// deactivated while its run waited in line is dropped, not run. Returns
+// false (no cleanup/cooldown) whenever it did not actually run anything.
+func (s *Scheduler) scheduledJob(sc Schedule) func(ctx context.Context) bool {
+	return func(ctx context.Context) bool {
+		if ctx.Err() != nil {
+			return false // shutting down: never start new scheduled work
+		}
+		if !s.stillEnabled(sc.ID) {
+			log.Printf("scheduler: %s/%s was deactivated while queued, not running it", sc.WorkflowID, sc.NodeName)
+			return false
+		}
+		s.run(ctx, sc.WorkflowID, sc.NodeName)
+		return true
+	}
+}
+
+func (s *Scheduler) stillEnabled(scheduleID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sc := range s.schedules {
+		if sc.ID == scheduleID {
+			return sc.Enabled
+		}
+	}
+	return false
 }
 
 // cronMatches implements standard 5-field cron (minute hour day month
