@@ -384,7 +384,7 @@ func (e CodeExecutor) newHTTPRequestHelper(ctx context.Context, rc *engine.RunCo
 		if err != nil {
 			fail("invalid request")
 		}
-		req.Header.Set("User-Agent", defaultUserAgent())
+		req.Header.Set("User-Agent", defaultUserAgent(rc))
 		if headers, ok := opts["headers"].(map[string]any); ok {
 			for k, v := range headers {
 				req.Header.Set(k, fmt.Sprintf("%v", v))

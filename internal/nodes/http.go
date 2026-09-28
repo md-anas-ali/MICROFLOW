@@ -57,8 +57,16 @@ const maxResponseBytes = 25 * 1024 * 1024 // 25MB cap so one response can't blow
 // client/1.1") does not satisfy that. Operators can override this via
 // MICROFLOW_USER_AGENT (e.g. to include their own contact email/URL, as
 // Wikimedia's policy specifically asks for) without a code change.
-func defaultUserAgent() string {
-	if v := os.Getenv("MICROFLOW_USER_AGENT"); v != "" {
+func defaultUserAgent(rc *engine.RunContext) string {
+	// Resolved through the run's merged Environment (Service > Global >
+	// host), so it works wherever the operator set it.
+	var v string
+	if rc != nil {
+		v = rc.Env("MICROFLOW_USER_AGENT")
+	} else {
+		v = os.Getenv("MICROFLOW_USER_AGENT")
+	}
+	if v != "" {
 		return v
 	}
 	return "MicroFlow-Workflow-Automation/1.0 (+https://github.com/microflow/microflow; contact: set MICROFLOW_USER_AGENT to your own contact info)"
@@ -204,7 +212,7 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 			<-rc.HeavyWorkGate
 			return nil, err
 		}
-		req.Header.Set("User-Agent", defaultUserAgent())
+		req.Header.Set("User-Agent", defaultUserAgent(rc))
 		// Stable per-node operation ID: providers that support idempotency can
 		// reconcile a retried request after a process crash. The custom header
 		// is harmless for APIs that ignore it; it does not claim exactly-once
