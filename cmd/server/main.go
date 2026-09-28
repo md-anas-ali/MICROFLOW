@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -237,30 +238,32 @@ func main() {
 		"CLOUDFLARE_ACCOUNT_ID",
 	}
 
-	registry := nodes.DefaultRegistry(nodes.Deps{
-		// MaxIdleConnsPerHost/MaxIdleConns kept small on purpose: this
-		// process only ever runs one workflow with one heavy call in
-		// flight at a time (MaxConcurrentHeavy below), so a large idle
-		// keep-alive pool just holds buffers for connections that will
-		// never be reused concurrently. IdleConnTimeout releases them
-		// quickly instead of holding sockets/buffers open between the
-		// workflow's ~85s of paced Wait/cooldown gaps.
-		HTTPClient: &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        4,
-				MaxIdleConnsPerHost: 2,
-				IdleConnTimeout:     20 * time.Second,
-				// DialContext enforces the actual SSRF boundary
-				// (resolve-once-then-dial-that-IP) for every
-				// httpRequest node call -- see
-				// nodes.SafeDialContext's doc comment for why this,
-				// not a second hostname check in guardSSRF, is where
-				// hostname-based private-address blocking has to
-				// live to avoid a DNS-rebinding gap.
-				DialContext: nodes.SafeDialContext,
-			},
+	// MaxIdleConnsPerHost/MaxIdleConns kept small on purpose: this
+	// process only ever runs one workflow with one heavy call in
+	// flight at a time (MaxConcurrentHeavy below), so a large idle
+	// keep-alive pool just holds buffers for connections that will
+	// never be reused concurrently. IdleConnTimeout releases them
+	// quickly instead of holding sockets/buffers open between the
+	// workflow's ~85s of paced Wait/cooldown gaps.
+	nodeHTTPClient := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        4,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     20 * time.Second,
+			// DialContext enforces the actual SSRF boundary
+			// (resolve-once-then-dial-that-IP) for every
+			// httpRequest node call -- see
+			// nodes.SafeDialContext's doc comment for why this,
+			// not a second hostname check in guardSSRF, is where
+			// hostname-based private-address blocking has to
+			// live to avoid a DNS-rebinding gap.
+			DialContext: nodes.SafeDialContext,
 		},
+	}
+
+	registry := nodes.DefaultRegistry(nodes.Deps{
+		HTTPClient: nodeHTTPClient,
 		AllowedBinaries: allowedBinaries,
 		EnvAllowlist:    codeEnvAllowlist,
 		ScratchRoot:     scratchRoot,
@@ -329,6 +332,42 @@ func main() {
 		WithEnv(envVault).
 		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
 
+	// Global Scheduler: the ONLY thing that starts scheduled executions, and
+	// the one sequential queue (max concurrency 1) every run path goes
+	// through -- due Schedule Triggers, manual Run, webhooks, Run Service /
+	// Run All steps and crash recovery. A Schedule Trigger node never starts
+	// a run on its own; it only tells this scheduler when its workflow is due.
+	sch := scheduler.New(func(ctx context.Context, workflowID, nodeName string) {
+		seed := model.NodeOutput{{{JSON: map[string]any{"triggeredAt": time.Now().Format(time.RFC3339)}}}}
+		// Scheduler jobs are server-owned work, not HTTP-request work. Do not
+		// cancel an already-running scheduled execution merely because the
+		// scheduler loop's shutdown context was cancelled; its durable
+		// checkpoint must survive a graceful process exit for automatic restart
+		// recovery. The process itself is still allowed to exit normally.
+		runCtx := context.WithoutCancel(ctx)
+		ex, runErr := run.RunFromNode(runCtx, workflowID, nodeName, "schedule", seed)
+		if runErr != nil {
+			log.Printf("schedule run %s/%s failed: %v", workflowID, nodeName, runErr)
+			return
+		}
+		log.Printf("schedule run %s/%s finished: %s (execution %s)", workflowID, nodeName, ex.Status, ex.ID)
+	})
+	sch.SetLocation(schedulerLocation())
+	// Settling gap after every finished workflow, before the next queued
+	// Service starts. SERVICE_COOLDOWN_SECONDS=0 disables it.
+	serviceCooldown := time.Duration(envInt("SERVICE_COOLDOWN_SECONDS", 10)) * time.Second
+	sch.SetCooldown(serviceCooldown)
+	// Runs after EVERY workflow (success, error, cancelled or panic) and before
+	// the cooldown: wait for finished runs' scratch directories to be removed,
+	// drop idle keep-alive connections, and hand freed heap back to the OS.
+	sch.SetCleanup(func(ctx context.Context) {
+		run.WaitScratchCleanup(ctx)
+		nodeHTTPClient.CloseIdleConnections()
+		http.DefaultClient.CloseIdleConnections()
+		debug.FreeOSMemory()
+	})
+	log.Printf("global scheduler: sequential queue, max concurrency 1, service cooldown %s", serviceCooldown)
+
 	// Async execution (spec sections M/N): bounded worker pool on top
 	// of the same Runner -- MaxConcurrentExecutions caps simultaneous
 	// full workflow runs (independent of, and in addition to,
@@ -348,13 +387,13 @@ func main() {
 	execManager := runner.NewManager(run,
 		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
 		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 2),
-	)
+	).WithDispatcher(sch)
 	execManager.StartRecoveryLoop(ctx)
 
 	// Run Service / Run All Services: durable, strictly sequential sweeps
 	// through the same Runner. Resume picks up a sweep interrupted by a
 	// restart from its last persisted step (no duplicate re-runs).
-	runAllManager := runall.NewManager(st, run)
+	runAllManager := runall.NewManager(st, queuedRunner{sch: sch, run: run})
 	runAllManager.Resume(ctx)
 
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
@@ -423,28 +462,12 @@ func main() {
 			case model.TypeScheduleTrigger:
 				schedules = append(schedules, schedulesFromNode(wf.ID, name, n, wf.Active)...)
 			case model.TypeWebhookTrigger:
-				registerWebhookRoute(whServer, webhookToken, run, wf.ID, name, n)
+				registerWebhookRoute(whServer, webhookToken, run, sch, wf.ID, name, n)
 			}
 		}
 	}
 	log.Printf("startup: registered %d schedule(s) across %d workflow(s)", len(schedules), len(workflows))
 
-	sch := scheduler.New(func(ctx context.Context, workflowID, nodeName string) {
-		seed := model.NodeOutput{{{JSON: map[string]any{"triggeredAt": time.Now().Format(time.RFC3339)}}}}
-		// Scheduler jobs are server-owned work, not HTTP-request work. Do not
-		// cancel an already-running scheduled execution merely because the
-		// scheduler loop's shutdown context was cancelled; its durable
-		// checkpoint must survive a graceful process exit for automatic restart
-		// recovery. The process itself is still allowed to exit normally.
-		runCtx := context.WithoutCancel(ctx)
-		ex, runErr := run.RunFromNode(runCtx, workflowID, nodeName, "schedule", seed)
-		if runErr != nil {
-			log.Printf("schedule run %s/%s failed: %v", workflowID, nodeName, runErr)
-			return
-		}
-		log.Printf("schedule run %s/%s finished: %s (execution %s)", workflowID, nodeName, ex.Status, ex.ID)
-	})
-	sch.SetLocation(schedulerLocation())
 	sch.Load(schedules)
 	go sch.Start(ctx)
 
@@ -602,10 +625,33 @@ func intOr(v any, def int) int {
 	return def
 }
 
+// queuedRunner adapts *runner.Runner to runall.WorkflowRunner so every Run
+// Service / Run All step is submitted to the global scheduler's queue and runs
+// only when it reaches the front (max concurrency 1, cleanup + cooldown between
+// steps). runall itself is unchanged: it still calls RunFromNode per workflow.
+type queuedRunner struct {
+	sch *scheduler.Scheduler
+	run *runner.Runner
+}
+
+func (q queuedRunner) RunFromNode(ctx context.Context, workflowID, startNode, mode string, seed model.NodeOutput) (*model.Execution, error) {
+	var ex *model.Execution
+	var runErr error
+	if err := q.sch.RunSync(ctx, workflowID, mode, func(jobCtx context.Context) {
+		ex, runErr = q.run.RunFromNode(jobCtx, workflowID, startNode, mode, seed)
+	}); err != nil {
+		return nil, fmt.Errorf("workflow %q was not run: %w", workflowID, err)
+	}
+	if ex == nil && runErr == nil {
+		runErr = fmt.Errorf("workflow %q run ended without a result", workflowID)
+	}
+	return ex, runErr
+}
+
 // registerWebhookRoute wires a Webhook Trigger node's configured path to
 // the runner. Path defaults to /webhook/<workflowId>/<nodeName> if the
 // node didn't set an explicit "path" parameter.
-func registerWebhookRoute(whServer *webhook.Server, token string, run *runner.Runner, workflowID, nodeName string, n *model.Node) {
+func registerWebhookRoute(whServer *webhook.Server, token string, run *runner.Runner, sch *scheduler.Scheduler, workflowID, nodeName string, n *model.Node) {
 	path := n.ParamString("path", "")
 	if path == "" {
 		path = fmt.Sprintf("/webhook/%s/%s", workflowID, nodeName)
@@ -620,11 +666,30 @@ func registerWebhookRoute(whServer *webhook.Server, token string, run *runner.Ru
 			"body":    body,
 		}
 		seed := model.NodeOutput{{{JSON: seedJSON}}}
-		ex, runErr := run.RunFromNode(context.Background(), workflowID, nodeName, "webhook", seed)
-		if runErr != nil {
-			return http.StatusInternalServerError, map[string]string{"error": runErr.Error(), "executionId": ex.ID}
+		// Webhook runs go through the same global queue as everything else
+		// (max concurrency 1, cleanup + cooldown between runs); the request
+		// waits for its turn and for the run to finish, as it did before.
+		var ex *model.Execution
+		var runErr error
+		if qErr := sch.RunSync(context.Background(), workflowID, "webhook", func(jobCtx context.Context) {
+			ex, runErr = run.RunFromNode(jobCtx, workflowID, nodeName, "webhook", seed)
+		}); qErr != nil {
+			if errors.Is(qErr, scheduler.ErrDuplicate) {
+				return http.StatusConflict, map[string]string{"error": qErr.Error()}
+			}
+			return http.StatusInternalServerError, map[string]string{"error": qErr.Error()}
 		}
-		return http.StatusOK, map[string]string{"status": string(ex.Status), "executionId": ex.ID}
+		execID := ""
+		if ex != nil {
+			execID = ex.ID
+		}
+		if runErr != nil {
+			return http.StatusInternalServerError, map[string]string{"error": runErr.Error(), "executionId": execID}
+		}
+		if ex == nil {
+			return http.StatusInternalServerError, map[string]string{"error": "workflow run ended without a result"}
+		}
+		return http.StatusOK, map[string]string{"status": string(ex.Status), "executionId": execID}
 	})
 	log.Printf("registered webhook route %s -> %s/%s", path, workflowID, nodeName)
 }
