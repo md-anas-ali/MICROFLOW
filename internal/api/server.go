@@ -20,8 +20,10 @@ import (
 	"microflow/internal/model"
 	"microflow/internal/parser"
 	"microflow/internal/report"
+	"microflow/internal/runall"
 	"microflow/internal/runner"
 	"microflow/internal/store"
+	"microflow/internal/tenant"
 	"microflow/internal/vault"
 )
 
@@ -101,6 +103,100 @@ type Server struct {
 	// definition).
 	persistMu         sync.Mutex
 	onWorkflowChanged func(workflowID string, wf *model.Workflow)
+
+	// services/envVault/runAll back Service (tenant) management, Global/
+	// Service Environment, and Run All Services -- all nil-safe like
+	// accounts/manager above: a Server built with plain New() (every
+	// existing test helper) simply doesn't expose these routes/behaviors,
+	// so nothing that predates this feature breaks. Wired via WithTenancy.
+	services ServiceStore
+	envVault EnvResolver
+	runAll   RunAllController
+}
+
+// ServiceStore is the persistence interface Service (tenant) management
+// needs; internal/store's Postgres implementation satisfies it.
+type ServiceStore interface {
+	CreateService(ctx context.Context, svc *tenant.Service) error
+	GetService(ctx context.Context, id string) (*tenant.Service, error)
+	ListServices(ctx context.Context) ([]*tenant.Service, error)
+	RenameService(ctx context.Context, id, name string) error
+	DeleteService(ctx context.Context, id string) error
+	CountWorkflowsInService(ctx context.Context, id string) (int, error)
+	ListWorkflowsByService(ctx context.Context, serviceID string) ([]*model.Workflow, error)
+	ListExecutionsByService(ctx context.Context, serviceID string, limit int) ([]*model.Execution, error)
+
+	ListGlobalEnv(ctx context.Context) ([]store.EnvInfo, error)
+	ListServiceEnv(ctx context.Context, serviceID string) ([]store.EnvInfo, error)
+}
+
+// EnvResolver is the write side of Global/Service Environment (the read
+// side, for execution, lives entirely in runner/engine -- this package
+// only ever writes/deletes, never decrypts a value back out over HTTP,
+// rule 13). Implemented by *vault.EnvVault.
+type EnvResolver interface {
+	PutGlobal(ctx context.Context, key, value string, isSecret bool) error
+	DeleteGlobal(ctx context.Context, key string) error
+	PutService(ctx context.Context, serviceID, key, value string, isSecret bool) error
+	DeleteService(ctx context.Context, serviceID, key string) error
+}
+
+// RunAllController is what the Run Service / Run All Services endpoints
+// call; implemented by *runall.Manager. A separate small interface (not
+// a direct *runall.Manager field) so this package never imports
+// runall's persistence/runner internals, matching the Manager/execLoader
+// pattern above.
+type RunAllController interface {
+	StartAll(ctx context.Context, stopOnFailure bool) (jobID string, err error)
+	StartOne(ctx context.Context, serviceID string, stopOnFailure bool) (jobID string, err error)
+	Status(ctx context.Context) (*runall.Status, error)
+	Cancel(ctx context.Context) error
+}
+
+// WithTenancy enables Service (tenant) management, Global/Service
+// Environment, and Run All Services. Nil-safe like WithAsync: without
+// it (every existing test helper) the handlers behave exactly as
+// before -- no /api/services/* routes are registered at all.
+func (s *Server) WithTenancy(services ServiceStore, env EnvResolver, runAll RunAllController) *Server {
+	s.services = services
+	s.envVault = env
+	s.runAll = runAll
+	s.routesTenancy()
+	return s
+}
+
+// authorizeWorkflowService enforces isolation rule 13 ("URL/API
+// parameter পরিবর্তন করে অন্য Service-এর workflow ... access করতে না
+// পারে") for the pre-existing, non-nested /api/workflows/{id}/* routes:
+// the frontend sends the selected Service's id in the
+// X-Microflow-Service header on every request, and this checks it
+// against the workflow actually loaded from the database. A request
+// with NO header (an older client, a script, curl) is let through
+// unchanged -- this keeps every pre-existing integration working
+// (rule 14) while the dashboard, which always sends the header, gets
+// real backend-enforced isolation. Mismatches return 404, not 403, so a
+// probing request can't even learn that a workflow with that id exists
+// under a different Service.
+func (s *Server) authorizeWorkflowService(w http.ResponseWriter, r *http.Request, wf *model.Workflow) bool {
+	want := r.Header.Get("X-Microflow-Service")
+	if want == "" || want == wf.ServiceID {
+		return true
+	}
+	writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
+	return false
+}
+
+// authorizeExecutionService is authorizeWorkflowService's counterpart
+// for execution-scoped endpoints, checked against the execution's own
+// denormalized ServiceID (model.Execution.ServiceID) rather than
+// re-loading the owning workflow.
+func (s *Server) authorizeExecutionService(w http.ResponseWriter, r *http.Request, ex *model.Execution) bool {
+	want := r.Header.Get("X-Microflow-Service")
+	if want == "" || ex.ServiceID == "" || want == ex.ServiceID {
+		return true
+	}
+	writeErr(w, http.StatusNotFound, errors.New("execution not found"))
+	return false
 }
 
 // WithScheduleSync registers the callback that re-registers a workflow's
@@ -195,7 +291,22 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/credentials/google", s.handleDeleteCentralCredential)
 }
 
+// handleList returns every workflow, or (when the caller passes
+// ?serviceId=... -- what the Service Dashboard's fetch calls always
+// do) only the workflows belonging to that Service. Omitting the param
+// preserves the exact pre-Service behavior (every workflow, no
+// filtering) for any older client/script/test that never learned about
+// Services (rule 14).
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	if id := r.URL.Query().Get("serviceId"); id != "" && s.services != nil {
+		wfs, err := s.services.ListWorkflowsByService(r.Context(), id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, wfs)
+		return
+	}
 	wfs, err := s.workflows.ListWorkflows(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -206,6 +317,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 // handleImport implements rule 1/26: parse, return the compatibility
 // checklist, and DO NOT silently drop anything the parser didn't map.
+//
+// serviceId (query param, falling back to the X-Microflow-Service
+// header) says which Service the imported workflow belongs to from now
+// on -- immutable after this point (see SaveWorkflow's ON CONFLICT
+// clause). Omitted entirely -- an older client that doesn't know about
+// Services -- defaults to tenant.DefaultID, so a pre-existing
+// single-Service deployment's import flow is completely unchanged.
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	raw, err := readBody(r, 10*1024*1024)
 	if err != nil {
@@ -217,6 +335,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	result.Workflow.ServiceID = requestServiceID(r)
 	if err := s.persistWorkflow(r.Context(), result.Workflow); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -228,12 +347,33 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requestServiceID reads the target Service id from ?serviceId= first,
+// then the X-Microflow-Service header, defaulting to tenant.DefaultID
+// so every pre-existing call site (no knowledge of Services at all)
+// keeps landing every workflow in the one Service that already owns
+// everything from before this feature existed.
+func requestServiceID(r *http.Request) string {
+	if v := r.URL.Query().Get("serviceId"); v != "" {
+		return v
+	}
+	if v := r.Header.Get("X-Microflow-Service"); v != "" {
+		return v
+	}
+	return tenant.DefaultID
+}
+
 // maxWorkflowSaveBytes mirrors handleImport's 10MB cap. handleSave
 // previously decoded straight from r.Body with no limit at all -- a
 // workflow-editor bug or a malicious client could stream an unbounded
 // body into json.Decoder and grow heap without any ceiling.
 const maxWorkflowSaveBytes = 10 * 1024 * 1024
 
+// handleSave edits an existing workflow, or creates a new one under
+// the requesting Service if the id has never been saved before (the
+// editor's "New Workflow" path, distinct from Import). Once a workflow
+// exists, its ServiceID is immutable through this endpoint -- an
+// ordinary re-save can never move it to a different Service (isolation
+// rule 4/13); only DeleteWorkflow + a fresh Import elsewhere can.
 func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	var wf model.Workflow
 	limited := io.LimitReader(r.Body, maxWorkflowSaveBytes+1)
@@ -242,6 +382,14 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wf.ID = r.PathValue("id")
+	if existing, err := s.workflows.LoadWorkflow(r.Context(), wf.ID); err == nil {
+		if !s.authorizeWorkflowService(w, r, existing) {
+			return
+		}
+		wf.ServiceID = existing.ServiceID
+	} else {
+		wf.ServiceID = requestServiceID(r)
+	}
 	if err := s.persistWorkflow(r.Context(), &wf); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -253,6 +401,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.workflows.LoadWorkflow(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if !s.authorizeWorkflowService(w, r, wf) {
 		return
 	}
 	writeJSON(w, http.StatusOK, wf)
@@ -290,6 +441,11 @@ func (s *Server) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("workflow id is required"))
 		return
 	}
+	if existing, err := s.workflows.LoadWorkflow(r.Context(), id); err == nil {
+		if !s.authorizeWorkflowService(w, r, existing) {
+			return
+		}
+	}
 
 	if s.run != nil && s.run.IsWorkflowActive(id) {
 		writeErr(w, http.StatusConflict, errWorkflowActive)
@@ -322,6 +478,9 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.workflows.LoadWorkflow(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if !s.authorizeWorkflowService(w, r, wf) {
 		return
 	}
 	raw, err := parser.Export(wf)
@@ -360,6 +519,11 @@ type executeAcceptedResponse struct {
 
 func (s *Server) handleExecuteAsync(w http.ResponseWriter, r *http.Request) {
 	wfID := r.PathValue("id")
+	if existing, err := s.workflows.LoadWorkflow(r.Context(), wfID); err == nil {
+		if !s.authorizeWorkflowService(w, r, existing) {
+			return
+		}
+	}
 	startNode := r.URL.Query().Get("startNode")
 	seed := model.NodeOutput{{{JSON: map[string]any{}}}}
 
@@ -386,6 +550,9 @@ func (s *Server) handleExecuteSync(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.workflows.LoadWorkflow(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if !s.authorizeWorkflowService(w, r, wf) {
 		return
 	}
 	startNode := r.URL.Query().Get("startNode")
@@ -530,6 +697,9 @@ func (s *Server) handleGetExecution(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
 		return
 	}
+	if !s.authorizeExecutionService(w, r, ex) {
+		return
+	}
 	writeJSON(w, http.StatusOK, ex)
 }
 
@@ -564,6 +734,11 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	execID := r.PathValue("id")
+	if ex, ok := s.manager.Get(execID); ok {
+		if !s.authorizeExecutionService(w, r, ex) {
+			return
+		}
+	}
 	if err := s.manager.Cancel(execID); err != nil {
 		// The in-memory manager only owns live executions. If the record
 		// disappeared between the UI refresh and this click, consult the
@@ -612,6 +787,9 @@ func (s *Server) handleDebugReport(w http.ResponseWriter, r *http.Request) {
 	ex, ok := s.resolveExecution(r.Context(), execID)
 	if !ok {
 		writeErr(w, http.StatusNotFound, errors.New("execution not found"))
+		return
+	}
+	if !s.authorizeExecutionService(w, r, ex) {
 		return
 	}
 
@@ -776,6 +954,9 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
 		return
 	}
+	if !s.authorizeWorkflowService(w, r, wf) {
+		return
+	}
 	creds, err := s.credentials.ListCredentials(r.Context(), wfID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to list credentials"))
@@ -839,6 +1020,9 @@ func (s *Server) handleSaveCredential(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.workflows.LoadWorkflow(r.Context(), wfID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, errors.New("workflow not found"))
+		return
+	}
+	if !s.authorizeWorkflowService(w, r, wf) {
 		return
 	}
 	node, ok := wf.Nodes[req.NodeName]
