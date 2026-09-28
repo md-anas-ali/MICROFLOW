@@ -82,6 +82,13 @@ type Server struct {
 	// credential paste endpoints above are unaffected either way.
 	googleOAuth    *vault.GoogleOAuthApp
 	googleAccounts *vault.GoogleServiceAccounts
+	// googleOAuthResolver, when set (EnableGoogleOAuthResolver), builds the
+	// OAuth client per request from the merged Environment (Service >
+	// Global > host, each key independently) of the Service involved, so
+	// no variable has to live in one particular place and no restart is
+	// needed after adding one. googleOAuth above is only the static
+	// fallback used by EnableGoogleOAuth.
+	googleOAuthResolver GoogleOAuthResolver
 
 	// manager and execLoader back the async execute/executions/events
 	// endpoints (handleExecuteAsync, handleGetExecution,

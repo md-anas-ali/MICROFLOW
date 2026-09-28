@@ -10,6 +10,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -29,11 +30,43 @@ import (
 func (s *Server) EnableGoogleOAuth(app *vault.GoogleOAuthApp, accounts *vault.GoogleServiceAccounts) {
 	s.googleOAuth = app
 	s.googleAccounts = accounts
+	s.registerGoogleRoutes()
+}
 
+// GoogleOAuthResolver builds the Google OAuth client for one MicroFlow
+// Service from that Service's merged Environment. It is called per
+// request (never cached at boot), so a variable added or changed in the
+// dashboard or the hosting provider is picked up immediately.
+type GoogleOAuthResolver func(ctx context.Context, serviceID string) (*vault.GoogleOAuthApp, error)
+
+// EnableGoogleOAuthResolver is EnableGoogleOAuth for the fully automatic
+// case: the routes are always registered and the OAuth client is
+// resolved on every request through resolve, so the operator never has
+// to decide where GOOGLE_OAUTH_* live or restart after adding them.
+func (s *Server) EnableGoogleOAuthResolver(resolve GoogleOAuthResolver, accounts *vault.GoogleServiceAccounts) {
+	s.googleOAuthResolver = resolve
+	s.googleAccounts = accounts
+	s.registerGoogleRoutes()
+}
+
+func (s *Server) registerGoogleRoutes() {
 	s.mux.HandleFunc("GET /api/services/{msvc}/google/connections", s.handleGoogleConnections)
 	s.mux.HandleFunc("GET /api/services/{msvc}/google/connect/{service}", s.handleGoogleConnectStart)
 	s.mux.HandleFunc("GET /api/oauth/google/callback", s.handleGoogleOAuthCallback)
 	s.mux.HandleFunc("POST /api/services/{msvc}/google/disconnect/{service}", s.handleGoogleDisconnect)
+}
+
+// oauthAppFor returns the Google OAuth client to use for msvc: the
+// per-request merged-Environment resolver when one is wired, otherwise
+// the static app from EnableGoogleOAuth.
+func (s *Server) oauthAppFor(ctx context.Context, msvc string) (*vault.GoogleOAuthApp, error) {
+	if s.googleOAuthResolver != nil {
+		return s.googleOAuthResolver(ctx, msvc)
+	}
+	if s.googleOAuth != nil {
+		return s.googleOAuth, nil
+	}
+	return nil, errGoogleOAuthNotConfigured
 }
 
 // googleConnectionView is one row of the "Google Connections" page --
@@ -84,10 +117,6 @@ func (s *Server) handleGoogleConnections(w http.ResponseWriter, r *http.Request)
 // the Authorization Code flow is that the browser navigates to Google
 // and back, never touching a token directly.
 func (s *Server) handleGoogleConnectStart(w http.ResponseWriter, r *http.Request) {
-	if s.googleOAuth == nil {
-		writeErr(w, http.StatusInternalServerError, errGoogleOAuthNotConfigured)
-		return
-	}
 	msvc := r.PathValue("msvc")
 	if !s.requireService(w, r, msvc) {
 		return
@@ -97,7 +126,12 @@ func (s *Server) handleGoogleConnectStart(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, errors.New("unknown google service -- must be gmail, youtube, or sheets"))
 		return
 	}
-	authURL, err := s.googleOAuth.AuthURL(msvc, service)
+	app, err := s.oauthAppFor(r.Context(), msvc)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	authURL, err := app.AuthURL(msvc, service)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to build google connect link"))
 		return
@@ -124,7 +158,7 @@ func (s *Server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return "/#/services/" + url.PathEscape(msvc) + "/credentials"
 	}
 
-	if s.googleOAuth == nil || s.googleAccounts == nil {
+	if s.googleAccounts == nil || (s.googleOAuthResolver == nil && s.googleOAuth == nil) {
 		http.Redirect(w, r, backTo("")+"?googleError="+urlMsg("Google OAuth is not configured on this server"), http.StatusFound)
 		return
 	}
@@ -143,7 +177,18 @@ func (s *Server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	msvc, service, secrets, err := s.googleOAuth.Exchange(r.Context(), code, state)
+	// The state names the Service the connect started from; that Service's
+	// merged Environment supplies the OAuth client. The id is only used for
+	// that lookup -- Exchange fully verifies the state (HMAC + TTL) against
+	// the resolved client before anything is trusted or saved.
+	stateMsvc, _ := vault.PeekStateServiceID(state)
+	app, err := s.oauthAppFor(r.Context(), stateMsvc)
+	if err != nil {
+		log.Printf("google oauth callback: %v", err)
+		http.Redirect(w, r, backTo(stateMsvc)+"?googleError="+urlMsg(err.Error()), http.StatusFound)
+		return
+	}
+	msvc, service, secrets, err := app.Exchange(r.Context(), code, state)
 	if err != nil {
 		log.Printf("google oauth exchange failed: %v", err)
 		http.Redirect(w, r, backTo("")+"?googleError="+urlMsg("Could not connect to Google. Please try again."), http.StatusFound)
@@ -184,7 +229,7 @@ func (s *Server) handleGoogleDisconnect(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": service})
 }
 
-var errGoogleOAuthNotConfigured = errors.New("google oauth is not configured on this server -- set GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/GOOGLE_OAUTH_REDIRECT_URL")
+var errGoogleOAuthNotConfigured = errors.New("google oauth is not configured on this server -- set GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/GOOGLE_OAUTH_REDIRECT_URL in the Service Environment, Global Environment, or host environment (any combination)")
 
 // requireService writes a 404 and returns false if id doesn't name an
 // existing Service, or if tenancy support isn't wired on this Server
