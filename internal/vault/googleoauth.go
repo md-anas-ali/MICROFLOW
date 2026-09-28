@@ -158,6 +158,30 @@ func (g *GoogleOAuthApp) signRaw(payload string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + sig
 }
 
+// PeekStateServiceID returns the MicroFlow Service id embedded in a
+// state token WITHOUT trusting it. It exists only so the OAuth callback
+// can work out which Service's merged Environment to resolve the OAuth
+// client (ID/secret/redirect) from -- that client's secret is what signs
+// the state, so the signature can only be checked after the lookup. The
+// returned id is never used for anything but that lookup: the state is
+// then fully verified (HMAC + TTL) by verifyState/Exchange against the
+// resolved client, and a forged or tampered state is rejected there.
+func PeekStateServiceID(state string) (string, bool) {
+	dot := strings.LastIndexByte(state, '.')
+	if dot < 0 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(state[:dot])
+	if err != nil {
+		return "", false
+	}
+	fields := strings.SplitN(string(payload), "|", 4)
+	if len(fields) != 4 || fields[0] == "" {
+		return "", false
+	}
+	return fields[0], true
+}
+
 // verifyState checks the HMAC signature and TTL and returns the
 // MicroFlow Service id and Google service the state was originally
 // issued for.
