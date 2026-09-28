@@ -3,7 +3,6 @@ package nodes
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -151,11 +150,17 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		cmd := exec.CommandContext(cctx, path, args...)
 		cmd.Dir = rc.ScratchDir
+		// Child processes (Edge-TTS/FFmpeg/python3/...) get this run's merged
+		// environment: host/Render < Global < this Service's own Environment.
+		// Without this they only ever saw the host environment, so a key saved
+		// in the dashboard never reached $VARIABLE / os.Getenv in a helper.
 		if rc.CurrentOperationID != "" {
-			// Expose the same deterministic operation identity to allowed helper
-			// binaries (Edge-TTS/FFmpeg/python3/etc.) without changing their argv.
-			// A helper can use it to make its own output/idempotency decision.
-			cmd.Env = append(os.Environ(), "MICROFLOW_OPERATION_ID="+rc.CurrentOperationID)
+			// Also expose the same deterministic operation identity to helper
+			// binaries without changing their argv. A helper can use it to make
+			// its own output/idempotency decision.
+			cmd.Env = rc.ProcessEnv("MICROFLOW_OPERATION_ID=" + rc.CurrentOperationID)
+		} else {
+			cmd.Env = rc.ProcessEnv()
 		}
 
 		stdout := newBoundedWriter(maxCaptureBytes)
