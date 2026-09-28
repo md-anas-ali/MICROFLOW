@@ -18,6 +18,11 @@ type Context struct {
 	JSON        map[string]any            // current item's $json
 	NodeOutputs map[string]map[string]any // nodeName -> that node's first output item's $json, for $node["X"]
 	Execution   map[string]any            // $execution.id, $execution.mode, etc.
+
+	// Env resolves {{ $env.NAME }}. Optional: nil falls back to the
+	// process environment (the historical behavior), so callers/tests
+	// that build a Context by hand are unaffected.
+	Env func(key string) string
 }
 
 var exprPattern = regexp.MustCompile(`\{\{(.*?)\}\}`)
@@ -77,6 +82,9 @@ func evalExpression(src string, ctx Context) (any, error) {
 
 	case strings.HasPrefix(src, "$env."):
 		key := strings.TrimPrefix(src, "$env.")
+		if ctx.Env != nil {
+			return ctx.Env(key), nil
+		}
 		return os.Getenv(key), nil
 
 	case strings.HasPrefix(src, "$execution"):
