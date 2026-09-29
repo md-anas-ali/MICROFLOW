@@ -22,6 +22,7 @@ import (
 	"microflow/internal/report"
 	"microflow/internal/runall"
 	"microflow/internal/runner"
+	"microflow/internal/scheduler"
 	"microflow/internal/store"
 	"microflow/internal/tenant"
 	"microflow/internal/vault"
@@ -120,6 +121,18 @@ type Server struct {
 	envVault EnvResolver
 	runAll   RunAllController
 
+	// runAllSchedules/onRunAllSchedulesChanged back the Run All Services
+	// Schedule feature (Add/Edit/Delete/Enable/Disable a cron/interval
+	// schedule that fires Run All Services). Nil-safe like services/
+	// envVault/runAll above: without WithRunAllSchedules (every existing
+	// test helper) the /api/run-all-schedules routes are not registered.
+	runAllSchedules          RunAllScheduleStore
+	onRunAllSchedulesChanged func(rows []store.RunAllScheduleRow)
+	// schedLoc/nextRuns back GET /api/schedules/next-runs (see
+	// WithScheduleNextRuns); nil until wired.
+	schedLoc *time.Location
+	nextRuns func(now time.Time) []scheduler.NextRunInfo
+
 	// reauth re-verifies the logged-in person's password for sensitive
 	// actions (deleting a Service's whole Environment set). Wired by
 	// WithReauth from the existing login gate; nil => those actions are
@@ -179,6 +192,42 @@ func (s *Server) WithTenancy(services ServiceStore, env EnvResolver, runAll RunA
 	s.envVault = env
 	s.runAll = runAll
 	s.routesTenancy()
+	return s
+}
+
+// RunAllScheduleStore is the persistence interface the Run All
+// Services Schedule feature needs; internal/store's Postgres
+// implementation satisfies it.
+type RunAllScheduleStore interface {
+	ListRunAllSchedules(ctx context.Context) ([]store.RunAllScheduleRow, error)
+	CreateRunAllSchedule(ctx context.Context, row store.RunAllScheduleRow) error
+	UpdateRunAllSchedule(ctx context.Context, row store.RunAllScheduleRow) error
+	DeleteRunAllSchedule(ctx context.Context, id string) error
+	GetRunAllSchedule(ctx context.Context, id string) (*store.RunAllScheduleRow, error)
+}
+
+// WithRunAllSchedules enables Add/Edit/Delete/Enable/Disable of Run All
+// Services schedules at /api/run-all-schedules. sync is called with the
+// full, just-persisted list after every mutation (and should push it
+// into the running scheduler via scheduler.Scheduler.ReplaceRunAll --
+// see cmd/server/main.go) so a change takes effect immediately, no
+// restart needed. Nil-safe like WithTenancy: without it, no
+// /api/run-all-schedules routes are registered at all.
+func (s *Server) WithRunAllSchedules(st RunAllScheduleStore, sync func(rows []store.RunAllScheduleRow)) *Server {
+	s.runAllSchedules = st
+	s.onRunAllSchedulesChanged = sync
+	s.routesRunAllSchedules()
+	return s
+}
+
+// WithScheduleNextRuns exposes GET /api/schedules/next-runs: the next run
+// of every registered schedule, read from the one running scheduler.
+// loc is the scheduler's timezone (used for display and for parsing the
+// Run All schedule Start/End times). Nil-safe like the other With* hooks.
+func (s *Server) WithScheduleNextRuns(loc *time.Location, fn func(now time.Time) []scheduler.NextRunInfo) *Server {
+	s.schedLoc = loc
+	s.nextRuns = fn
+	s.mux.HandleFunc("GET /api/schedules/next-runs", s.handleScheduleNextRuns)
 	return s
 }
 
