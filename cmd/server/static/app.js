@@ -373,7 +373,7 @@
         statCard(queue.accepted || 0, "Accepted / active") +
         statCard(queue.running || 0, "Running") +
         statCard(queue.waiting || 0, "Waiting in queue") +
-        statCard((queue.maxConcurrent || 0) + " / " + (queue.maxQueued ? queue.maxQueued : "Unlimited"), "Workers / queue limit");
+        statCard((queue.maxConcurrent || 0) + " / " + (queue.maxQueued || 0), "Workers / queue limit");
     }
 
     function renderRows(executions) {
