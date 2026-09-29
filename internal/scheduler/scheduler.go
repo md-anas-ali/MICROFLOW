@@ -12,6 +12,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -20,7 +21,9 @@ import (
 	"time"
 )
 
-// Schedule mirrors one Schedule Trigger node's config: either a cron
+// Schedule mirrors either one Schedule Trigger node's config
+// (WorkflowID/NodeName set, RunAll false) or one Run All Services
+// schedule (RunAll true, WorkflowID/NodeName unused) -- either a cron
 // expression or a simple interval, per rule 14.
 type Schedule struct {
 	ID              string
@@ -29,20 +32,49 @@ type Schedule struct {
 	CronExpr        string // 5-field standard cron: minute hour day month weekday
 	IntervalSeconds int
 	Enabled         bool
+
+	// RunAll marks this as a "Run All Services" schedule rather than a
+	// workflow's Schedule Trigger: when due, it calls the RunAllRunner
+	// (see SetRunAllRunner) instead of being queued as a workflow job.
+	// StopOnFailure is only meaningful when RunAll is true.
+	RunAll        bool
+	StopOnFailure bool
+
+	// Run All only. StartAt/EndAt zero = no bound; MaxRuns 0 = unlimited
+	// (Repeat/Unlimited in the UI); RunCount = fires so far.
+	StartAt  time.Time
+	EndAt    time.Time
+	MaxRuns  int
+	RunCount int
 }
 
 // Runner is called when a schedule fires. Implemented by the API/engine
 // glue (internal/api) to kick off engine.Run for that workflow.
 type Runner func(ctx context.Context, workflowID, nodeName string)
 
+// RunAllRunner is called when a Run All Services schedule fires.
+// Implemented by runall.Manager.StartAll (via a small adapter in
+// cmd/server/main.go) -- the exact same path the "Run All Services"
+// button uses, so no separate runner/queue exists for this. An error
+// (e.g. a sweep is already active) is only logged; it must never stop
+// the scheduler.
+type RunAllRunner func(ctx context.Context, stopOnFailure bool) error
+
+// ErrRunAllSkipped is returned by a RunAllRunner when the sweep did not
+// start (e.g. one is already in progress). Such a fire is not counted
+// toward a schedule's Repeat limit.
+var ErrRunAllSkipped = errors.New("run-all sweep not started")
+
 type Scheduler struct {
 	// mu guards schedules and lastRun: ReplaceWorkflow (called from the
 	// workflow save/import/delete API path) mutates them while tick runs
 	// on the scheduler goroutine.
-	mu        sync.Mutex
-	schedules []Schedule
-	run       Runner
-	lastRun   map[string]time.Time
+	mu          sync.Mutex
+	schedules   []Schedule
+	run         Runner
+	runAll      RunAllRunner
+	runAllFired func(id string)
+	lastRun     map[string]time.Time
 
 	// The global queue/worker state (queue, keys, cooldown, cleanup hook)
 	// lives in queue.go. Overlap protection is now the queue's per-workflow
@@ -76,6 +108,32 @@ func (s *Scheduler) SetLocation(loc *time.Location) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.location = loc
+}
+
+// SetRunAllRunner wires the callback used when a Run All Services
+// schedule (Schedule.RunAll) is due. Nil-safe: without it, a due
+// RunAll schedule is just logged and skipped (matching how the rest of
+// this package fails safe rather than panicking on missing wiring).
+func (s *Scheduler) SetRunAllRunner(fn RunAllRunner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runAll = fn
+}
+
+// SetRunAllFiredHook registers a callback invoked (off the tick
+// goroutine) each time a Run All Services schedule fires, so the fire
+// count behind Repeat can be persisted. Nil-safe.
+func (s *Scheduler) SetRunAllFiredHook(fn func(id string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runAllFired = fn
+}
+
+// Location returns the timezone cron fields are evaluated in.
+func (s *Scheduler) Location() *time.Location {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.location
 }
 
 func (s *Scheduler) Load(schedules []Schedule) {
@@ -145,6 +203,50 @@ func (s *Scheduler) ReplaceWorkflow(workflowID string, schedules []Schedule) {
 	s.schedules = kept
 }
 
+// ReplaceRunAll atomically swaps every Run All Services schedule
+// (Schedule.RunAll == true) for the given set, leaving every workflow
+// Schedule Trigger entry untouched -- the counterpart of ReplaceWorkflow
+// for schedules that are not tied to one workflow. Called after a Run
+// All Services schedule is created, edited, deleted, enabled or
+// disabled (see internal/api's run-all-schedules handlers) so the
+// running scheduler reflects the persisted set without a restart. Same
+// lastRun/first-interval-counts-from-now semantics as ReplaceWorkflow.
+func (s *Scheduler) ReplaceRunAll(schedules []Schedule) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := make(map[string]Schedule)
+	kept := make([]Schedule, 0, len(s.schedules)+len(schedules))
+	for _, sc := range s.schedules {
+		if sc.RunAll {
+			old[sc.ID] = sc
+			continue
+		}
+		kept = append(kept, sc)
+	}
+	now := time.Now()
+	registered := make(map[string]bool, len(schedules))
+	for _, sc := range schedules {
+		sc.RunAll = true
+		registered[sc.ID] = true
+		prev, existed := old[sc.ID]
+		changed := !existed || !prev.Enabled || prev.CronExpr != sc.CronExpr || prev.IntervalSeconds != sc.IntervalSeconds
+		if sc.Enabled && changed {
+			if sc.CronExpr == "" && sc.IntervalSeconds > 0 {
+				s.lastRun[sc.ID] = now
+			} else {
+				delete(s.lastRun, sc.ID)
+			}
+		}
+		kept = append(kept, sc)
+	}
+	for id := range old {
+		if !registered[id] {
+			delete(s.lastRun, id)
+		}
+	}
+	s.schedules = kept
+}
+
 // Start blocks until ctx is cancelled. It wakes at the top of every
 // minute (a single timer for every schedule, not one goroutine/timer per
 // schedule, so the scheduler's own footprint stays flat regardless of how
@@ -184,9 +286,22 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	// bookkeeping and the same-minute guard) stays a plain absolute
 	// instant, comparable regardless of zone.
 	localMinute := minute.In(s.location)
-	for _, sc := range s.schedules {
+	for i := range s.schedules {
+		sc := s.schedules[i]
 		if !sc.Enabled {
 			continue
+		}
+		if sc.RunAll {
+			// Optional Start/End window and Repeat limit (minute resolution).
+			if !sc.StartAt.IsZero() && minute.Before(sc.StartAt.Truncate(time.Minute)) {
+				continue
+			}
+			if !sc.EndAt.IsZero() && minute.After(sc.EndAt) {
+				continue
+			}
+			if sc.MaxRuns > 0 && sc.RunCount >= sc.MaxRuns {
+				continue
+			}
 		}
 		last, ran := s.lastRun[sc.ID]
 		due := false
@@ -203,6 +318,23 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 			// instead of accumulating the tick's sub-second offset.
 			s.lastRun[sc.ID] = minute
 
+			if sc.RunAll {
+				// Run All Services itself is not one workflow job to queue --
+				// it is a sweep across every Service, each step of which
+				// already goes through this same global queue (see
+				// runall.Manager / queuedRunner in cmd/server/main.go). So a
+				// due RunAll schedule calls the RunAllRunner directly
+				// (off the tick goroutine, so a slow store write never
+				// delays the next minute's tick) rather than being enqueued
+				// as a job here -- no second queue is introduced.
+				s.schedules[i].RunCount++
+				if sc.MaxRuns > 0 && s.schedules[i].RunCount >= sc.MaxRuns {
+					s.schedules[i].Enabled = false // Repeat limit reached
+				}
+				go s.fireRunAll(sc)
+				continue
+			}
+
 			// The Schedule Trigger node never starts a run itself: it only
 			// says WHEN its workflow is due. The run is appended to the one
 			// global queue (keyed by workflow, so a workflow that is already
@@ -212,6 +344,60 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 				log.Printf("scheduler: %s/%s is due but %v, skipping this tick", sc.WorkflowID, sc.NodeName, err)
 			}
 		}
+	}
+}
+
+// fireRunAll calls the RunAllRunner for a due Run All Services
+// schedule. Run on its own goroutine (see tick) so it never blocks the
+// once-a-minute tick loop; safe to call concurrently with itself since
+// runall.Manager already refuses a second concurrent sweep (rule:
+// "Duplicate Run All execution prevent করো") -- that refusal is simply
+// logged here, not treated as an error condition for the scheduler.
+func (s *Scheduler) fireRunAll(sc Schedule) {
+	s.mu.Lock()
+	fn := s.runAll
+	hook := s.runAllFired
+	s.mu.Unlock()
+	if fn == nil {
+		log.Printf("scheduler: run-all schedule %s is due but no Run All Services runner is wired, skipping", sc.ID)
+		s.uncountRunAll(sc.ID)
+		return
+	}
+	// Server-owned work, like a scheduled workflow run: must survive the
+	// scheduler loop's own shutdown context being cancelled (the sweep it
+	// starts is durable and resumes after a restart anyway -- see
+	// runall.Manager.Resume), so a graceful process exit doesn't need to
+	// wait for or abort it.
+	ctx := context.WithoutCancel(s.getContext())
+	if err := fn(ctx, sc.StopOnFailure); err != nil {
+		if errors.Is(err, ErrRunAllSkipped) {
+			log.Printf("scheduler: run-all schedule %s is due but a sweep is already in progress, skipping (not counted)", sc.ID)
+		} else {
+			log.Printf("scheduler: run-all schedule %s is due but %v", sc.ID, err)
+		}
+		s.uncountRunAll(sc.ID)
+		return
+	}
+	if hook != nil {
+		hook(sc.ID) // persist the fire count only for a sweep that really started
+	}
+}
+
+// uncountRunAll undoes tick's optimistic RunCount increment when the
+// sweep did not actually start, re-enabling the schedule if that
+// increment was what hit its Repeat limit.
+func (s *Scheduler) uncountRunAll(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.schedules {
+		sc := &s.schedules[i]
+		if sc.ID != id || !sc.RunAll || sc.RunCount == 0 {
+			continue
+		}
+		if sc.MaxRuns > 0 && sc.RunCount == sc.MaxRuns {
+			sc.Enabled = true
+		}
+		sc.RunCount--
 	}
 }
 
