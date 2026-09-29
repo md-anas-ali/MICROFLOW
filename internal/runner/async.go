@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -269,11 +268,7 @@ func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	// maxQueued <= 0 means Unlimited: every accepted run waits in the single
-	// global queue (still one at a time), nothing is rejected with ErrQueueFull.
-	if maxQueued <= 0 {
-		maxQueued = math.MaxInt32
-	} else if maxQueued < maxConcurrent {
+	if maxQueued < maxConcurrent {
 		maxQueued = maxConcurrent
 	}
 	if r.sem == nil {
@@ -819,16 +814,12 @@ func (m *Manager) Stats() map[string]int {
 	if waiting < 0 {
 		waiting = 0
 	}
-	maxQ := int(m.maxQueued)
-	if m.maxQueued == math.MaxInt32 {
-		maxQ = 0 // 0 = Unlimited
-	}
 	return map[string]int{
 		"accepted":      queued,
 		"running":       running,
 		"waiting":       waiting,
 		"maxConcurrent": cap(m.sem),
-		"maxQueued":     maxQ,
+		"maxQueued":     int(m.maxQueued),
 	}
 }
 
