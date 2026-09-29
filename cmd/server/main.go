@@ -386,7 +386,7 @@ func main() {
 	// rather than accumulating queued memory.
 	execManager := runner.NewManager(run,
 		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
-		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 0),
+		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 2),
 	).WithDispatcher(sch)
 	execManager.StartRecoveryLoop(ctx)
 
@@ -535,9 +535,7 @@ func main() {
 func schedulerLocation() *time.Location {
 	name := strings.TrimSpace(os.Getenv("MICROFLOW_SCHEDULER_TIMEZONE"))
 	if name == "" {
-		// Default zone is Asia/Dhaka (matches the Dockerfile) so a run
-		// outside Docker reads cron fields as Dhaka wall-clock time too.
-		name = "Asia/Dhaka"
+		return time.UTC
 	}
 	loc, err := time.LoadLocation(name)
 	if err != nil {
