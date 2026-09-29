@@ -945,6 +945,138 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "23505")
 }
 
+// --- Run All Services Schedule (fires runall.Manager.StartAll on a
+// cron/interval schedule -- see internal/scheduler's Schedule.RunAll
+// field; no new runner/queue, the exact same scheduler tick loop and
+// the exact same Run All Services path a manual click uses) ---
+
+// ErrRunAllScheduleNotFound is returned by Update/Delete when the id
+// does not exist (already deleted, or never existed).
+var ErrRunAllScheduleNotFound = errors.New("store: run-all schedule not found")
+
+// RunAllScheduleRow is one persisted "Run All Services" schedule.
+// Exactly one of CronExpr/IntervalSeconds is expected to be set,
+// mirroring a Schedule Trigger node's own two shapes.
+type RunAllScheduleRow struct {
+	ID              string
+	Label           string
+	CronExpr        string
+	IntervalSeconds int
+	StopOnFailure   bool
+	Enabled         bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+
+	// Optional window and repeat limit. nil = no bound; MaxRuns 0 =
+	// unlimited. RunCount is how many times it has fired so far.
+	StartAt  *time.Time
+	EndAt    *time.Time
+	MaxRuns  int
+	RunCount int
+}
+
+func nullableInt(v int) any {
+	if v <= 0 {
+		return nil
+	}
+	return v
+}
+
+// CreateRunAllSchedule inserts a new schedule. Callers (see
+// internal/api) are expected to pass Enabled=false for a brand new
+// schedule -- the schema also defaults enabled to false so this holds
+// even if a caller forgets.
+func (s *Store) CreateRunAllSchedule(ctx context.Context, row RunAllScheduleRow) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO run_all_schedules (id, label, cron_expr, interval_seconds, stop_on_failure, enabled, start_at, end_at, max_runs, run_count, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, now(), now())
+	`, row.ID, row.Label, nullableString(row.CronExpr), nullableInt(row.IntervalSeconds), row.StopOnFailure, row.Enabled, row.StartAt, row.EndAt, row.MaxRuns)
+	return err
+}
+
+// UpdateRunAllSchedule replaces every mutable field of an existing
+// schedule (label, timing, stop-on-failure, enabled) in one call, so
+// Edit and Enable/Disable both go through the same path.
+func (s *Store) UpdateRunAllSchedule(ctx context.Context, row RunAllScheduleRow) error {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE run_all_schedules
+		SET label=$2, cron_expr=$3, interval_seconds=$4, stop_on_failure=$5, enabled=$6,
+		    start_at=$7, end_at=$8, max_runs=$9, run_count=$10, updated_at=now()
+		WHERE id=$1
+	`, row.ID, row.Label, nullableString(row.CronExpr), nullableInt(row.IntervalSeconds), row.StopOnFailure, row.Enabled, row.StartAt, row.EndAt, row.MaxRuns, row.RunCount)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrRunAllScheduleNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteRunAllSchedule(ctx context.Context, id string) error {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM run_all_schedules WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrRunAllScheduleNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetRunAllSchedule(ctx context.Context, id string) (*RunAllScheduleRow, error) {
+	row, err := s.scanRunAllSchedule(s.pool.QueryRow(ctx, `
+		SELECT id, label, COALESCE(cron_expr,''), COALESCE(interval_seconds,0), stop_on_failure, enabled, created_at, updated_at, start_at, end_at, max_runs, run_count
+		FROM run_all_schedules WHERE id=$1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRunAllScheduleNotFound
+	}
+	return row, err
+}
+
+// ListRunAllSchedules returns every schedule, oldest first (stable
+// creation order, matching how Services/workflows are listed
+// elsewhere in this package).
+func (s *Store) ListRunAllSchedules(ctx context.Context) ([]RunAllScheduleRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, label, COALESCE(cron_expr,''), COALESCE(interval_seconds,0), stop_on_failure, enabled, created_at, updated_at, start_at, end_at, max_runs, run_count
+		FROM run_all_schedules ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RunAllScheduleRow{}
+	for rows.Next() {
+		r, err := s.scanRunAllSchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
+// RecordRunAllScheduleFire counts one fire of a schedule and, when its
+// Repeat limit is reached, disables it (atomic, so a restart never loses
+// or double-counts a run).
+func (s *Store) RecordRunAllScheduleFire(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE run_all_schedules
+		SET run_count = run_count + 1,
+		    enabled = CASE WHEN max_runs > 0 AND run_count + 1 >= max_runs THEN false ELSE enabled END,
+		    updated_at = now()
+		WHERE id=$1`, id)
+	return err
+}
+
+func (s *Store) scanRunAllSchedule(row pgx.Row) (*RunAllScheduleRow, error) {
+	var r RunAllScheduleRow
+	if err := row.Scan(&r.ID, &r.Label, &r.CronExpr, &r.IntervalSeconds, &r.StopOnFailure, &r.Enabled, &r.CreatedAt, &r.UpdatedAt, &r.StartAt, &r.EndAt, &r.MaxRuns, &r.RunCount); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // SaveExecutionCheckpoint upserts the single latest checkpoint for an
 // execution. The JSON representation is bounded before it reaches Postgres.
 func (s *Store) SaveExecutionCheckpoint(ctx context.Context, cp *model.ExecutionCheckpoint) error {

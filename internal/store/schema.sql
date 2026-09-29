@@ -204,6 +204,34 @@ CREATE TABLE IF NOT EXISTS run_all_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_run_all_jobs_single_active
     ON run_all_jobs ((1)) WHERE status IN ('queued', 'running');
 
+-- Run All Services Schedule: like a workflow's Schedule Trigger node,
+-- but fires "Run All Services" itself instead of one workflow (see
+-- internal/scheduler's Schedule.RunAll field). Ticked by the exact same
+-- in-process scheduler loop, and fires through the exact same
+-- runall.Manager.StartAll a manual "Run All Services" click uses --
+-- no separate runner/queue is introduced for this. A newly created row
+-- always starts with enabled=false (rule: never start firing on its
+-- own the moment it's added) -- a person must explicitly enable it from
+-- the MicroFlow UI, and can disable/re-enable it again at any time
+-- without deleting it.
+CREATE TABLE IF NOT EXISTS run_all_schedules (
+    id               TEXT PRIMARY KEY,
+    label            TEXT NOT NULL DEFAULT '',
+    cron_expr        TEXT,               -- either cron_expr or interval_seconds is set
+    interval_seconds INT,
+    stop_on_failure  BOOLEAN NOT NULL DEFAULT false,
+    enabled          BOOLEAN NOT NULL DEFAULT false,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Optional Start/End window and Repeat limit for a Run All Services
+-- schedule (max_runs 0 = unlimited; run_count = fires so far). Idempotent.
+ALTER TABLE run_all_schedules ADD COLUMN IF NOT EXISTS start_at  TIMESTAMPTZ;
+ALTER TABLE run_all_schedules ADD COLUMN IF NOT EXISTS end_at    TIMESTAMPTZ;
+ALTER TABLE run_all_schedules ADD COLUMN IF NOT EXISTS max_runs  INT NOT NULL DEFAULT 0;
+ALTER TABLE run_all_schedules ADD COLUMN IF NOT EXISTS run_count INT NOT NULL DEFAULT 0;
+
 -- Idempotent upgrade for installations that created the checkpoint table before
 -- started_at was added. Existing rows receive their durable execution start time.
 DO $$
