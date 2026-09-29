@@ -396,6 +396,33 @@ func main() {
 	runAllManager := runall.NewManager(st, queuedRunner{sch: sch, run: run})
 	runAllManager.Resume(ctx)
 
+	// Run All Services Schedule: the ONE global scheduler above also
+	// drives this -- when a due Run All Services schedule fires, it
+	// calls runAllManager.StartAll directly (the exact same path the
+	// "Run All Services" button uses), no separate runner/queue.
+	sch.SetRunAllRunner(func(ctx context.Context, stopOnFailure bool) error {
+		jobID, err := runAllManager.StartAll(ctx, stopOnFailure)
+		if err != nil {
+			if errors.Is(err, runall.ErrAlreadyActive) {
+				// Not a real problem: a sweep (manual, or from another
+				// schedule) is already in flight -- this tick simply has
+				// nothing to do (and not counted toward Repeat).
+				return scheduler.ErrRunAllSkipped
+			}
+			return err
+		}
+		log.Printf("run-all schedule: started sweep %s", jobID)
+		return nil
+	})
+
+	// Persist each Run All schedule fire so "Repeat N times" survives a
+	// restart (the store also disables the schedule once N is reached).
+	sch.SetRunAllFiredHook(func(id string) {
+		if err := st.RecordRunAllScheduleFire(context.Background(), id); err != nil {
+			log.Printf("run-all schedule %s: could not record run: %v", id, err)
+		}
+	})
+
 	// st also satisfies api.CredentialStore (ListCredentials); baseVault
 	// (not the OAuthResolver) is passed so per-node credential writes go
 	// through the same Put path cmd/setcred uses -- no token refresh
@@ -404,7 +431,12 @@ func main() {
 	// satisfies api.ExecutionLoader (GetExecution) -- the durable
 	// fallback for GET /api/executions/{id} once execManager evicts a
 	// finished execution from memory.
-	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword)
+	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword).
+		WithRunAllSchedules(st, func(rows []store.RunAllScheduleRow) {
+			sch.ReplaceRunAll(runAllSchedulesToScheduler(rows))
+			log.Printf("run-all schedule sync: %d schedule(s) registered", len(rows))
+		}).
+		WithScheduleNextRuns(sch.Location(), sch.NextRuns)
 
 	// "Connect with Google" (n8n-style OAuth Authorization Code flow) is
 	// always available and fully automatic: GOOGLE_OAUTH_CLIENT_ID /
@@ -479,6 +511,14 @@ func main() {
 		}
 	}
 	log.Printf("startup: registered %d schedule(s) across %d workflow(s)", len(schedules), len(workflows))
+
+	runAllScheduleRows, err := st.ListRunAllSchedules(ctx)
+	if err != nil {
+		log.Printf("warning: could not list run-all schedules at startup (%v) -- they won't be registered until the next restart after this is fixed", err)
+		runAllScheduleRows = nil
+	}
+	schedules = append(schedules, runAllSchedulesToScheduler(runAllScheduleRows)...)
+	log.Printf("startup: registered %d Run All Services schedule(s)", len(runAllScheduleRows))
 
 	sch.Load(schedules)
 	go sch.Start(ctx)
@@ -626,6 +666,35 @@ func schedulesFromNode(workflowID, nodeName string, n *model.Node, wfActive bool
 	}
 	if len(out) == 0 {
 		log.Printf("warning: Schedule Trigger node %q in workflow %q has no recognized interval config -- it will never fire; check its parameters", nodeName, workflowID)
+	}
+	return out
+}
+
+// runAllSchedulesToScheduler converts persisted Run All Services
+// schedules (store.RunAllScheduleRow) into scheduler.Schedule entries
+// (Schedule.RunAll = true), used both at startup (combined with every
+// workflow's own Schedule Trigger entries into one sch.Load call) and
+// after any create/edit/delete/enable/disable (via sch.ReplaceRunAll).
+func runAllSchedulesToScheduler(rows []store.RunAllScheduleRow) []scheduler.Schedule {
+	out := make([]scheduler.Schedule, 0, len(rows))
+	for _, row := range rows {
+		sc := scheduler.Schedule{
+			ID:              row.ID,
+			CronExpr:        row.CronExpr,
+			IntervalSeconds: row.IntervalSeconds,
+			Enabled:         row.Enabled,
+			RunAll:          true,
+			StopOnFailure:   row.StopOnFailure,
+			MaxRuns:         row.MaxRuns,
+			RunCount:        row.RunCount,
+		}
+		if row.StartAt != nil {
+			sc.StartAt = *row.StartAt
+		}
+		if row.EndAt != nil {
+			sc.EndAt = *row.EndAt
+		}
+		out = append(out, sc)
 	}
 	return out
 }
