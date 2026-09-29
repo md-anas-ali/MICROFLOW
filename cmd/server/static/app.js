@@ -817,7 +817,7 @@
     let actionsHTML;
     if (view.connected) {
       actionsHTML =
-        '<a class="btn btn-secondary btn-sm" href="' + svcPath("/google/connect/" + encodeURIComponent(view.service)) + '">' +
+        '<a class="btn btn-sm" href="' + svcPath("/google/connect/" + encodeURIComponent(view.service)) + '">' +
         (view.needsReconnect ? "Reconnect" : "Reconnect") + "</a> " +
         '<button class="btn btn-danger btn-sm google-disconnect-btn" data-service="' + escapeHtml(view.service) + '">Disconnect</button>';
     } else {
@@ -1195,7 +1195,9 @@
       parameters: {},
       credentials: {},
       position: [x, y],
-      disabled: false,
+      // A new Schedule Trigger never fires on its own: it starts Disabled
+      // and is switched on from the node panel (untick Disabled).
+      disabled: type === "scheduleTrigger",
       retryOnFail: false,
       maxTries: 0,
       waitBetweenTriesMs: 0,
@@ -1204,7 +1206,8 @@
     editorState.selectedNodeName = name;
     drawCanvas();
     refreshStartNodeOptions();
-    toast("Added \u201c" + name + "\u201d \u2014 remember to Save", "success");
+    toast("Added \u201c" + name + "\u201d \u2014 remember to Save" +
+      (type === "scheduleTrigger" ? " (Schedule Trigger starts Disabled \u2014 untick Disabled to enable)" : ""), "success");
   }
 
   // addNode/deleteNode only re-run drawCanvas() (not the whole toolbar,
@@ -1533,7 +1536,12 @@
       "<h3>" + escapeHtml(nodeName) + "</h3>" +
       '<div class="field"><label>Type</label><input type="text" value="' + escapeHtml(node.type || "") + '" disabled></div>' +
       '<div class="field"><label class="row-checkbox"><input type="checkbox" id="nodeDisabled" ' +
-      (node.disabled ? "checked" : "") + "> Disabled</label></div>" +
+      (node.disabled ? "checked" : "") + "> Disabled</label>" +
+      (node.type === "scheduleTrigger"
+        ? '<div class="sub" style="font-size:11px;margin-top:4px;">Schedule Trigger starts Disabled. Untick <b>Disabled</b> and click Apply to enable it (the workflow must also be Active).</div>' +
+          '<div id="nodeNextRun" class="sub" style="font-size:12px;margin-top:6px;">Next run: \u2026</div>'
+        : "") +
+      "</div>" +
       '<div class="field"><label class="row-checkbox"><input type="checkbox" id="nodeRetry" ' +
       (node.retryOnFail ? "checked" : "") + "> Retry on fail</label></div>" +
       '<div class="field"><label>Parameters (JSON)</label>' +
@@ -1547,6 +1555,7 @@
   }
 
   function wireSidePanel(nodeName) {
+    loadNodeNextRun(nodeName);
     document.getElementById("applyNodeBtn").addEventListener("click", async () => {
       const node = editorState.workflow.nodes[nodeName];
       const paramsErr = document.getElementById("paramsError");
@@ -1895,8 +1904,421 @@
       '<button id="runAllCancelBtn" class="btn btn-danger" style="display:none;">Cancel</button>' +
       '<label style="font-size:12px;"><input type="checkbox" id="runAllStop"> Stop if a Service fails</label>' +
       "</div>" +
-      '<div id="runAllStatus" style="margin-top:12px;"></div></div>'
+      '<div id="runAllStatus" style="margin-top:12px;"></div>' +
+      rasSectionHTML() +
+      "</div>"
     );
+  }
+
+  // ---------------- Next Run (every schedule) ----------------
+  //
+  // GET /api/schedules/next-runs reports the next fire time of every
+  // registered schedule (workflow Schedule Triggers + Run All Services
+  // schedules), all in the scheduler's timezone (MICROFLOW_SCHEDULER_TIMEZONE,
+  // UTC by default) -- the same zone cron hours are read in.
+
+  async function fetchNextRuns() {
+    try {
+      const d = await apiJSON("/api/schedules/next-runs");
+      const byId = {};
+      (d.schedules || []).forEach((x) => { byId[x.id] = x; });
+      return { timezone: d.timezone || "UTC", byId: byId, list: d.schedules || [] };
+    } catch (e) {
+      return { timezone: "UTC", byId: {}, list: [] };
+    }
+  }
+
+  function relativeIn(iso) {
+    const ms = new Date(iso).getTime() - Date.now();
+    if (!(ms > 0)) return "";
+    const m = Math.round(ms / 60000);
+    if (m < 60) return "in " + m + " min";
+    const h = Math.floor(m / 60), mm = m % 60;
+    if (h < 48) return "in " + h + "h" + (mm ? " " + mm + "m" : "");
+    return "in " + Math.round(h / 24) + " days";
+  }
+
+  function nextRunText(info, tz) {
+    if (!info) return "\u2014";
+    if (info.state === "scheduled" && info.nextRun) {
+      return info.nextRunText + " " + tz + " (" + relativeIn(info.nextRun) + ")";
+    }
+    return { disabled: "Disabled", ended: "Ended", completed: "Completed (repeat limit reached)", invalid: "Not scheduled" }[info.state] || "\u2014";
+  }
+
+  async function loadNodeNextRun(nodeName) {
+    const el = document.getElementById("nodeNextRun");
+    if (!el || !editorState) return;
+    const prefix = editorState.workflow.id + "/" + nodeName;
+    const nr = await fetchNextRuns();
+    const mine = nr.list.filter((x) => x.id === prefix || x.id.indexOf(prefix + "#") === 0);
+    if (!document.getElementById("nodeNextRun")) return;
+    if (!mine.length) {
+      el.textContent = "Next run: \u2014 (not scheduled; save the workflow after enabling)";
+      return;
+    }
+    el.innerHTML = "Next run: " + mine.map((x) => escapeHtml(nextRunText(x, nr.timezone))).join("<br>");
+  }
+
+  // ---------------- Run All Services: Schedule ----------------
+  //
+  // Talks to internal/api/run_all_schedules.go. A schedule fires Run All
+  // Services automatically (cron or a plain interval) through the exact
+  // same path the manual button above uses -- no separate runner/queue.
+  // A newly added schedule always starts Disabled; Enable it once you're
+  // happy with the timing.
+
+  let rasEditingId = null; // null while adding, a schedule id while editing
+
+  function rasSectionHTML() {
+    return (
+      '<div id="rasSection" style="margin-top:18px;border-top:1px solid var(--border,#333);padding-top:14px;">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+      "<h4 style=\"margin:0;\">\u23F0 Run All Services \u2014 Schedule</h4>" +
+      '<button id="rasAddBtn" class="btn">+ Add Schedule</button>' +
+      "</div>" +
+      '<div class="sub" style="margin:6px 0 10px;">Set a time/day and MicroFlow will trigger Run All Services on its own ' +
+      "\u2014 every Service still runs one at a time, exactly like clicking the button above. Add, edit, delete, enable or disable as many as you like.</div>" +
+      rasFormHTML() +
+      '<div id="rasList" class="sub">Loading\u2026</div>' +
+      "</div>"
+    );
+  }
+
+  const RAS_DAYS = [["1", "Mon"], ["2", "Tue"], ["3", "Wed"], ["4", "Thu"], ["5", "Fri"], ["6", "Sat"], ["0", "Sun"]];
+
+  function rasFormHTML() {
+    const dayBoxes = RAS_DAYS.map((d) =>
+      '<label style="font-size:12px;"><input type="checkbox" class="ras-day" value="' + d[0] + '" checked> ' + d[1] + "</label>"
+    ).join(" ");
+    const hourOpts = Array.from({ length: 24 }, (_, h) => '<option value="' + h + '">' + String(h).padStart(2, "0") + "</option>").join("");
+    return (
+      '<div id="rasForm" class="card" style="display:none;margin-bottom:12px;padding:12px;">' +
+      '<div style="display:grid;gap:8px;max-width:520px;">' +
+      '<label style="font-size:12px;">Label (optional)<br>' +
+      '<input id="rasLabel" type="text" placeholder="e.g. Nightly run" style="width:100%;"></label>' +
+      '<div style="display:flex;gap:16px;font-size:12px;flex-wrap:wrap;">' +
+      '<label><input type="radio" name="rasMode" id="rasModeDays" value="days" checked> Days &amp; time</label>' +
+      '<label><input type="radio" name="rasMode" id="rasModeInterval" value="interval"> Simple interval</label>' +
+      '<label><input type="radio" name="rasMode" id="rasModeCron" value="cron"> Cron (advanced)</label>' +
+      "</div>" +
+      '<div id="rasDaysRow"><div style="font-size:12px;margin-bottom:4px;">Days</div>' +
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;">' + dayBoxes + "</div>" +
+      '<div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:12px;flex-wrap:wrap;">' +
+      '<label>Hour <select id="rasHour">' + hourOpts + "</select></label>" +
+      '<label>Minute <input id="rasMinute" type="number" min="0" max="59" value="0" style="width:64px;"></label>' +
+      "</div></div>" +
+      '<div id="rasCronRow" style="display:none;"><label style="font-size:12px;">Cron ("minute hour day month weekday")<br>' +
+      '<input id="rasCron" type="text" placeholder="0 19 * * *" style="width:100%;"></label>' +
+      '<div class="sub">Example: <code>0 19 * * *</code> = every day at 19:00. <code>0 9 * * 1-5</code> = weekdays at 09:00.</div></div>' +
+      '<div id="rasIntervalRow" style="display:none;">' +
+      '<label style="font-size:12px;">Every<br>' +
+      '<span style="display:flex;gap:6px;align-items:center;">' +
+      '<input id="rasIntervalValue" type="number" min="1" value="1" style="width:80px;">' +
+      '<select id="rasIntervalUnit"><option value="60">minute(s)</option><option value="3600">hour(s)</option><option value="86400">day(s)</option></select>' +
+      "</span></label></div>" +
+      '<div style="font-size:12px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">' +
+      '<label><input type="radio" name="rasRepeat" id="rasRepeatUnlimited" checked> Unlimited</label>' +
+      '<label><input type="radio" name="rasRepeat" id="rasRepeatN"> Repeat</label>' +
+      '<input id="rasRepeatCount" type="number" min="1" value="1" style="width:70px;"> <span>time(s)</span></div>' +
+      '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;">' +
+      '<label>Start (optional)<br><input id="rasStartAt" type="datetime-local"></label>' +
+      '<label>End (optional)<br><input id="rasEndAt" type="datetime-local"></label></div>' +
+      '<div class="sub" id="rasTzHint">All times use the scheduler timezone.</div>' +
+      '<label style="font-size:12px;"><input type="checkbox" id="rasStopOnFailure"> Stop if a Service fails</label>' +
+      '<div style="display:flex;gap:8px;">' +
+      '<button id="rasSaveBtn" class="btn btn-primary">Add Schedule</button>' +
+      '<button id="rasCancelBtn" class="btn">Cancel</button>' +
+      "</div></div></div>"
+    );
+  }
+
+  // Days + Hour + Minute are stored as an ordinary cron expression
+  // ("M H * * d,d,d" / "M H * * *"), so the existing scheduler runs it
+  // unchanged; rasParseDaysCron turns such a cron back into the form.
+  function rasBuildDaysCron() {
+    const days = Array.from(document.querySelectorAll(".ras-day:checked")).map((c) => c.value);
+    if (!days.length) return null;
+    const h = document.getElementById("rasHour").value;
+    const m = parseInt(document.getElementById("rasMinute").value, 10);
+    if (isNaN(m) || m < 0 || m > 59) return null;
+    return m + " " + h + " * * " + (days.length === 7 ? "*" : days.join(","));
+  }
+
+  function rasParseDaysCron(expr) {
+    const mt = /^(\d{1,2}) (\d{1,2}) \* \* (\*|[0-6](?:,[0-6])*)$/.exec((expr || "").trim());
+    if (!mt || +mt[1] > 59 || +mt[2] > 23) return null;
+    return { minute: +mt[1], hour: +mt[2], days: mt[3] === "*" ? RAS_DAYS.map((d) => d[0]) : mt[3].split(",") };
+  }
+
+  function rasTimingText(row) {
+    if (row.cronExpr) {
+      const d = rasParseDaysCron(row.cronExpr);
+      if (d) {
+        const names = d.days.length === 7 ? "Every day" : RAS_DAYS.filter((x) => d.days.indexOf(x[0]) >= 0).map((x) => x[1]).join(", ");
+        return names + " at " + String(d.hour).padStart(2, "0") + ":" + String(d.minute).padStart(2, "0");
+      }
+      return "Cron " + row.cronExpr;
+    }
+    const s = row.intervalSeconds || 0;
+    if (s > 0 && s % 86400 === 0) return "Every " + (s / 86400) + " day(s)";
+    if (s > 0 && s % 3600 === 0) return "Every " + (s / 3600) + " hour(s)";
+    if (s > 0 && s % 60 === 0) return "Every " + (s / 60) + " minute(s)";
+    return "Every " + s + " second(s)";
+  }
+
+  function rasRepeatText(row) {
+    const runs = (row.runCount || 0) + " / " + (row.maxRuns > 0 ? row.maxRuns : "\u221E");
+    const win = (row.startAt ? "from " + row.startAt.replace("T", " ") : "") + (row.endAt ? " until " + row.endAt.replace("T", " ") : "");
+    return "Runs " + runs + (win ? "<br>" + escapeHtml(win) : "");
+  }
+
+  function rasListHTML(rows, nr) {
+    if (!rows || !rows.length) return '<div class="sub">No schedules yet.</div>';
+    const tz = (nr && nr.timezone) || "UTC";
+    const rowsHtml = rows.map((row) =>
+      "<tr>" +
+      "<td>" + escapeHtml(row.label || "\u2014") + "</td>" +
+      "<td>" + escapeHtml(rasTimingText(row)) + "</td>" +
+      "<td>" + rasRepeatText(row) + "</td>" +
+      "<td>" + escapeHtml(nextRunText(nr && nr.byId[row.id], tz)) + "</td>" +
+      "<td>" + (row.stopOnFailure ? "Yes" : "No") + "</td>" +
+      '<td><span class="badge ' + (row.enabled ? "badge-active" : "badge-inactive") + '">' +
+      (row.enabled ? "Enabled" : "Disabled") + "</span></td>" +
+      '<td style="display:flex;gap:6px;flex-wrap:wrap;">' +
+      '<button class="btn btn-sm ras-toggle" data-id="' + escapeHtml(row.id) + '" data-enabled="' + (row.enabled ? "1" : "0") + '">' +
+      (row.enabled ? "Disable" : "Enable") + "</button>" +
+      '<button class="btn btn-sm ras-edit" data-id="' + escapeHtml(row.id) + '">Edit</button>' +
+      '<button class="btn btn-sm btn-danger ras-delete" data-id="' + escapeHtml(row.id) + '">Delete</button>' +
+      "</td></tr>"
+    ).join("");
+    return (
+      '<div class="sub" style="margin-bottom:6px;">Times shown in scheduler timezone: <b>' + escapeHtml(tz) + "</b></div>" +
+      '<table class="wf-table"><thead><tr><th>Label</th><th>Schedule</th><th>Repeat / window</th><th>Next run</th><th>Stop on failure</th><th>Status</th><th></th></tr></thead>' +
+      "<tbody>" + rowsHtml + "</tbody></table>"
+    );
+  }
+
+  function rasSetMode(mode) {
+    document.getElementById("rasModeDays").checked = mode === "days";
+    document.getElementById("rasModeCron").checked = mode === "cron";
+    document.getElementById("rasModeInterval").checked = mode === "interval";
+    document.getElementById("rasDaysRow").style.display = mode === "days" ? "" : "none";
+    document.getElementById("rasCronRow").style.display = mode === "cron" ? "" : "none";
+    document.getElementById("rasIntervalRow").style.display = mode === "interval" ? "" : "none";
+  }
+
+  function rasSetDays(days) {
+    document.querySelectorAll(".ras-day").forEach((c) => { c.checked = days.indexOf(c.value) >= 0; });
+  }
+
+  function rasSetRepeat(maxRuns) {
+    document.getElementById("rasRepeatUnlimited").checked = !(maxRuns > 0);
+    document.getElementById("rasRepeatN").checked = maxRuns > 0;
+    document.getElementById("rasRepeatCount").value = String(maxRuns > 0 ? maxRuns : 1);
+  }
+
+  function rasResetForm() {
+    rasEditingId = null;
+    document.getElementById("rasLabel").value = "";
+    document.getElementById("rasCron").value = "";
+    document.getElementById("rasIntervalValue").value = "1";
+    document.getElementById("rasIntervalUnit").value = "3600";
+    document.getElementById("rasStopOnFailure").checked = false;
+    document.getElementById("rasHour").value = "9";
+    document.getElementById("rasMinute").value = "0";
+    document.getElementById("rasStartAt").value = "";
+    document.getElementById("rasEndAt").value = "";
+    rasSetDays(RAS_DAYS.map((d) => d[0]));
+    rasSetRepeat(0);
+    rasSetMode("days");
+    document.getElementById("rasSaveBtn").textContent = "Add Schedule";
+  }
+
+  function rasFillFormForEdit(row) {
+    rasEditingId = row.id;
+    document.getElementById("rasLabel").value = row.label || "";
+    document.getElementById("rasStopOnFailure").checked = !!row.stopOnFailure;
+    document.getElementById("rasStartAt").value = row.startAt || "";
+    document.getElementById("rasEndAt").value = row.endAt || "";
+    rasSetRepeat(row.maxRuns || 0);
+    const d = row.cronExpr ? rasParseDaysCron(row.cronExpr) : null;
+    if (d) {
+      rasSetMode("days");
+      rasSetDays(d.days);
+      document.getElementById("rasHour").value = String(d.hour);
+      document.getElementById("rasMinute").value = String(d.minute);
+    } else if (row.cronExpr) {
+      rasSetMode("cron");
+      document.getElementById("rasCron").value = row.cronExpr;
+    } else {
+      rasSetMode("interval");
+      const s = row.intervalSeconds || 60;
+      let unit = 60, val = s;
+      if (s > 0 && s % 86400 === 0) { unit = 86400; val = s / 86400; }
+      else if (s > 0 && s % 3600 === 0) { unit = 3600; val = s / 3600; }
+      else if (s > 0 && s % 60 === 0) { unit = 60; val = s / 60; }
+      else { unit = 1; val = s; }
+      document.getElementById("rasIntervalUnit").value = String(unit);
+      document.getElementById("rasIntervalValue").value = String(val);
+    }
+    document.getElementById("rasSaveBtn").textContent = "Save Changes";
+    document.getElementById("rasForm").style.display = "";
+  }
+
+  async function reloadRasList() {
+    const listEl = document.getElementById("rasList");
+    if (!listEl) return;
+    try {
+      const [rows, nr] = await Promise.all([apiJSON("/api/run-all-schedules"), fetchNextRuns()]);
+      listEl.innerHTML = rasListHTML(rows, nr);
+      const hint = document.getElementById("rasTzHint");
+      if (hint) hint.textContent = "Hour/Minute, Start and End use the scheduler timezone: " + nr.timezone;
+      wireRasListButtons();
+    } catch (e) {
+      listEl.innerHTML = '<div class="field-error">' + escapeHtml(e.message) + "</div>";
+    }
+  }
+
+  function wireRasListButtons() {
+    document.querySelectorAll(".ras-toggle").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-id");
+        const enabled = btn.getAttribute("data-enabled") === "1";
+        btn.disabled = true;
+        try {
+          await apiJSON("/api/run-all-schedules/" + encodeURIComponent(id) + "/" + (enabled ? "disable" : "enable"), { method: "POST" });
+          toast(enabled ? "Schedule disabled" : "Schedule enabled", "success");
+          await reloadRasList();
+        } catch (e) {
+          toast(e.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+    document.querySelectorAll(".ras-edit").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-id");
+        try {
+          const row = await apiJSON("/api/run-all-schedules/" + encodeURIComponent(id));
+          rasFillFormForEdit(row);
+        } catch (e) {
+          toast(e.message, "error");
+        }
+      });
+    });
+    document.querySelectorAll(".ras-delete").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-id");
+        if (!confirm("Delete this schedule? This cannot be undone.")) return;
+        btn.disabled = true;
+        try {
+          await apiJSON("/api/run-all-schedules/" + encodeURIComponent(id), { method: "DELETE" });
+          toast("Schedule deleted", "success");
+          if (rasEditingId === id) {
+            rasResetForm();
+            document.getElementById("rasForm").style.display = "none";
+          }
+          await reloadRasList();
+        } catch (e) {
+          toast(e.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function wireRunAllSchedules() {
+    const addBtn = document.getElementById("rasAddBtn");
+    const form = document.getElementById("rasForm");
+    const saveBtn = document.getElementById("rasSaveBtn");
+    const cancelBtn = document.getElementById("rasCancelBtn");
+    if (!addBtn) return;
+    if (addBtn.dataset.wired) {
+      // wireRunAllPanel() can be called again on the same, still-mounted
+      // DOM (e.g. after running a single Service) without a re-render --
+      // only refresh the list then, so click handlers are never attached
+      // twice (which would otherwise submit the Add/Edit form twice).
+      reloadRasList();
+      return;
+    }
+    addBtn.dataset.wired = "1";
+    addBtn.addEventListener("click", () => {
+      const showing = form.style.display !== "none";
+      if (showing) {
+        form.style.display = "none";
+        return;
+      }
+      rasResetForm();
+      form.style.display = "";
+    });
+    document.getElementById("rasModeDays").addEventListener("change", () => rasSetMode("days"));
+    document.getElementById("rasModeCron").addEventListener("change", () => rasSetMode("cron"));
+    document.getElementById("rasModeInterval").addEventListener("change", () => rasSetMode("interval"));
+    cancelBtn.addEventListener("click", () => {
+      form.style.display = "none";
+      rasResetForm();
+    });
+    saveBtn.addEventListener("click", async () => {
+      const payload = {
+        label: document.getElementById("rasLabel").value.trim(),
+        stopOnFailure: document.getElementById("rasStopOnFailure").checked,
+        startAt: document.getElementById("rasStartAt").value,
+        endAt: document.getElementById("rasEndAt").value,
+        maxRuns: 0,
+      };
+      if (document.getElementById("rasRepeatN").checked) {
+        const n = parseInt(document.getElementById("rasRepeatCount").value, 10);
+        if (!n || n < 1) { toast("Enter a valid repeat count (or choose Unlimited)", "error"); return; }
+        payload.maxRuns = n;
+      }
+      if (payload.startAt && payload.endAt && payload.endAt <= payload.startAt) {
+        toast("End must be after Start", "error");
+        return;
+      }
+      if (document.getElementById("rasModeCron").checked) {
+        payload.cronExpr = document.getElementById("rasCron").value.trim();
+        payload.intervalSeconds = 0;
+        if (!payload.cronExpr) { toast("Enter a cron expression", "error"); return; }
+      } else if (document.getElementById("rasModeInterval").checked) {
+        const val = parseInt(document.getElementById("rasIntervalValue").value, 10);
+        const unit = parseInt(document.getElementById("rasIntervalUnit").value, 10);
+        if (!val || val < 1) { toast("Enter a valid interval", "error"); return; }
+        payload.intervalSeconds = val * unit;
+        payload.cronExpr = "";
+      } else {
+        const cron = rasBuildDaysCron();
+        if (!cron) { toast("Pick at least one day and a valid hour/minute", "error"); return; }
+        payload.cronExpr = cron;
+        payload.intervalSeconds = 0;
+      }
+      saveBtn.disabled = true;
+      try {
+        if (rasEditingId) {
+          await apiJSON("/api/run-all-schedules/" + encodeURIComponent(rasEditingId), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          toast("Schedule updated", "success");
+        } else {
+          await apiJSON("/api/run-all-schedules", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          toast("Schedule added (disabled \u2014 enable it when ready)", "success");
+        }
+        form.style.display = "none";
+        rasResetForm();
+        await reloadRasList();
+      } catch (e) {
+        toast(e.message, "error");
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+    reloadRasList();
   }
 
   function runAllStatusHTML(st) {
@@ -1966,6 +2388,7 @@
     refresh().then(() => {
       if (btn.disabled) startPolling();
     });
+    wireRunAllSchedules();
   }
 
   async function runCurrentService(btn) {
