@@ -25,6 +25,15 @@ type Store interface {
 	PutEncrypted(ctx context.Context, workflowID, logicalName string, ciphertext []byte) error
 }
 
+// ErrCredentialNotFound is returned (wrapped, so errors.Is matches) when
+// no credential is stored for a workflow/logical name. Store
+// implementations must return it (or an error wrapping it) from
+// GetEncrypted when the row genuinely does not exist. It is the ONLY
+// per-node resolve failure that may fall back to a connected Google
+// account; every other error (e.g. a revoked refresh token) must be
+// surfaced as-is.
+var ErrCredentialNotFound = errors.New("credential not found")
+
 type Vault struct {
 	store Store
 	aead  cipher.AEAD
@@ -121,7 +130,12 @@ func (v *Vault) Put(ctx context.Context, workflowID, logicalName string, secrets
 func (v *Vault) Resolve(ctx context.Context, workflowID, logicalName string) (map[string]string, error) {
 	ciphertext, err := v.store.GetEncrypted(ctx, workflowID, logicalName)
 	if err != nil {
-		return nil, fmt.Errorf("vault: credential %q not found for workflow %q", logicalName, workflowID)
+		if errors.Is(err, ErrCredentialNotFound) {
+			return nil, fmt.Errorf("vault: %w: %q for workflow %q", ErrCredentialNotFound, logicalName, workflowID)
+		}
+		// DB/network/other storage failure: surface the original error so
+		// callers never mistake a temporary outage for a missing credential.
+		return nil, fmt.Errorf("vault: reading credential %q for workflow %q: %w", logicalName, workflowID, err)
 	}
 	ns := v.aead.NonceSize()
 	if len(ciphertext) < ns {
