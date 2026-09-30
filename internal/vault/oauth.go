@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -125,18 +126,24 @@ func (e *refreshEngine) resolve(
 		return secrets, nil
 	}
 
-	newAccess, newExpiresAt, err := e.refresh(ctx, secrets["clientId"], secrets["clientSecret"], refreshToken)
+	// Use the refresh token from the fresh re-read above (not the one
+	// read before taking the lock), so a token rotated meanwhile is used.
+	newAccess, newRefresh, newExpiresAt, err := e.refresh(ctx, secrets["clientId"], secrets["clientSecret"], secrets["refreshToken"])
 	if err != nil {
 		return nil, fmt.Errorf("oauth: refresh failed for %q: %w", lockKey, err)
 	}
 
 	secrets["accessToken"] = newAccess
 	secrets["expiresAt"] = strconv.FormatInt(newExpiresAt.Unix(), 10)
+	if newRefresh != "" {
+		// Google only sometimes rotates the refresh token; when it does,
+		// the new one must replace the stored one.
+		secrets["refreshToken"] = newRefresh
+	}
 	if err := put(ctx, secrets); err != nil {
-		// Non-fatal: we still have a valid in-memory token for this call,
-		// even though persisting the refreshed token failed. Log-worthy
-		// but the caller should proceed with the token it has.
-		return secrets, fmt.Errorf("oauth: refreshed token but failed to persist it (will re-refresh next call): %w", err)
+		// Non-fatal: the in-memory token is valid for this call; the next
+		// call simply refreshes again. Never log secret values.
+		log.Printf("oauth: refreshed token for %q but failed to persist it (will re-refresh next call): %v", lockKey, err)
 	}
 	return secrets, nil
 }
@@ -156,9 +163,9 @@ func needsRefresh(expiresAtStr string) bool {
 // net/url only -- no golang.org/x/oauth2 dependency, since this was
 // written where fetching an extra module wasn't possible; feel free to
 // swap in x/oauth2 locally if you prefer it).
-func (e *refreshEngine) refresh(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, expiresAt time.Time, err error) {
+func (e *refreshEngine) refresh(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken, newRefreshToken string, expiresAt time.Time, err error) {
 	if clientID == "" || clientSecret == "" {
-		return "", time.Time{}, fmt.Errorf("missing clientId/clientSecret on stored credential")
+		return "", "", time.Time{}, fmt.Errorf("missing clientId/clientSecret on stored credential")
 	}
 	form := url.Values{
 		"client_id":     {clientID},
@@ -168,30 +175,37 @@ func (e *refreshEngine) refresh(ctx context.Context, clientID, clientSecret, ref
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", time.Time{}, err
+		return "", "", time.Time{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return "", time.Time{}, err
+		return "", "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 
 	var body struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-		Error       string `json:"error"`
-		ErrorDesc   string `json:"error_description"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", time.Time{}, fmt.Errorf("decode token response: %w", err)
+		return "", "", time.Time{}, fmt.Errorf("decode token response: %w", err)
 	}
 	if body.Error == "invalid_grant" {
-		return "", time.Time{}, fmt.Errorf("token endpoint rejected refresh token: %w", ErrGoogleReauthRequired)
+		return "", "", time.Time{}, fmt.Errorf("token endpoint rejected refresh token: %w", ErrGoogleReauthRequired)
 	}
 	if resp.StatusCode >= 300 || body.Error != "" {
-		return "", time.Time{}, fmt.Errorf("token endpoint returned %d: %s: %s", resp.StatusCode, body.Error, body.ErrorDesc)
+		return "", "", time.Time{}, fmt.Errorf("token endpoint returned %d: %s: %s", resp.StatusCode, body.Error, body.ErrorDesc)
 	}
-	return body.AccessToken, time.Now().Add(time.Duration(body.ExpiresIn) * time.Second), nil
+	if body.AccessToken == "" {
+		return "", "", time.Time{}, errors.New("token endpoint returned no access token")
+	}
+	if body.ExpiresIn <= 0 {
+		body.ExpiresIn = 3600 // Google access tokens last 1h; avoid refreshing on every call
+	}
+	return body.AccessToken, body.RefreshToken, time.Now().Add(time.Duration(body.ExpiresIn) * time.Second), nil
 }

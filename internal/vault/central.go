@@ -157,8 +157,17 @@ func NewCentralFallbackResolver(perNode *OAuthResolver, account *AccountResolver
 }
 
 func (r *CentralFallbackResolver) Resolve(ctx context.Context, workflowID, logicalName string) (map[string]string, error) {
-	if secrets, err := r.perNode.Resolve(ctx, workflowID, logicalName); err == nil {
+	secrets, err := r.perNode.Resolve(ctx, workflowID, logicalName)
+	if err == nil {
 		return secrets, nil
+	}
+	// Fall back to the central account ONLY when no per-node credential
+	// exists. Any other failure (notably ErrGoogleReauthRequired -- the
+	// per-node refresh token was revoked) is returned as-is so the
+	// person is asked to reconnect instead of silently using a
+	// different Google account.
+	if !errors.Is(err, ErrCredentialNotFound) {
+		return nil, err
 	}
 	return r.account.Resolve(ctx)
 }
@@ -328,7 +337,9 @@ func (g *GoogleServiceAccounts) Status(ctx context.Context, msvcID, service stri
 		if errors.Is(rerr, ErrGoogleReauthRequired) {
 			return "", updatedAt, true, true, nil
 		}
-		return "", updatedAt, true, false, rerr
+		// Transient failure (network, Google 5xx, ...): the connection is
+		// still valid, so don't report an error or ask for a reconnect.
+		return "", updatedAt, true, false, nil
 	}
 	return secrets["email"], updatedAt, true, false, nil
 }
