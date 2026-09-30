@@ -62,6 +62,19 @@ func GenerateMasterKey() (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
+// CanOpen reports whether ciphertext was sealed with THIS vault's master key.
+// Used by database Import to reject (before touching anything) a backup whose
+// secrets this installation could never decrypt. It never returns or logs
+// plaintext.
+func (v *Vault) CanOpen(ciphertext []byte) bool {
+	ns := v.aead.NonceSize()
+	if len(ciphertext) < ns {
+		return false
+	}
+	_, err := v.aead.Open(nil, ciphertext[:ns], ciphertext[ns:], nil)
+	return err == nil
+}
+
 // Put encrypts and stores a set of key/value secrets for one logical
 // credential (e.g. {"accessToken": "...", "refreshToken": "..."}).
 func (v *Vault) Put(ctx context.Context, workflowID, logicalName string, secrets map[string]string) error {
