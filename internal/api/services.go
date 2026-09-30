@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -35,6 +36,9 @@ func (s *Server) routesTenancy() {
 	s.mux.HandleFunc("GET /api/global-env", s.handleListGlobalEnv)
 	s.mux.HandleFunc("POST /api/global-env", s.handlePutGlobalEnv)
 	s.mux.HandleFunc("DELETE /api/global-env/{key}", s.handleDeleteGlobalEnv)
+	s.mux.HandleFunc("GET /api/global-env/{key}", s.handleRevealGlobalEnv)
+	s.mux.HandleFunc("POST /api/global-env/import", s.handleImportGlobalEnv)
+	s.mux.HandleFunc("POST /api/global-env/delete-all", s.handleDeleteAllGlobalEnv)
 
 	s.mux.HandleFunc("GET /api/services/{id}/env", s.handleListServiceEnv)
 	s.mux.HandleFunc("POST /api/services/{id}/env", s.handlePutServiceEnv)
@@ -310,6 +314,34 @@ func (s *Server) handlePutGlobalEnv(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if req.Mode != "" && req.Mode != "create" && req.Mode != "update" {
+		writeErr(w, http.StatusBadRequest, errors.New("mode must be create or update"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	if req.Mode != "" {
+		list, err := s.services.ListGlobalEnv(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, errors.New("failed to check global environment"))
+			return
+		}
+		exists := false
+		for _, e := range list {
+			if e.Key == req.Key {
+				exists = true
+				break
+			}
+		}
+		if req.Mode == "create" && exists {
+			writeErr(w, http.StatusConflict, errors.New("a variable with this name already exists in Global -- use Edit to change it"))
+			return
+		}
+		if req.Mode == "update" && !exists {
+			writeErr(w, http.StatusNotFound, errors.New("variable not found in Global"))
+			return
+		}
 	}
 	if err := s.envVault.PutGlobal(r.Context(), req.Key, req.Value, req.IsSecret); err != nil {
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to save global environment value"))
@@ -681,6 +713,144 @@ func (s *Server) handleDeleteAllServiceEnv(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	log.Printf("service environment set deleted: service=%s variables=%d", id, n) // count only, never keys/values
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted": n})
+}
+
+// globalEnvExtras is the optional Global-side counterpart of GetService /
+// DeleteAllService. It is a separate interface (satisfied by
+// *vault.EnvVault) so EnvResolver and its test fakes stay unchanged.
+type globalEnvExtras interface {
+	GetGlobal(ctx context.Context, key string) (value string, found bool, err error)
+	DeleteAllGlobal(ctx context.Context) (int, error)
+}
+
+// globalEnvConfirmName is what must be typed to delete the whole Global
+// Environment set (Global has no Service name to type).
+const globalEnvConfirmName = "Global"
+
+// handleRevealGlobalEnv returns ONE decrypted Global value, only on an
+// explicit per-key request (View / Edit). Lists stay metadata-only.
+func (s *Server) handleRevealGlobalEnv(w http.ResponseWriter, r *http.Request) {
+	x, ok := s.envVault.(globalEnvExtras)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, errors.New("viewing Global values is not enabled on this server"))
+		return
+	}
+	key := r.PathValue("key")
+	if !validEnvKey.MatchString(key) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid key"))
+		return
+	}
+	val, found, err := x.GetGlobal(r.Context(), key)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to read global environment value"))
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, errors.New("variable not found in Global"))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": val})
+}
+
+// handleImportGlobalEnv imports .env text into the Global Environment.
+// Same parsing/limits/response as the Service import; existing keys are
+// kept unless overwrite=true; values are stored as secrets; the response
+// never contains a value.
+func (s *Server) handleImportGlobalEnv(w http.ResponseWriter, r *http.Request) {
+	var req envImportRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxEnvImportBytes+4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	if len(req.Content) > maxEnvImportBytes {
+		writeErr(w, http.StatusBadRequest, errors.New(".env content is too large"))
+		return
+	}
+	entries, issues, dupes := parseDotEnv(req.Content)
+	if len(entries) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("no valid KEY=VALUE entries found"))
+		return
+	}
+	if len(entries) > maxEnvImportEntries {
+		writeErr(w, http.StatusBadRequest, errors.New("too many entries in one import"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	existing, err := s.services.ListGlobalEnv(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to check global environment"))
+		return
+	}
+	have := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		have[e.Key] = true
+	}
+	added, updated, skipped := 0, 0, 0
+	for _, kv := range entries {
+		if have[kv.Key] && !req.Overwrite {
+			skipped++
+			continue
+		}
+		if err := s.envVault.PutGlobal(r.Context(), kv.Key, kv.Value, true); err != nil {
+			writeErr(w, http.StatusInternalServerError, errors.New("failed to save global environment value"))
+			return
+		}
+		if have[kv.Key] {
+			updated++
+		} else {
+			added++
+		}
+	}
+	if issues == nil {
+		issues = []envImportIssue{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"added": added, "updated": updated, "skipped": skipped,
+		"duplicatesInFile": dupes, "invalid": issues,
+	})
+}
+
+// handleDeleteAllGlobalEnv deletes the whole Global Environment set.
+// Two steps, both enforced HERE: (1) confirmName must equal "Global";
+// (2) the login gate's password re-check (s.reauth, same rate limiter as
+// login). Fails closed if no re-check is wired. Service Environments,
+// workflows and credentials are never touched.
+func (s *Server) handleDeleteAllGlobalEnv(w http.ResponseWriter, r *http.Request) {
+	x, ok := s.envVault.(globalEnvExtras)
+	if !ok || s.reauth == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("deleting the Global Environment set is not enabled on this server"))
+		return
+	}
+	var req envDeleteAllRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	if req.ConfirmName != globalEnvConfirmName {
+		writeErr(w, http.StatusBadRequest, errors.New("confirmation did not match -- nothing was deleted"))
+		return
+	}
+	okPw, wait := s.reauth(r, req.Password)
+	if wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeErr(w, http.StatusTooManyRequests, errors.New("too many failed attempts -- try again later"))
+		return
+	}
+	if !okPw {
+		writeErr(w, http.StatusForbidden, errors.New("verification failed -- nothing was deleted"))
+		return
+	}
+	envWriteMu.Lock()
+	defer envWriteMu.Unlock()
+	n, err := x.DeleteAllGlobal(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to delete global environment"))
+		return
+	}
+	log.Printf("global environment set deleted: variables=%d", n) // count only, never keys/values
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted": n})
 }
 
