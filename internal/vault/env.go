@@ -70,6 +70,48 @@ func (ev *EnvVault) DeleteGlobal(ctx context.Context, key string) error {
 	return ev.store.DeleteGlobalEnv(ctx, key)
 }
 
+// GetGlobal decrypts and returns ONE Global Environment value (found=false
+// if the key is not set). Only used by the explicit, per-key "reveal"
+// endpoint -- never by list responses.
+func (ev *EnvVault) GetGlobal(ctx context.Context, key string) (value string, found bool, err error) {
+	all, err := ev.store.AllGlobalEnvCiphertext(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	ct, ok := all[key]
+	if !ok {
+		return "", false, nil
+	}
+	v, err := ev.open(ct)
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+// DeleteAllGlobal removes every Global Environment variable (and nothing
+// else -- Service Environments, workflows and credentials are untouched).
+// Returns how many variables were removed.
+func (ev *EnvVault) DeleteAllGlobal(ctx context.Context) (int, error) {
+	if a, ok := ev.store.(interface {
+		DeleteAllGlobalEnv(ctx context.Context) (int, error)
+	}); ok {
+		return a.DeleteAllGlobalEnv(ctx)
+	}
+	all, err := ev.store.AllGlobalEnvCiphertext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for k := range all {
+		if err := ev.store.DeleteGlobalEnv(ctx, k); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 // PutService encrypts and stores one Service Environment override.
 func (ev *EnvVault) PutService(ctx context.Context, serviceID, key, value string, isSecret bool) error {
 	ct, err := ev.seal(value)
