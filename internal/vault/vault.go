@@ -75,6 +75,33 @@ func (v *Vault) CanOpen(ciphertext []byte) bool {
 	return err == nil
 }
 
+// Open decrypts one vault ciphertext with THIS installation's master key.
+// Used only by database Export to hand secrets (in memory, never to disk or
+// logs) to the backup re-encryption step.
+func (v *Vault) Open(ciphertext []byte) ([]byte, error) {
+	ns := v.aead.NonceSize()
+	if len(ciphertext) < ns {
+		return nil, errors.New("vault: corrupt ciphertext")
+	}
+	pt, err := v.aead.Open(nil, ciphertext[:ns], ciphertext[ns:], nil)
+	if err != nil {
+		// deliberately generic: never echo cipher internals or key material
+		return nil, errors.New("vault: decryption failed")
+	}
+	return pt, nil
+}
+
+// Seal encrypts plaintext with THIS installation's master key, producing the
+// exact nonce||AES-GCM layout every other vault row uses. Used only by
+// database Import to re-key restored secrets to the target installation.
+func (v *Vault) Seal(plaintext []byte) ([]byte, error) {
+	nonce := make([]byte, v.aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return v.aead.Seal(nonce, nonce, plaintext, nil), nil
+}
+
 // Put encrypts and stores a set of key/value secrets for one logical
 // credential (e.g. {"accessToken": "...", "refreshToken": "..."}).
 func (v *Vault) Put(ctx context.Context, workflowID, logicalName string, secrets map[string]string) error {
