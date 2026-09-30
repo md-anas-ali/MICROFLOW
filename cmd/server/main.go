@@ -69,10 +69,14 @@ func main() {
 	}
 
 	// Login page credentials come from MICROFLOW_LOGIN_USER /
-	// MICROFLOW_LOGIN_PASSWORD (see auth.go). Fails closed if missing.
+	// MICROFLOW_LOGIN_PASSWORD (see auth.go). Both unset = login disabled;
+	// exactly one set = refuse to start.
 	gate, err := newAuthGateFromEnv()
 	if err != nil {
 		log.Fatal(err)
+	}
+	if !gate.enabled {
+		log.Printf("warning: login is DISABLED (MICROFLOW_LOGIN_USER / MICROFLOW_LOGIN_PASSWORD not set) -- anyone who can reach this URL can use MicroFlow")
 	}
 
 	st, err := store.Open(ctx, dbURL)

@@ -3,9 +3,15 @@
 // Credentials come ONLY from environment variables (never stored in the
 // database, never hardcoded):
 //
-//	MICROFLOW_LOGIN_USER       required  -- login user name
-//	MICROFLOW_LOGIN_PASSWORD   required  -- login password
+//	MICROFLOW_LOGIN_USER       login user name
+//	MICROFLOW_LOGIN_PASSWORD   login password
 //	MICROFLOW_SESSION_HOURS    optional  -- session lifetime, default 168 (7 days)
+//
+// Login is OPTIONAL: if BOTH MICROFLOW_LOGIN_USER and
+// MICROFLOW_LOGIN_PASSWORD are unset/empty the login gate is disabled
+// (no login page, everything is open). If both are set the gate is on.
+// If only ONE of them is set the server refuses to start (fail closed --
+// that is almost certainly a typo, and must not silently expose the app).
 //
 // How it works:
 //   - Every request except /login, /logout, /healthz and /webhook/* needs a
@@ -49,6 +55,10 @@ type failRecord struct {
 }
 
 type authGate struct {
+	// enabled is false when no login credentials are configured: the gate
+	// then passes every request straight through.
+	enabled bool
+
 	user string
 	pass string
 	key  []byte
@@ -58,13 +68,16 @@ type authGate struct {
 	fails map[string]*failRecord
 }
 
-// newAuthGateFromEnv fails closed: if the login env vars are missing the
-// server refuses to start instead of silently exposing the UI/API.
+// newAuthGateFromEnv: both login vars unset -> login disabled; both set
+// -> login enabled; exactly one set -> error (fail closed).
 func newAuthGateFromEnv() (*authGate, error) {
 	user := strings.TrimSpace(os.Getenv("MICROFLOW_LOGIN_USER"))
 	pass := os.Getenv("MICROFLOW_LOGIN_PASSWORD")
+	if user == "" && pass == "" {
+		return &authGate{enabled: false, fails: map[string]*failRecord{}}, nil
+	}
 	if user == "" || pass == "" {
-		return nil, errors.New("MICROFLOW_LOGIN_USER and MICROFLOW_LOGIN_PASSWORD are required (login page credentials) -- set both environment variables")
+		return nil, errors.New("MICROFLOW_LOGIN_USER and MICROFLOW_LOGIN_PASSWORD must be set together -- set both to enable the login page, or leave both unset to disable it")
 	}
 	hours := envInt("MICROFLOW_SESSION_HOURS", 168)
 	if hours < 1 {
@@ -72,11 +85,12 @@ func newAuthGateFromEnv() (*authGate, error) {
 	}
 	sum := sha256.Sum256([]byte("microflow-session-v1\x00" + user + "\x00" + pass + "\x00" + os.Getenv("MICROFLOW_MASTER_KEY")))
 	return &authGate{
-		user:  user,
-		pass:  pass,
-		key:   sum[:],
-		ttl:   time.Duration(hours) * time.Hour,
-		fails: map[string]*failRecord{},
+		enabled: true,
+		user:    user,
+		pass:    pass,
+		key:     sum[:],
+		ttl:     time.Duration(hours) * time.Hour,
+		fails:   map[string]*failRecord{},
 	}, nil
 }
 
@@ -84,6 +98,31 @@ func newAuthGateFromEnv() (*authGate, error) {
 func (g *authGate) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		if !g.enabled {
+			// Login disabled (no credentials configured): no login page.
+			switch {
+			case p == "/login" || p == "/logout":
+				http.Redirect(w, r, "/", http.StatusFound)
+			case p == "/healthz":
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte("ok"))
+			case p == "/api/auth-status":
+				writeAuthStatus(w, false)
+			default:
+				next.ServeHTTP(w, r)
+			}
+			return
+		}
+		if p == "/api/auth-status" {
+			if !g.validSession(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"login required"}`))
+				return
+			}
+			writeAuthStatus(w, true)
+			return
+		}
 		switch {
 		case p == "/login":
 			g.handleLogin(w, r)
@@ -111,6 +150,18 @@ func (g *authGate) Wrap(next http.Handler) http.Handler {
 		}
 		http.Redirect(w, r, "/login", http.StatusFound)
 	})
+}
+
+// writeAuthStatus tells the dashboard whether a login password exists
+// (so the "delete Environment set" dialog knows whether to ask for it).
+func writeAuthStatus(w http.ResponseWriter, required bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if required {
+		_, _ = w.Write([]byte(`{"loginRequired":true}`))
+		return
+	}
+	_, _ = w.Write([]byte(`{"loginRequired":false}`))
 }
 
 func (g *authGate) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +207,11 @@ func (g *authGate) handleLogin(w http.ResponseWriter, r *http.Request) {
 // no separate auth system. The request must also carry a valid session.
 // retryAfter > 0 means the IP is currently locked out.
 func (g *authGate) verifyPassword(r *http.Request, password string) (ok bool, retryAfter time.Duration) {
+	if !g.enabled {
+		// No login password is configured, so there is nothing to
+		// re-check; the typed-name confirmation is the only step.
+		return true, 0
+	}
 	if !g.validSession(r) {
 		return false, 0
 	}
