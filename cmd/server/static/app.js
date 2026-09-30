@@ -718,25 +718,24 @@
   // database in a single transaction (all-or-nothing) and reloads its
   // schedules/webhooks; this page then reloads so every view reads fresh state.
   function renderDatabasePage() {
-    const CONFIRM = "REPLACE DATABASE";
+    const CONFIRM = "IMPORT DATABASE";
+    const EXPORT_CONFIRM = "EXPORT DATABASE";
     viewEl.innerHTML =
       '<div class="narrow"><div class="page-head"><div><h1>\uD83D\uDDC4\uFE0F Database</h1>' +
       '<div class="sub">Move all of MicroFlow\u2019s saved state to another installation.</div></div></div>' +
       '<div class="card"><div class="env-section-title">\u2B07\uFE0F Export Database</div>' +
       '<div class="cred-section-note">Downloads one backup file with your Services, Environments, workflows, schedules and connected accounts. ' +
-      'Secrets are never stored in plain text: they are encrypted with the backup passphrase you choose below, so the backup restores on any MicroFlow installation without its <code>MICROFLOW_MASTER_KEY</code>. ' +
-      '<b>Keep the passphrase safe \u2014 without it the backup cannot be restored.</b> ' +
+      'Secrets are never stored in plain text and the backup restores on any MicroFlow installation without its <code>MICROFLOW_MASTER_KEY</code>. ' +
+      '<b>The file still contains your secrets in a form anyone holding it can open \u2014 store it privately.</b> ' +
       'Run history, logs and generated files are not included.</div>' +
-      '<div class="field" style="margin-top:12px;"><label>Backup passphrase (min 8 characters)</label><input type="password" id="dbExpPass" autocomplete="new-password"></div>' +
-      '<div class="field"><label>Repeat passphrase</label><input type="password" id="dbExpPass2" autocomplete="new-password"></div>' +
-      '<button id="dbExportBtn" class="btn btn-primary btn-big" style="margin-top:12px;">Export Database</button></div>' +
+      '<div class="field" style="margin-top:12px;"><label>Type <b>' + EXPORT_CONFIRM + '</b> to confirm</label><input type="text" id="dbExpConfirm" autocomplete="off"></div>' +
+      '<button id="dbExportBtn" class="btn btn-primary btn-big" style="margin-top:12px;" disabled>Export Database</button></div>' +
       '<div class="card"><div class="env-section-title">\u2B06\uFE0F Import Database</div>' +
       '<div class="unsupported-box">Import <b>replaces everything</b> on this installation with the backup. ' +
       'It is all-or-nothing: if anything fails, nothing changes. It is refused while a workflow is running.</div>' +
       '<div id="dbDrop" class="import-drop" style="margin-top:12px;">Drop a backup <code>.json</code> here, or click to choose one' +
       '<input id="dbFile" type="file" accept="application/json,.json" style="display:none"></div>' +
       '<div id="dbFileName" class="sub" style="margin:8px 0;"></div>' +
-      '<div class="field"><label>Backup passphrase (chosen when the backup was exported)</label><input type="password" id="dbImpPass" autocomplete="off"></div>' +
       '<div class="field"><label>Type <b>' + CONFIRM + '</b> to confirm</label><input type="text" id="dbConfirm" autocomplete="off"></div>' +
       '<div class="field"><label>Your login password</label><input type="password" id="dbPw" autocomplete="current-password"></div>' +
       '<button id="dbImportBtn" class="btn btn-danger btn-big" disabled>Import Database</button>' +
@@ -748,15 +747,13 @@
     const nameEl = document.getElementById("dbFileName");
     const confirmIn = document.getElementById("dbConfirm");
     const pwIn = document.getElementById("dbPw");
-    const impPassIn = document.getElementById("dbImpPass");
-    const expPassIn = document.getElementById("dbExpPass");
-    const expPass2In = document.getElementById("dbExpPass2");
+    const expConfirmIn = document.getElementById("dbExpConfirm");
     const importBtn = document.getElementById("dbImportBtn");
     const resultEl = document.getElementById("dbResult");
     let picked = null;
 
     const refreshBtn = () => {
-      importBtn.disabled = !(picked && confirmIn.value === CONFIRM && pwIn.value && impPassIn.value);
+      importBtn.disabled = !(picked && confirmIn.value === CONFIRM && pwIn.value);
     };
     const pick = (f) => {
       picked = f || null;
@@ -765,12 +762,11 @@
     };
 
     exportBtn.addEventListener("click", async () => {
-      if (expPassIn.value.length < 8) { toast("Backup passphrase must be at least 8 characters", "error"); return; }
-      if (expPassIn.value !== expPass2In.value) { toast("The two passphrases do not match", "error"); return; }
+      if (expConfirmIn.value !== EXPORT_CONFIRM) return;
       exportBtn.disabled = true;
       exportBtn.textContent = "Exporting\u2026";
       try {
-        const res = await api("/api/database/export", { headers: { "X-Microflow-Backup-Passphrase": expPassIn.value } });
+        const res = await api("/api/database/export", { headers: { "X-Microflow-Confirm": EXPORT_CONFIRM } });
         const blob = await res.blob();
         const cd = res.headers.get("Content-Disposition") || "";
         const m = /filename="([^"]+)"/.exec(cd);
@@ -781,10 +777,10 @@
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-        expPassIn.value = ""; expPass2In.value = "";
-        toast("Backup downloaded \u2014 keep your passphrase safe", "success");
+        expConfirmIn.value = "";
+        toast("Backup downloaded \u2014 store it privately", "success");
       } catch (e) { toast(e.message, "error"); }
-      finally { exportBtn.disabled = false; exportBtn.textContent = "Export Database"; }
+      finally { exportBtn.textContent = "Export Database"; exportBtn.disabled = expConfirmIn.value !== EXPORT_CONFIRM; }
     });
 
     drop.addEventListener("click", () => fileInput.click());
@@ -796,7 +792,7 @@
     drop.addEventListener("drop", (e) => pick(e.dataTransfer.files && e.dataTransfer.files[0]));
     confirmIn.addEventListener("input", refreshBtn);
     pwIn.addEventListener("input", refreshBtn);
-    impPassIn.addEventListener("input", refreshBtn);
+    expConfirmIn.addEventListener("input", () => { exportBtn.disabled = expConfirmIn.value !== EXPORT_CONFIRM; });
 
     importBtn.addEventListener("click", async () => {
       if (!picked) return;
@@ -806,10 +802,10 @@
       try {
         const r = await apiJSON("/api/database/import", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Microflow-Confirm": CONFIRM, "X-Microflow-Password": pwIn.value, "X-Microflow-Backup-Passphrase": impPassIn.value },
+          headers: { "Content-Type": "application/json", "X-Microflow-Confirm": CONFIRM, "X-Microflow-Password": pwIn.value },
           body: picked,
         });
-        pwIn.value = ""; impPassIn.value = "";
+        pwIn.value = "";
         const c = (r && r.counts) || {};
         resultEl.innerHTML = '<div class="card" style="margin-top:12px;">\u2705 Database imported: ' +
           escapeHtml((c.services || 0) + " service(s), " + (c.workflows || 0) + " workflow(s), " +
