@@ -7,11 +7,12 @@ package api
 // Environment action uses) and an explicit confirmation header, both
 // enforced here, not just in the UI.
 //
-// Backups are portable: secrets are re-encrypted under a backup passphrase
-// (header X-Microflow-Backup-Passphrase) on export and re-keyed to THIS
-// installation's MICROFLOW_MASTER_KEY on import, so the two installations do
-// not need to share a master key. The passphrase travels in a header (never
-// the URL) and is never logged or stored.
+// Backups are portable: secrets are re-encrypted under a per-backup key held
+// in the file on export and re-keyed to THIS installation's
+// MICROFLOW_MASTER_KEY on import, so the two installations do not need to
+// share a master key. Both actions need a typed confirmation phrase
+// (X-Microflow-Confirm), enforced here and not just in the UI, to stop
+// accidental clicks.
 
 import (
 	"context"
@@ -29,15 +30,16 @@ import (
 
 // DatabaseBackupStore is implemented by *store.Store.
 type DatabaseBackupStore interface {
-	ExportBackup(ctx context.Context, passphrase string, open func(ciphertext []byte) ([]byte, error)) (*store.Backup, error)
+	ExportBackup(ctx context.Context, open func(ciphertext []byte) ([]byte, error)) (*store.Backup, error)
 	ImportBackup(ctx context.Context, p *store.ParsedBackup) (*store.ImportSummary, error)
 }
 
-// ImportConfirmPhrase must be sent in the X-Microflow-Confirm header.
-const ImportConfirmPhrase = "REPLACE DATABASE"
-
-// BackupPassphraseHeader carries the backup passphrase for export and import.
-const BackupPassphraseHeader = "X-Microflow-Backup-Passphrase"
+// ImportConfirmPhrase / ExportConfirmPhrase must be sent in the
+// X-Microflow-Confirm header of the respective request.
+const (
+	ImportConfirmPhrase = "IMPORT DATABASE"
+	ExportConfirmPhrase = "EXPORT DATABASE"
+)
 
 // WithDatabaseBackup enables /api/database/export and /api/database/import.
 // reload is called after a successful import commit to re-register schedules
@@ -70,12 +72,12 @@ func (s *Server) handleDatabaseExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, errors.New("database backup needs the credential vault, which is not enabled"))
 		return
 	}
-	b, err := s.dbBackup.ExportBackup(r.Context(), r.Header.Get(BackupPassphraseHeader), s.vault.Open)
+	if r.Header.Get("X-Microflow-Confirm") != ExportConfirmPhrase {
+		writeErr(w, http.StatusBadRequest, errors.New("confirmation missing -- nothing was exported"))
+		return
+	}
+	b, err := s.dbBackup.ExportBackup(r.Context(), s.vault.Open)
 	if err != nil {
-		if errors.Is(err, store.ErrBackupPassphrase) {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
 		log.Printf("database export failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to export the database (a stored secret may not be decryptable with this installation's master key -- see the server log)"))
 		return
@@ -121,9 +123,9 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, errors.New("database import needs the credential vault, which is not enabled"))
 		return
 	}
-	// Secrets are decrypted with the backup passphrase and re-sealed with
+	// Secrets are decrypted with the key in the backup header and re-sealed with
 	// THIS installation's master key here, in memory, before any DB access.
-	parsed, err := store.ParseBackup(body, r.Header.Get(BackupPassphraseHeader), s.vault.Seal)
+	parsed, err := store.ParseBackup(body, s.vault.Seal)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
