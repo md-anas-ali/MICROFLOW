@@ -125,7 +125,10 @@ func resolveGoogleCreds(ctx context.Context, creds engine.CredentialResolver, ac
 	if err == nil {
 		return secrets, nil
 	}
-	if accounts != nil {
+	// Fall back to the connected account ONLY when no per-node credential
+	// exists; a revoked/invalid per-node credential must surface as a
+	// reconnect-required error instead of borrowing another account.
+	if accounts != nil && errors.Is(err, vault.ErrCredentialNotFound) {
 		secrets, acctErr := accounts.Resolve(ctx, msvcID, service)
 		if acctErr == nil {
 			return secrets, nil
