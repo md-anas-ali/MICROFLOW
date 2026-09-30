@@ -138,6 +138,11 @@ type Server struct {
 	// WithReauth from the existing login gate; nil => those actions are
 	// refused (fail closed), never silently allowed.
 	reauth ReauthFunc
+
+	// dbBackup/dbReload back GET /api/database/export and
+	// POST /api/database/import (see WithDatabaseBackup); nil-safe.
+	dbBackup DatabaseBackupStore
+	dbReload func(ctx context.Context) error
 }
 
 // ServiceStore is the persistence interface Service (tenant) management
