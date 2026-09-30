@@ -478,6 +478,9 @@ func main() {
 		var missing []string
 		for _, k := range oauthEnvKeys {
 			if strings.TrimSpace(get(k)) == "" {
+				if k == "GOOGLE_OAUTH_REDIRECT_URL" {
+					k += " (or " + vault.HostURLEnvKey + ")"
+				}
 				missing = append(missing, k)
 			}
 		}
