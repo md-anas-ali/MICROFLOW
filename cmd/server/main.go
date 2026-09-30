@@ -263,7 +263,7 @@ func main() {
 	}
 
 	registry := nodes.DefaultRegistry(nodes.Deps{
-		HTTPClient: nodeHTTPClient,
+		HTTPClient:      nodeHTTPClient,
 		AllowedBinaries: allowedBinaries,
 		EnvAllowlist:    codeEnvAllowlist,
 		ScratchRoot:     scratchRoot,
@@ -499,29 +499,53 @@ func main() {
 		workflows = nil
 	}
 
-	var schedules []scheduler.Schedule
-	for _, wf := range workflows {
-		for name, n := range wf.Nodes {
-			switch n.Type {
-			case model.TypeScheduleTrigger:
-				schedules = append(schedules, schedulesFromNode(wf.ID, name, n, wf.Active)...)
-			case model.TypeWebhookTrigger:
-				registerWebhookRoute(whServer, webhookToken, run, sch, wf.ID, name, n)
+	// registerTriggers (re)builds every trigger registration from persisted
+	// state: each workflow's Schedule Trigger nodes + the Run All Services
+	// schedules go into the ONE scheduler (sch.Load), and each Webhook
+	// Trigger node gets its route. Used at startup and again after a
+	// database Import, so both paths register triggers identically.
+	registerTriggers := func(workflows []*model.Workflow, runAllRows []store.RunAllScheduleRow) {
+		whServer.Reset()
+		var schedules []scheduler.Schedule
+		for _, wf := range workflows {
+			for name, n := range wf.Nodes {
+				switch n.Type {
+				case model.TypeScheduleTrigger:
+					schedules = append(schedules, schedulesFromNode(wf.ID, name, n, wf.Active)...)
+				case model.TypeWebhookTrigger:
+					registerWebhookRoute(whServer, webhookToken, run, sch, wf.ID, name, n)
+				}
 			}
 		}
+		log.Printf("startup: registered %d schedule(s) across %d workflow(s)", len(schedules), len(workflows))
+		schedules = append(schedules, runAllSchedulesToScheduler(runAllRows)...)
+		log.Printf("startup: registered %d Run All Services schedule(s)", len(runAllRows))
+		sch.Load(schedules)
 	}
-	log.Printf("startup: registered %d schedule(s) across %d workflow(s)", len(schedules), len(workflows))
 
 	runAllScheduleRows, err := st.ListRunAllSchedules(ctx)
 	if err != nil {
 		log.Printf("warning: could not list run-all schedules at startup (%v) -- they won't be registered until the next restart after this is fixed", err)
 		runAllScheduleRows = nil
 	}
-	schedules = append(schedules, runAllSchedulesToScheduler(runAllScheduleRows)...)
-	log.Printf("startup: registered %d Run All Services schedule(s)", len(runAllScheduleRows))
-
-	sch.Load(schedules)
+	registerTriggers(workflows, runAllScheduleRows)
 	go sch.Start(ctx)
+
+	// Database Import (POST /api/database/import): after the transaction
+	// commits, re-read the restored workflows + Run All schedules and
+	// re-register every trigger, exactly as startup does -- no restart.
+	apiServer.WithDatabaseBackup(st, func(rctx context.Context) error {
+		wfs, err := st.ListWorkflows(rctx)
+		if err != nil {
+			return err
+		}
+		rows, err := st.ListRunAllSchedules(rctx)
+		if err != nil {
+			return err
+		}
+		registerTriggers(wfs, rows)
+		return nil
+	})
 
 	// After every save/import/delete, re-register that workflow's Schedule
 	// Trigger nodes from the just-persisted definition (same
