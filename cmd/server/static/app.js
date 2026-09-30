@@ -2923,33 +2923,36 @@
       });
     }
 
-    function openDelete() {
+    async function openDelete() {
       const name = scopeName;
+      let needPw = true;
+      try { const st = await apiJSON("/api/auth-status"); needPw = !st || st.loginRequired !== false; } catch (_) { needPw = true; }
       openPanel("\uD83D\uDD34 Delete Environment set",
         '<div class="sub" style="margin-bottom:10px;">Deletes <b>all ' + envList.length + " variable(s)</b> of <b>" + escapeHtml(name) +
         "</b>. " + (isGlobal
           ? "Service Environments, workflows and credentials are not touched, but every Service loses these shared values."
           : "The Service, its workflows, credentials, Global Environment and other Services are not touched.") + " This cannot be undone.</div>" +
-        '<div class="field"><label>Step 1 \u2014 type ' + (isGlobal ? "Global" : "the Service name") + ' to confirm</label><input type="text" id="envDelName" autocomplete="off" placeholder="' + escapeHtml(name) + '"></div>' +
-        '<div class="field"><label>Step 2 \u2014 verify with your login password</label><input type="password" id="envDelPw" autocomplete="current-password" disabled></div>' +
+        '<div class="field"><label>' + (needPw ? "Step 1 \u2014 " : "") + "type " + (isGlobal ? "Global" : "the Service name") + ' to confirm</label><input type="text" id="envDelName" autocomplete="off" placeholder="' + escapeHtml(name) + '"></div>' +
+        (needPw ? '<div class="field"><label>Step 2 \u2014 verify with your login password</label><input type="password" id="envDelPw" autocomplete="current-password" disabled></div>' : "") +
         '<button id="envDelGo" class="btn btn-danger btn-big" disabled>Delete Environment set</button>');
       const nameIn = document.getElementById("envDelName"), pwIn = document.getElementById("envDelPw"), go = document.getElementById("envDelGo");
       const sync = () => {
         const ok = nameIn.value === name;
-        pwIn.disabled = !ok;
-        go.disabled = !(ok && pwIn.value.length > 0);
+        if (pwIn) pwIn.disabled = !ok;
+        go.disabled = !(ok && (!pwIn || pwIn.value.length > 0));
       };
       nameIn.addEventListener("input", sync);
-      pwIn.addEventListener("input", sync);
+      if (pwIn) pwIn.addEventListener("input", sync);
       go.addEventListener("click", async () => {
         go.disabled = true;
         try {
-          const r = await jsonPost(envPath("/delete-all"), { confirmName: nameIn.value, password: pwIn.value });
-          pwIn.value = "";
+          const r = await jsonPost(envPath("/delete-all"), { confirmName: nameIn.value, password: pwIn ? pwIn.value : "" });
+          if (pwIn) pwIn.value = "";
           toast("Deleted " + (r && r.deleted != null ? r.deleted : 0) + " variable(s)", "success");
           closePanel(); refresh();
         } catch (e) {
-          pwIn.value = ""; sync();
+          if (pwIn) pwIn.value = "";
+          sync();
           toast(e.message, "error");
         }
       });
