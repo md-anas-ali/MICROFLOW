@@ -20,6 +20,7 @@ import (
 
 	"microflow/internal/model"
 	"microflow/internal/tenant"
+	"microflow/internal/vault"
 )
 
 type Store struct {
@@ -586,6 +587,11 @@ func (s *Store) GetExecution(ctx context.Context, id string) (*model.Execution, 
 func (s *Store) GetEncrypted(ctx context.Context, workflowID, logicalName string) ([]byte, error) {
 	var ct []byte
 	err := s.pool.QueryRow(ctx, `SELECT ciphertext FROM credentials WHERE workflow_id=$1 AND logical_name=$2`, workflowID, logicalName).Scan(&ct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Only a genuinely absent row is "not found"; any other error
+		// (DB/network) is returned unchanged.
+		return nil, vault.ErrCredentialNotFound
+	}
 	return ct, err
 }
 
