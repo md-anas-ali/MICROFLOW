@@ -45,22 +45,49 @@ func (r *rateLimiter) Allow(key string) bool {
 }
 
 type Server struct {
-	mux     *http.ServeMux
+	// routes is a swappable path -> handler table (rather than a
+	// http.ServeMux, which can neither replace nor remove a pattern) so a
+	// database Import can re-register every Webhook Trigger without a restart.
+	mu      sync.RWMutex
+	routes  map[string]http.HandlerFunc
 	limiter *rateLimiter
 }
 
 func NewServer() *Server {
-	return &Server{mux: http.NewServeMux(), limiter: newRateLimiter(60, time.Minute)}
+	return &Server{routes: map[string]http.HandlerFunc{}, limiter: newRateLimiter(60, time.Minute)}
 }
 
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler serves the registered exact paths; anything else is 404 (the
+// same result the previous ServeMux gave for an unregistered path).
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		h := s.routes[r.URL.Path]
+		s.mu.RUnlock()
+		if h == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h(w, r)
+	})
+}
+
+// Reset removes every registered webhook route (used by a database Import
+// right before the imported workflows' routes are registered again).
+func (s *Server) Reset() {
+	s.mu.Lock()
+	s.routes = map[string]http.HandlerFunc{}
+	s.mu.Unlock()
+}
 
 // Register wires a webhook path (e.g. /webhook/<workflowId>/<path>) to h.
 // authToken, if non-empty, is checked against an X-Webhook-Token header
 // (simple shared-secret auth -- sufficient for a self-hosted single-user
 // tool; not meant as a general auth framework).
 func (s *Server) Register(path string, authToken string, h Handler) {
-	s.mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routes[path] = func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -104,5 +131,5 @@ func (s *Server) Register(path string, authToken string, h Handler) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(resp)
-	})
+	}
 }
