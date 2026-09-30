@@ -11,18 +11,23 @@ package store
 // one particular installation (see runtimeTables below).
 //
 // Secrets (credentials, Google account tokens, Global/Service Environment
-// values) never leave the database as plaintext AND the backup never depends
-// on MICROFLOW_MASTER_KEY:
+// values) are never written to the file as plaintext AND the backup never
+// depends on MICROFLOW_MASTER_KEY:
 //
 //   - Export opens each vault ciphertext in memory with the SOURCE master key
-//     and immediately re-seals it (AES-256-GCM) under a key derived from a
-//     backup passphrase the person supplies (PBKDF2-HMAC-SHA256, random salt).
-//     Nothing plaintext is written to the file, logs or temp files.
-//   - Import derives the same key from the passphrase, opens each secret and
-//     re-seals it under the TARGET installation's own master key -- all in
-//     memory, during validation, BEFORE the database is touched. A wrong
-//     passphrase, a tampered file or any decrypt failure aborts the import
-//     with the existing database unchanged.
+//     and immediately re-seals it (AES-256-GCM) under a fresh random
+//     per-backup key that is stored in the file's own header. Nothing
+//     plaintext is written to the file, logs or temp files.
+//   - Import reads that key from the header, opens each secret and re-seals
+//     it under the TARGET installation's own master key -- all in memory,
+//     during validation, BEFORE the database is touched. A corrupted file or
+//     any decrypt failure aborts the import with the existing database
+//     unchanged.
+//
+// SECURITY NOTE: because the file carries its own key (there is no
+// passphrase), the secrets inside it are protected from casual reading, not
+// from anyone who holds the file. Treat a backup file like the secrets it
+// contains.
 //
 // Import is FULL REPLACE in ONE transaction:
 //
@@ -41,7 +46,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -60,20 +64,11 @@ import (
 const (
 	// BackupFormat / BackupVersion identify a MicroFlow database backup.
 	BackupFormat  = "microflow-db-backup"
-	BackupVersion = 2
+	BackupVersion = 3
 
-	backupKDF        = "pbkdf2-sha256"
-	backupCipher     = "aes-256-gcm"
-	backupKDFIter    = 600000
-	backupKDFMinIter = 100000
-	backupKDFMaxIter = 10000000
-	// BackupMinPassphraseLen is the shortest backup passphrase Export accepts.
-	BackupMinPassphraseLen = 8
+	backupKeyMode = "embedded-random-key"
+	backupCipher  = "aes-256-gcm"
 )
-
-// ErrBackupPassphrase is returned by ExportBackup when the passphrase is
-// missing or too short.
-var ErrBackupPassphrase = errors.New("store: a backup passphrase of at least 8 characters is required")
 
 // ErrBackupActiveRuns is returned by ImportBackup while any execution or
 // Run All sweep is queued/running/waiting: replacing workflows underneath a
@@ -172,22 +167,22 @@ type Backup struct {
 	Counts     map[string]int    `json:"counts"`
 	Encryption *BackupEncryption `json:"encryption"`
 	Checksum   string            `json:"checksum"` // hex sha256 of the compacted "tables" JSON
-	MAC        string            `json:"mac"`      // hex HMAC-SHA256 (passphrase-derived key) of the same bytes
+	MAC        string            `json:"mac"`      // hex HMAC-SHA256 (backup key) of the same bytes
 	Tables     json.RawMessage   `json:"tables"`
 }
 
 // BackupEncryption describes how the secret columns in this file are sealed.
-// It holds only public parameters; the key is derived from the passphrase and
-// is never stored. Verifier lets Import report a wrong passphrase up front.
+// Key is the random per-backup key material (base64, 64 bytes: 32 for
+// AES-256-GCM + 32 for the file MAC). Verifier is a sealed constant that lets
+// Import detect a damaged header up front.
 type BackupEncryption struct {
-	KDF        string `json:"kdf"`
-	Cipher     string `json:"cipher"`
-	Iterations int    `json:"iterations"`
-	Salt       string `json:"salt"`     // base64
-	Verifier   string `json:"verifier"` // base64 sealed constant
+	Mode     string `json:"mode"`
+	Cipher   string `json:"cipher"`
+	Key      string `json:"key"`      // base64
+	Verifier string `json:"verifier"` // base64 sealed constant
 }
 
-// backupCrypto holds the keys derived from the backup passphrase.
+// backupCrypto holds the keys taken from the backup header.
 type backupCrypto struct {
 	aead   cipher.AEAD
 	macKey []byte
@@ -195,36 +190,11 @@ type backupCrypto struct {
 
 var backupVerifierPlain = []byte("microflow-backup-verifier-v1")
 
-func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
-	prf := hmac.New(sha256.New, password)
-	hashLen := prf.Size()
-	blocks := (keyLen + hashLen - 1) / hashLen
-	dk := make([]byte, 0, blocks*hashLen)
-	u := make([]byte, 0, hashLen)
-	var ib [4]byte
-	for b := 1; b <= blocks; b++ {
-		prf.Reset()
-		prf.Write(salt)
-		binary.BigEndian.PutUint32(ib[:], uint32(b))
-		prf.Write(ib[:])
-		dk = prf.Sum(dk)
-		t := dk[len(dk)-hashLen:]
-		u = append(u[:0], t...)
-		for n := 2; n <= iter; n++ {
-			prf.Reset()
-			prf.Write(u)
-			u = prf.Sum(u[:0])
-			for x := range u {
-				t[x] ^= u[x]
-			}
-		}
+func newBackupCrypto(key []byte) (*backupCrypto, error) {
+	if len(key) != 64 {
+		return nil, errors.New("backup key has the wrong length")
 	}
-	return dk[:keyLen]
-}
-
-func newBackupCrypto(passphrase string, salt []byte, iter int) (*backupCrypto, error) {
-	dk := pbkdf2SHA256([]byte(passphrase), salt, iter, 64)
-	block, err := aes.NewCipher(dk[:32])
+	block, err := aes.NewCipher(key[:32])
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +202,7 @@ func newBackupCrypto(passphrase string, salt []byte, iter int) (*backupCrypto, e
 	if err != nil {
 		return nil, err
 	}
-	return &backupCrypto{aead: aead, macKey: dk[32:]}, nil
+	return &backupCrypto{aead: aead, macKey: key[32:]}, nil
 }
 
 func (bc *backupCrypto) seal(plain, aad []byte) ([]byte, error) {
@@ -336,20 +306,17 @@ func checksumOf(tablesJSON []byte) (string, error) {
 // preserved verbatim (rows are emitted as JSON objects keyed by column).
 //
 // open decrypts one vault ciphertext with the SOURCE installation's master
-// key; every secret is immediately re-sealed under the passphrase-derived
-// backup key, so the file carries no plaintext and no master-key ciphertext.
-func (s *Store) ExportBackup(ctx context.Context, passphrase string, open func(ciphertext []byte) ([]byte, error)) (*Backup, error) {
-	if len(passphrase) < BackupMinPassphraseLen {
-		return nil, ErrBackupPassphrase
-	}
+// key; every secret is immediately re-sealed under a fresh random per-backup
+// key, so the file carries no plaintext and no master-key ciphertext.
+func (s *Store) ExportBackup(ctx context.Context, open func(ciphertext []byte) ([]byte, error)) (*Backup, error) {
 	if open == nil {
 		return nil, errors.New("export: no vault available to read secrets")
 	}
-	salt := make([]byte, 16)
-	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+	key := make([]byte, 64)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, err
 	}
-	bc, err := newBackupCrypto(passphrase, salt, backupKDFIter)
+	bc, err := newBackupCrypto(key)
 	if err != nil {
 		return nil, err
 	}
@@ -423,11 +390,10 @@ func (s *Store) ExportBackup(ctx context.Context, passphrase string, open func(c
 		ExportedAt: time.Now().UTC(),
 		Counts:     counts,
 		Encryption: &BackupEncryption{
-			KDF:        backupKDF,
-			Cipher:     backupCipher,
-			Iterations: backupKDFIter,
-			Salt:       base64.StdEncoding.EncodeToString(salt),
-			Verifier:   base64.StdEncoding.EncodeToString(ver),
+			Mode:     backupKeyMode,
+			Cipher:   backupCipher,
+			Key:      base64.StdEncoding.EncodeToString(key),
+			Verifier: base64.StdEncoding.EncodeToString(ver),
 		},
 		Checksum: sum,
 		MAC:      mac,
@@ -456,15 +422,12 @@ func (p *ParsedBackup) Counts() map[string]int {
 //     (workflow -> service, static data/credentials/schedules -> workflow,
 //     service_env -> service);
 //   - every workflow definition parses as a model.Workflow with a matching id;
-//   - the passphrase opens the backup (verifier + file MAC), and every secret
+//   - the header key opens the backup (verifier + file MAC), and every secret
 //     opens under it;
 //   - every secret is then re-sealed with seal (the TARGET installation's
 //     vault), so the rows handed to ImportBackup are already keyed for this
 //     installation. All of this happens in memory, before any DB access.
-func ParseBackup(r io.Reader, passphrase string, seal func(plaintext []byte) ([]byte, error)) (*ParsedBackup, error) {
-	if passphrase == "" {
-		return nil, invalidf("the backup passphrase is required")
-	}
+func ParseBackup(r io.Reader, seal func(plaintext []byte) ([]byte, error)) (*ParsedBackup, error) {
 	if seal == nil {
 		return nil, invalidf("no vault available to re-encrypt secrets for this installation")
 	}
@@ -475,22 +438,19 @@ func ParseBackup(r io.Reader, passphrase string, seal func(plaintext []byte) ([]
 	if b.Format != BackupFormat {
 		return nil, invalidf("unrecognised file format %q", b.Format)
 	}
-	if b.Version == 1 {
-		return nil, invalidf("this is a version 1 backup, whose secrets depend on the original MICROFLOW_MASTER_KEY; re-export it from the source installation with this MicroFlow version to get a portable backup")
+	if b.Version == 1 || b.Version == 2 {
+		return nil, invalidf("this is a version %d backup (secrets tied to the original MICROFLOW_MASTER_KEY or to a passphrase); re-export it from the source installation with this MicroFlow version", b.Version)
 	}
 	if b.Version != BackupVersion {
 		return nil, invalidf("backup version %d is not supported by this MicroFlow (supports %d)", b.Version, BackupVersion)
 	}
 	enc := b.Encryption
-	if enc == nil || enc.KDF != backupKDF || enc.Cipher != backupCipher {
+	if enc == nil || enc.Mode != backupKeyMode || enc.Cipher != backupCipher {
 		return nil, invalidf("backup has no supported encryption header")
 	}
-	if enc.Iterations < backupKDFMinIter || enc.Iterations > backupKDFMaxIter {
-		return nil, invalidf("backup key-derivation settings are out of range")
-	}
-	salt, err := base64.StdEncoding.DecodeString(enc.Salt)
-	if err != nil || len(salt) < 8 {
-		return nil, invalidf("backup encryption salt is invalid")
+	key, err := base64.StdEncoding.DecodeString(enc.Key)
+	if err != nil || len(key) != 64 {
+		return nil, invalidf("backup encryption key is invalid")
 	}
 	verifier, err := base64.StdEncoding.DecodeString(enc.Verifier)
 	if err != nil {
@@ -506,16 +466,16 @@ func ParseBackup(r io.Reader, passphrase string, seal func(plaintext []byte) ([]
 	if !strings.EqualFold(want, b.Checksum) {
 		return nil, invalidf("checksum mismatch -- the file is corrupted or was modified")
 	}
-	bc, err := newBackupCrypto(passphrase, salt, enc.Iterations)
+	bc, err := newBackupCrypto(key)
 	if err != nil {
-		return nil, invalidf("could not derive the backup key (%v)", err)
+		return nil, invalidf("could not load the backup key (%v)", err)
 	}
 	if pt, err := bc.open(verifier, []byte("verifier")); err != nil || !bytes.Equal(pt, backupVerifierPlain) {
-		return nil, invalidf("wrong backup passphrase (or the file's encryption header was modified)")
+		return nil, invalidf("backup encryption header is damaged")
 	}
 	wantMAC, err := bc.mac(b.Tables)
 	if err != nil || !hmac.Equal([]byte(wantMAC), []byte(strings.ToLower(b.MAC))) {
-		return nil, invalidf("backup authentication failed -- the file was modified")
+		return nil, invalidf("backup authentication failed -- the file is corrupted or was modified")
 	}
 
 	var raw map[string]json.RawMessage
@@ -585,7 +545,7 @@ func ParseBackup(r io.Reader, passphrase string, seal func(plaintext []byte) ([]
 		rekeyed, err := rekeyRows(t, arr, func(row map[string]json.RawMessage, col string, ct []byte) ([]byte, error) {
 			pt, err := bc.open(ct, cellAAD(t, row, col))
 			if err != nil {
-				return nil, invalidf("%s: a secret could not be decrypted with the backup passphrase", t.name)
+				return nil, invalidf("%s: a secret could not be decrypted with the backup key", t.name)
 			}
 			defer wipe(pt)
 			if t.name == "credentials" || t.name == "google_account_credentials" {
