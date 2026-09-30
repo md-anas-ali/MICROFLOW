@@ -720,6 +720,16 @@ func (s *Store) DeleteGlobalEnv(ctx context.Context, key string) error {
 	return err
 }
 
+// DeleteAllGlobalEnv removes every Global Environment row in a single SQL
+// statement (all-or-nothing). Returns how many rows were removed.
+func (s *Store) DeleteAllGlobalEnv(ctx context.Context) (int, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM global_env`)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // ListGlobalEnv returns every configured Global Environment key's
 // metadata (never values), ordered by key for a stable dashboard list.
 func (s *Store) ListGlobalEnv(ctx context.Context) ([]EnvInfo, error) {
