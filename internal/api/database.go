@@ -167,7 +167,7 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 		// Host/domain-specific values are never restored from a backup; say so
 		// plainly so the operator sets this installation's own value.
 		resp["skippedDeploymentKeys"] = summary.SkippedDeploymentKeys
-		resp["notice"] = "GOOGLE_OAUTH_REDIRECT_URL was not restored because it belongs to the old domain. Set it for THIS installation (Global/Service Environment or host env) to <your-domain>/api/oauth/google/callback and register the same URL in Google Cloud Console. Connected Google accounts keep working without it; it is only needed to Connect/Reconnect."
+		resp["notice"] = "GOOGLE_OAUTH_REDIRECT_URL / HOST_URL were not restored because they belong to the old domain. Set HOST_URL for THIS installation (Global/Service Environment or host env) to https://<your-domain> (or set GOOGLE_OAUTH_REDIRECT_URL to <your-domain>/api/oauth/google/callback) and register <your-domain>/api/oauth/google/callback in Google Cloud Console. Connected Google accounts keep working without it; it is only needed to Connect/Reconnect."
 	}
 	if s.dbReload != nil {
 		if rerr := s.dbReload(context.WithoutCancel(r.Context())); rerr != nil {
