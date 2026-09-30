@@ -67,6 +67,21 @@ type GoogleOAuthApp struct {
 	httpClient  *http.Client
 }
 
+// HostURLEnvKey is the optional Environment variable holding the canonical
+// public Host URL (e.g. "https://example.com"). It is resolved through the
+// existing Service > Global > host Environment precedence; it is not a secret.
+const HostURLEnvKey = "HOST_URL"
+
+// GoogleOAuthCallbackPath is the fixed path of the Google OAuth callback
+// route (see internal/api/google_connect.go).
+const GoogleOAuthCallbackPath = "/api/oauth/google/callback"
+
+// NormalizeHostURL trims whitespace and any trailing "/" so joining a path
+// never produces a duplicate slash. Returns "" for an empty value.
+func NormalizeHostURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
+}
+
 // GoogleOAuthAppFromEnv builds a GoogleOAuthApp from
 // GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET /
 // GOOGLE_OAUTH_REDIRECT_URL. ok is false (nil app) if any are unset, so
@@ -78,6 +93,12 @@ func GoogleOAuthAppFromEnv(getenv func(string) string) (app *GoogleOAuthApp, ok 
 	id := strings.TrimSpace(getenv("GOOGLE_OAUTH_CLIENT_ID"))
 	secret := strings.TrimSpace(getenv("GOOGLE_OAUTH_CLIENT_SECRET"))
 	redirect := strings.TrimSpace(getenv("GOOGLE_OAUTH_REDIRECT_URL"))
+	// Optional HOST_URL: when set it is the canonical public Host URL and
+	// the callback is derived from it (taking precedence over
+	// GOOGLE_OAUTH_REDIRECT_URL). When unset, behavior is unchanged.
+	if host := NormalizeHostURL(getenv(HostURLEnvKey)); host != "" {
+		redirect = host + GoogleOAuthCallbackPath
+	}
 	if id == "" || secret == "" || redirect == "" {
 		return nil, false
 	}
