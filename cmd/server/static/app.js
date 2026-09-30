@@ -239,6 +239,9 @@
       } else if (p0 === "global-env") {
         setPageNav("#/dashboard", "Home");
         await renderEnvPage("global");
+      } else if (p0 === "database") {
+        setPageNav("#/dashboard", "Home");
+        renderDatabasePage();
       } else {
         setPageNav("#/dashboard", "Home");
         viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
@@ -704,6 +707,115 @@
       } finally {
         btn.disabled = false;
         btn.textContent = "Import";
+      }
+    });
+  }
+
+  // ---------------- Database: Export / Import ----------------
+  // Export downloads one portable backup of all persistent MicroFlow state
+  // (GET /api/database/export). Import is a FULL REPLACE
+  // (POST /api/database/import): the server validates the file, replaces the
+  // database in a single transaction (all-or-nothing) and reloads its
+  // schedules/webhooks; this page then reloads so every view reads fresh state.
+  function renderDatabasePage() {
+    const CONFIRM = "REPLACE DATABASE";
+    viewEl.innerHTML =
+      '<div class="narrow"><div class="page-head"><div><h1>\uD83D\uDDC4\uFE0F Database</h1>' +
+      '<div class="sub">Move all of MicroFlow\u2019s saved state to another installation.</div></div></div>' +
+      '<div class="card"><div class="env-section-title">\u2B07\uFE0F Export Database</div>' +
+      '<div class="cred-section-note">Downloads one backup file with your Services, Environments, workflows, schedules and connected accounts. ' +
+      'Secrets stay encrypted; the other installation must use the same <code>MICROFLOW_MASTER_KEY</code>. ' +
+      'Run history, logs and generated files are not included.</div>' +
+      '<button id="dbExportBtn" class="btn btn-primary btn-big" style="margin-top:12px;">Export Database</button></div>' +
+      '<div class="card"><div class="env-section-title">\u2B06\uFE0F Import Database</div>' +
+      '<div class="unsupported-box">Import <b>replaces everything</b> on this installation with the backup. ' +
+      'It is all-or-nothing: if anything fails, nothing changes. It is refused while a workflow is running.</div>' +
+      '<div id="dbDrop" class="import-drop" style="margin-top:12px;">Drop a backup <code>.json</code> here, or click to choose one' +
+      '<input id="dbFile" type="file" accept="application/json,.json" style="display:none"></div>' +
+      '<div id="dbFileName" class="sub" style="margin:8px 0;"></div>' +
+      '<div class="field"><label>Type <b>' + CONFIRM + '</b> to confirm</label><input type="text" id="dbConfirm" autocomplete="off"></div>' +
+      '<div class="field"><label>Your login password</label><input type="password" id="dbPw" autocomplete="current-password"></div>' +
+      '<button id="dbImportBtn" class="btn btn-danger btn-big" disabled>Import Database</button>' +
+      '<div id="dbResult"></div></div></div>';
+
+    const exportBtn = document.getElementById("dbExportBtn");
+    const drop = document.getElementById("dbDrop");
+    const fileInput = document.getElementById("dbFile");
+    const nameEl = document.getElementById("dbFileName");
+    const confirmIn = document.getElementById("dbConfirm");
+    const pwIn = document.getElementById("dbPw");
+    const importBtn = document.getElementById("dbImportBtn");
+    const resultEl = document.getElementById("dbResult");
+    let picked = null;
+
+    const refreshBtn = () => {
+      importBtn.disabled = !(picked && confirmIn.value === CONFIRM && pwIn.value);
+    };
+    const pick = (f) => {
+      picked = f || null;
+      nameEl.textContent = picked ? picked.name + " \u00B7 " + (picked.size / 1024).toFixed(1) + " KB" : "";
+      refreshBtn();
+    };
+
+    exportBtn.addEventListener("click", async () => {
+      exportBtn.disabled = true;
+      exportBtn.textContent = "Exporting\u2026";
+      try {
+        const res = await api("/api/database/export");
+        const blob = await res.blob();
+        const cd = res.headers.get("Content-Disposition") || "";
+        const m = /filename="([^"]+)"/.exec(cd);
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = m ? m[1] : "microflow-backup.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        toast("Backup downloaded", "success");
+      } catch (e) { toast(e.message, "error"); }
+      finally { exportBtn.disabled = false; exportBtn.textContent = "Export Database"; }
+    });
+
+    drop.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => pick(fileInput.files[0]));
+    ["dragover", "dragenter"].forEach((evt) =>
+      drop.addEventListener(evt, (e) => { e.preventDefault(); drop.classList.add("dragover"); }));
+    ["dragleave", "drop"].forEach((evt) =>
+      drop.addEventListener(evt, (e) => { e.preventDefault(); drop.classList.remove("dragover"); }));
+    drop.addEventListener("drop", (e) => pick(e.dataTransfer.files && e.dataTransfer.files[0]));
+    confirmIn.addEventListener("input", refreshBtn);
+    pwIn.addEventListener("input", refreshBtn);
+
+    importBtn.addEventListener("click", async () => {
+      if (!picked) return;
+      importBtn.disabled = true;
+      importBtn.textContent = "Importing\u2026";
+      resultEl.innerHTML = "";
+      try {
+        const r = await apiJSON("/api/database/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Microflow-Confirm": CONFIRM, "X-Microflow-Password": pwIn.value },
+          body: picked,
+        });
+        pwIn.value = "";
+        const c = (r && r.counts) || {};
+        resultEl.innerHTML = '<div class="card" style="margin-top:12px;">\u2705 Database imported: ' +
+          escapeHtml((c.services || 0) + " service(s), " + (c.workflows || 0) + " workflow(s), " +
+            ((c.global_env || 0) + (c.service_env || 0)) + " environment variable(s), " +
+            (c.run_all_schedules || 0) + " Run All schedule(s)") + "." +
+          (r && r.warning ? '<div class="unsupported-box" style="margin-top:8px;">' + escapeHtml(r.warning) + "</div>" : "") +
+          "<div class=\"sub\" style=\"margin-top:8px;\">Reloading\u2026</div></div>";
+        toast("Database imported", "success");
+        // The previously selected Service may not exist in the restored data.
+        try { localStorage.removeItem("mf.service"); } catch (_) {}
+        setTimeout(() => { location.hash = "#/dashboard"; location.reload(); }, r && r.warning ? 4000 : 1200);
+      } catch (e) {
+        toast(e.message, "error");
+        resultEl.innerHTML = '<div class="unsupported-box" style="margin-top:12px;">' + escapeHtml(e.message) +
+          " Nothing was changed.</div>";
+        importBtn.textContent = "Import Database";
+        refreshBtn();
       }
     });
   }
