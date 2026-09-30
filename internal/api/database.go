@@ -6,6 +6,12 @@ package api
 // login password re-verified (the same s.reauth check the destructive
 // Environment action uses) and an explicit confirmation header, both
 // enforced here, not just in the UI.
+//
+// Backups are portable: secrets are re-encrypted under a backup passphrase
+// (header X-Microflow-Backup-Passphrase) on export and re-keyed to THIS
+// installation's MICROFLOW_MASTER_KEY on import, so the two installations do
+// not need to share a master key. The passphrase travels in a header (never
+// the URL) and is never logged or stored.
 
 import (
 	"context"
@@ -23,12 +29,15 @@ import (
 
 // DatabaseBackupStore is implemented by *store.Store.
 type DatabaseBackupStore interface {
-	ExportBackup(ctx context.Context) (*store.Backup, error)
+	ExportBackup(ctx context.Context, passphrase string, open func(ciphertext []byte) ([]byte, error)) (*store.Backup, error)
 	ImportBackup(ctx context.Context, p *store.ParsedBackup) (*store.ImportSummary, error)
 }
 
 // ImportConfirmPhrase must be sent in the X-Microflow-Confirm header.
 const ImportConfirmPhrase = "REPLACE DATABASE"
+
+// BackupPassphraseHeader carries the backup passphrase for export and import.
+const BackupPassphraseHeader = "X-Microflow-Backup-Passphrase"
 
 // WithDatabaseBackup enables /api/database/export and /api/database/import.
 // reload is called after a successful import commit to re-register schedules
@@ -57,10 +66,18 @@ func (s *Server) handleDatabaseExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, errors.New("database backup is not enabled on this server"))
 		return
 	}
-	b, err := s.dbBackup.ExportBackup(r.Context())
+	if s.vault == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("database backup needs the credential vault, which is not enabled"))
+		return
+	}
+	b, err := s.dbBackup.ExportBackup(r.Context(), r.Header.Get(BackupPassphraseHeader), s.vault.Open)
 	if err != nil {
+		if errors.Is(err, store.ErrBackupPassphrase) {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
 		log.Printf("database export failed: %v", err)
-		writeErr(w, http.StatusInternalServerError, errors.New("failed to export the database"))
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to export the database (a stored secret may not be decryptable with this installation's master key -- see the server log)"))
 		return
 	}
 	name := "microflow-backup-" + b.ExportedAt.UTC().Format("20060102-150405") + ".json"
@@ -100,11 +117,13 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 
 	// 1. VALIDATE (no database access).
 	body := http.MaxBytesReader(w, r.Body, importMaxBytes())
-	var canOpen func([]byte) bool
-	if s.vault != nil {
-		canOpen = s.vault.CanOpen
+	if s.vault == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("database import needs the credential vault, which is not enabled"))
+		return
 	}
-	parsed, err := store.ParseBackup(body, canOpen)
+	// Secrets are decrypted with the backup passphrase and re-sealed with
+	// THIS installation's master key here, in memory, before any DB access.
+	parsed, err := store.ParseBackup(body, r.Header.Get(BackupPassphraseHeader), s.vault.Seal)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -142,6 +161,12 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 
 	// 5. RELOAD application state (schedules + webhook routes).
 	resp := map[string]any{"status": "ok", "counts": summary.Counts, "reloaded": true}
+	if len(summary.SkippedDeploymentKeys) > 0 {
+		// Host/domain-specific values are never restored from a backup; say so
+		// plainly so the operator sets this installation's own value.
+		resp["skippedDeploymentKeys"] = summary.SkippedDeploymentKeys
+		resp["notice"] = "GOOGLE_OAUTH_REDIRECT_URL was not restored because it belongs to the old domain. Set it for THIS installation (Global/Service Environment or host env) to <your-domain>/api/oauth/google/callback and register the same URL in Google Cloud Console. Connected Google accounts keep working without it; it is only needed to Connect/Reconnect."
+	}
 	if s.dbReload != nil {
 		if rerr := s.dbReload(context.WithoutCancel(r.Context())); rerr != nil {
 			log.Printf("database import: reload after commit failed: %v", rerr)
