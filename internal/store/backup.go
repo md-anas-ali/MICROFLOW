@@ -10,10 +10,19 @@ package store
 // execution_checkpoints and run_all_jobs describe runs that happened on
 // one particular installation (see runtimeTables below).
 //
-// Secrets stay exactly as the existing vault stores them: AES-GCM
-// ciphertext sealed with MICROFLOW_MASTER_KEY. The backup carries that
-// ciphertext unchanged; import refuses (before touching anything) a backup
-// whose secrets the target installation's master key cannot open.
+// Secrets (credentials, Google account tokens, Global/Service Environment
+// values) never leave the database as plaintext AND the backup never depends
+// on MICROFLOW_MASTER_KEY:
+//
+//   - Export opens each vault ciphertext in memory with the SOURCE master key
+//     and immediately re-seals it (AES-256-GCM) under a key derived from a
+//     backup passphrase the person supplies (PBKDF2-HMAC-SHA256, random salt).
+//     Nothing plaintext is written to the file, logs or temp files.
+//   - Import derives the same key from the passphrase, opens each secret and
+//     re-seals it under the TARGET installation's own master key -- all in
+//     memory, during validation, BEFORE the database is touched. A wrong
+//     passphrase, a tampered file or any decrypt failure aborts the import
+//     with the existing database unchanged.
 //
 // Import is FULL REPLACE in ONE transaction:
 //
@@ -26,7 +35,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,8 +60,20 @@ import (
 const (
 	// BackupFormat / BackupVersion identify a MicroFlow database backup.
 	BackupFormat  = "microflow-db-backup"
-	BackupVersion = 1
+	BackupVersion = 2
+
+	backupKDF        = "pbkdf2-sha256"
+	backupCipher     = "aes-256-gcm"
+	backupKDFIter    = 600000
+	backupKDFMinIter = 100000
+	backupKDFMaxIter = 10000000
+	// BackupMinPassphraseLen is the shortest backup passphrase Export accepts.
+	BackupMinPassphraseLen = 8
 )
+
+// ErrBackupPassphrase is returned by ExportBackup when the passphrase is
+// missing or too short.
+var ErrBackupPassphrase = errors.New("store: a backup passphrase of at least 8 characters is required")
 
 // ErrBackupActiveRuns is returned by ImportBackup while any execution or
 // Run All sweep is queued/running/waiting: replacing workflows underneath a
@@ -139,12 +166,159 @@ func (t backupTable) quotedCols() string {
 
 // Backup is the portable file format.
 type Backup struct {
-	Format     string          `json:"format"`
-	Version    int             `json:"version"`
-	ExportedAt time.Time       `json:"exportedAt"`
-	Counts     map[string]int  `json:"counts"`
-	Checksum   string          `json:"checksum"` // hex sha256 of the compacted "tables" JSON
-	Tables     json.RawMessage `json:"tables"`
+	Format     string            `json:"format"`
+	Version    int               `json:"version"`
+	ExportedAt time.Time         `json:"exportedAt"`
+	Counts     map[string]int    `json:"counts"`
+	Encryption *BackupEncryption `json:"encryption"`
+	Checksum   string            `json:"checksum"` // hex sha256 of the compacted "tables" JSON
+	MAC        string            `json:"mac"`      // hex HMAC-SHA256 (passphrase-derived key) of the same bytes
+	Tables     json.RawMessage   `json:"tables"`
+}
+
+// BackupEncryption describes how the secret columns in this file are sealed.
+// It holds only public parameters; the key is derived from the passphrase and
+// is never stored. Verifier lets Import report a wrong passphrase up front.
+type BackupEncryption struct {
+	KDF        string `json:"kdf"`
+	Cipher     string `json:"cipher"`
+	Iterations int    `json:"iterations"`
+	Salt       string `json:"salt"`     // base64
+	Verifier   string `json:"verifier"` // base64 sealed constant
+}
+
+// backupCrypto holds the keys derived from the backup passphrase.
+type backupCrypto struct {
+	aead   cipher.AEAD
+	macKey []byte
+}
+
+var backupVerifierPlain = []byte("microflow-backup-verifier-v1")
+
+func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
+	prf := hmac.New(sha256.New, password)
+	hashLen := prf.Size()
+	blocks := (keyLen + hashLen - 1) / hashLen
+	dk := make([]byte, 0, blocks*hashLen)
+	u := make([]byte, 0, hashLen)
+	var ib [4]byte
+	for b := 1; b <= blocks; b++ {
+		prf.Reset()
+		prf.Write(salt)
+		binary.BigEndian.PutUint32(ib[:], uint32(b))
+		prf.Write(ib[:])
+		dk = prf.Sum(dk)
+		t := dk[len(dk)-hashLen:]
+		u = append(u[:0], t...)
+		for n := 2; n <= iter; n++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(u[:0])
+			for x := range u {
+				t[x] ^= u[x]
+			}
+		}
+	}
+	return dk[:keyLen]
+}
+
+func newBackupCrypto(passphrase string, salt []byte, iter int) (*backupCrypto, error) {
+	dk := pbkdf2SHA256([]byte(passphrase), salt, iter, 64)
+	block, err := aes.NewCipher(dk[:32])
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &backupCrypto{aead: aead, macKey: dk[32:]}, nil
+}
+
+func (bc *backupCrypto) seal(plain, aad []byte) ([]byte, error) {
+	nonce := make([]byte, bc.aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return bc.aead.Seal(nonce, nonce, plain, aad), nil
+}
+
+func (bc *backupCrypto) open(ct, aad []byte) ([]byte, error) {
+	ns := bc.aead.NonceSize()
+	if len(ct) < ns {
+		return nil, errors.New("short ciphertext")
+	}
+	return bc.aead.Open(nil, ct[:ns], ct[ns:], aad)
+}
+
+func (bc *backupCrypto) mac(tablesJSON []byte) (string, error) {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, tablesJSON); err != nil {
+		return "", err
+	}
+	m := hmac.New(sha256.New, bc.macKey)
+	m.Write(buf.Bytes())
+	return hex.EncodeToString(m.Sum(nil)), nil
+}
+
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// cellAAD binds a sealed secret to its table, primary key and column, so a
+// ciphertext moved to another row/column fails to open.
+func cellAAD(t backupTable, row map[string]json.RawMessage, col string) []byte {
+	parts := []string{"microflow-backup-v2", t.name}
+	for _, pk := range t.pk {
+		var sv string
+		_ = json.Unmarshal(row[pk], &sv)
+		parts = append(parts, sv)
+	}
+	parts = append(parts, col)
+	return []byte(strings.Join(parts, "\x00"))
+}
+
+// rekeyRows applies fn to every non-null secret cell of the table's rows
+// (given as a JSON array) and returns the re-serialised array. Tables
+// without secret columns are returned untouched.
+func rekeyRows(t backupTable, arr []byte, fn func(row map[string]json.RawMessage, col string, ct []byte) ([]byte, error)) ([]byte, error) {
+	hasSecret := false
+	for _, col := range t.cols {
+		if col.secret {
+			hasSecret = true
+		}
+	}
+	if !hasSecret {
+		return arr, nil
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(arr, &rows); err != nil {
+		return nil, err
+	}
+	for i, row := range rows {
+		for _, col := range t.cols {
+			if !col.secret {
+				continue
+			}
+			v, present := row[col.name]
+			if !present || string(bytes.TrimSpace(v)) == "null" {
+				continue
+			}
+			ct, err := decodeBytea(v)
+			if err != nil {
+				return nil, invalidf("%s row %d: %s is not valid binary data", t.name, i+1, col.name)
+			}
+			out, err := fn(row, col.name, ct)
+			if err != nil {
+				return nil, err
+			}
+			enc, _ := json.Marshal(`\x` + hex.EncodeToString(out))
+			row[col.name] = enc
+		}
+	}
+	return json.Marshal(rows)
 }
 
 func checksumOf(tablesJSON []byte) (string, error) {
@@ -160,17 +334,34 @@ func checksumOf(tablesJSON []byte) (string, error) {
 // repeatable-read transaction, so the file is a consistent snapshot even
 // while the server keeps running. IDs, timestamps and relationships are
 // preserved verbatim (rows are emitted as JSON objects keyed by column).
-func (s *Store) ExportBackup(ctx context.Context) (*Backup, error) {
+//
+// open decrypts one vault ciphertext with the SOURCE installation's master
+// key; every secret is immediately re-sealed under the passphrase-derived
+// backup key, so the file carries no plaintext and no master-key ciphertext.
+func (s *Store) ExportBackup(ctx context.Context, passphrase string, open func(ciphertext []byte) ([]byte, error)) (*Backup, error) {
+	if len(passphrase) < BackupMinPassphraseLen {
+		return nil, ErrBackupPassphrase
+	}
+	if open == nil {
+		return nil, errors.New("export: no vault available to read secrets")
+	}
+	salt := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+	bc, err := newBackupCrypto(passphrase, salt, backupKDFIter)
+	if err != nil {
+		return nil, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	var buf bytes.Buffer
-	buf.WriteByte('{')
+	rawRows := make(map[string][]byte, len(backupTables))
 	counts := make(map[string]int, len(backupTables))
-	for i, t := range backupTables {
+	for _, t := range backupTables {
 		pairs := make([]string, 0, len(t.cols)*2)
 		for _, col := range t.cols {
 			pairs = append(pairs, "'"+col.name+"'", quoteIdent(col.name))
@@ -182,20 +373,47 @@ func (s *Store) ExportBackup(ctx context.Context) (*Backup, error) {
 		if err := tx.QueryRow(ctx, q).Scan(&rows, &n); err != nil {
 			return nil, fmt.Errorf("export %s: %w", t.name, err)
 		}
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		buf.WriteString(`"` + t.name + `":`)
-		buf.WriteString(rows)
+		rawRows[t.name] = []byte(rows)
 		counts[t.name] = n
 	}
-	buf.WriteByte('}')
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
+	// Re-encrypt secrets (in memory): source master key -> backup key.
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, t := range backupTables {
+		t := t
+		arr, err := rekeyRows(t, rawRows[t.name], func(row map[string]json.RawMessage, col string, ct []byte) ([]byte, error) {
+			pt, err := open(ct)
+			if err != nil {
+				return nil, fmt.Errorf("export %s: a stored secret could not be decrypted with this installation's MICROFLOW_MASTER_KEY (column %s) -- nothing was exported", t.name, col)
+			}
+			defer wipe(pt)
+			return bc.seal(pt, cellAAD(t, row, col))
+		})
+		if err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(`"` + t.name + `":`)
+		buf.Write(arr)
+	}
+	buf.WriteByte('}')
+
 	tables := json.RawMessage(buf.Bytes())
 	sum, err := checksumOf(tables)
+	if err != nil {
+		return nil, err
+	}
+	mac, err := bc.mac(tables)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := bc.seal(backupVerifierPlain, []byte("verifier"))
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +422,16 @@ func (s *Store) ExportBackup(ctx context.Context) (*Backup, error) {
 		Version:    BackupVersion,
 		ExportedAt: time.Now().UTC(),
 		Counts:     counts,
-		Checksum:   sum,
-		Tables:     tables,
+		Encryption: &BackupEncryption{
+			KDF:        backupKDF,
+			Cipher:     backupCipher,
+			Iterations: backupKDFIter,
+			Salt:       base64.StdEncoding.EncodeToString(salt),
+			Verifier:   base64.StdEncoding.EncodeToString(ver),
+		},
+		Checksum: sum,
+		MAC:      mac,
+		Tables:   tables,
 	}, nil
 }
 
@@ -230,9 +456,18 @@ func (p *ParsedBackup) Counts() map[string]int {
 //     (workflow -> service, static data/credentials/schedules -> workflow,
 //     service_env -> service);
 //   - every workflow definition parses as a model.Workflow with a matching id;
-//   - every vault ciphertext can be opened by canOpen (the target
-//     installation's MICROFLOW_MASTER_KEY).
-func ParseBackup(r io.Reader, canOpen func(ciphertext []byte) bool) (*ParsedBackup, error) {
+//   - the passphrase opens the backup (verifier + file MAC), and every secret
+//     opens under it;
+//   - every secret is then re-sealed with seal (the TARGET installation's
+//     vault), so the rows handed to ImportBackup are already keyed for this
+//     installation. All of this happens in memory, before any DB access.
+func ParseBackup(r io.Reader, passphrase string, seal func(plaintext []byte) ([]byte, error)) (*ParsedBackup, error) {
+	if passphrase == "" {
+		return nil, invalidf("the backup passphrase is required")
+	}
+	if seal == nil {
+		return nil, invalidf("no vault available to re-encrypt secrets for this installation")
+	}
 	var b Backup
 	if err := json.NewDecoder(r).Decode(&b); err != nil {
 		return nil, invalidf("not a readable MicroFlow backup file (%v)", err)
@@ -240,8 +475,26 @@ func ParseBackup(r io.Reader, canOpen func(ciphertext []byte) bool) (*ParsedBack
 	if b.Format != BackupFormat {
 		return nil, invalidf("unrecognised file format %q", b.Format)
 	}
-	if b.Version < 1 || b.Version > BackupVersion {
-		return nil, invalidf("backup version %d is not supported by this MicroFlow (supports up to %d)", b.Version, BackupVersion)
+	if b.Version == 1 {
+		return nil, invalidf("this is a version 1 backup, whose secrets depend on the original MICROFLOW_MASTER_KEY; re-export it from the source installation with this MicroFlow version to get a portable backup")
+	}
+	if b.Version != BackupVersion {
+		return nil, invalidf("backup version %d is not supported by this MicroFlow (supports %d)", b.Version, BackupVersion)
+	}
+	enc := b.Encryption
+	if enc == nil || enc.KDF != backupKDF || enc.Cipher != backupCipher {
+		return nil, invalidf("backup has no supported encryption header")
+	}
+	if enc.Iterations < backupKDFMinIter || enc.Iterations > backupKDFMaxIter {
+		return nil, invalidf("backup key-derivation settings are out of range")
+	}
+	salt, err := base64.StdEncoding.DecodeString(enc.Salt)
+	if err != nil || len(salt) < 8 {
+		return nil, invalidf("backup encryption salt is invalid")
+	}
+	verifier, err := base64.StdEncoding.DecodeString(enc.Verifier)
+	if err != nil {
+		return nil, invalidf("backup encryption verifier is invalid")
 	}
 	if len(b.Tables) == 0 {
 		return nil, invalidf("backup contains no tables")
@@ -252,6 +505,17 @@ func ParseBackup(r io.Reader, canOpen func(ciphertext []byte) bool) (*ParsedBack
 	}
 	if !strings.EqualFold(want, b.Checksum) {
 		return nil, invalidf("checksum mismatch -- the file is corrupted or was modified")
+	}
+	bc, err := newBackupCrypto(passphrase, salt, enc.Iterations)
+	if err != nil {
+		return nil, invalidf("could not derive the backup key (%v)", err)
+	}
+	if pt, err := bc.open(verifier, []byte("verifier")); err != nil || !bytes.Equal(pt, backupVerifierPlain) {
+		return nil, invalidf("wrong backup passphrase (or the file's encryption header was modified)")
+	}
+	wantMAC, err := bc.mac(b.Tables)
+	if err != nil || !hmac.Equal([]byte(wantMAC), []byte(strings.ToLower(b.MAC))) {
+		return nil, invalidf("backup authentication failed -- the file was modified")
 	}
 
 	var raw map[string]json.RawMessage
@@ -301,15 +565,6 @@ func ParseBackup(r io.Reader, canOpen func(ciphertext []byte) bool) (*ParsedBack
 				if col.req && isNull {
 					return nil, invalidf("%s row %d is missing required column %q", t.name, i+1, col.name)
 				}
-				if col.secret && !isNull {
-					ct, err := decodeBytea(v)
-					if err != nil {
-						return nil, invalidf("%s row %d: %s is not valid binary data", t.name, i+1, col.name)
-					}
-					if canOpen != nil && !canOpen(ct) {
-						return nil, invalidf("%s row %d holds a secret this installation cannot decrypt -- the backup was made with a different MICROFLOW_MASTER_KEY; set the same MICROFLOW_MASTER_KEY here and retry", t.name, i+1)
-					}
-				}
 			}
 			var kp []string
 			for _, pk := range t.pk {
@@ -325,6 +580,30 @@ func ParseBackup(r io.Reader, canOpen func(ciphertext []byte) bool) (*ParsedBack
 			}
 			seen[key] = true
 		}
+		// Re-key every secret: backup key -> this installation's master key.
+		t := t
+		rekeyed, err := rekeyRows(t, arr, func(row map[string]json.RawMessage, col string, ct []byte) ([]byte, error) {
+			pt, err := bc.open(ct, cellAAD(t, row, col))
+			if err != nil {
+				return nil, invalidf("%s: a secret could not be decrypted with the backup passphrase", t.name)
+			}
+			defer wipe(pt)
+			if t.name == "credentials" || t.name == "google_account_credentials" {
+				var m map[string]string
+				if json.Unmarshal(pt, &m) != nil {
+					return nil, invalidf("%s: a credential has an unreadable format", t.name)
+				}
+			}
+			out, err := seal(pt)
+			if err != nil {
+				return nil, fmt.Errorf("re-encrypting %s for this installation: %w", t.name, err)
+			}
+			return out, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		arr = rekeyed
 		keys[t.name] = seen
 		tableRows[t.name] = rows
 		p.rows[t.name] = arr
@@ -390,7 +669,22 @@ func decodeBytea(raw json.RawMessage) ([]byte, error) {
 // ImportSummary reports what an import restored.
 type ImportSummary struct {
 	Counts map[string]int `json:"counts"`
+	// SkippedDeploymentKeys lists backup Environment entries that were NOT
+	// restored because they are specific to the host/domain the backup came
+	// from (see deploymentSpecificEnvKeys), as "global:KEY" or
+	// "service:<id>:KEY". The target's own existing values for those keys are
+	// kept (KeptDeploymentKeys counts them).
+	SkippedDeploymentKeys []string `json:"skippedDeploymentKeys,omitempty"`
+	KeptDeploymentKeys    int      `json:"keptDeploymentKeys"`
 }
+
+// deploymentSpecificEnvKeys are Global/Service Environment keys whose value is
+// tied to the host/domain an installation runs on (Google's OAuth callback
+// must be the exact URL registered for THAT domain). A full-replace import
+// never restores them from the backup; it keeps the target installation's
+// current value instead, so the new domain's redirect URL is never silently
+// overwritten by the old one.
+var deploymentSpecificEnvKeys = []string{"GOOGLE_OAUTH_REDIRECT_URL"}
 
 // ImportBackup is STAGE + REPLACE + VERIFY + COMMIT in one transaction.
 // ANY error rolls everything back: the existing database stays untouched.
@@ -457,6 +751,52 @@ func (s *Store) ImportBackup(ctx context.Context, p *ParsedBackup) (*ImportSumma
 		}
 	}
 
+	// ---- DEPLOYMENT-SPECIFIC KEYS: remember the target's current values and
+	// drop the backup's copies from the staged rows (see deploymentSpecificEnvKeys).
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE "_keep_global_env" (LIKE global_env INCLUDING DEFAULTS) ON COMMIT DROP`); err != nil {
+		return nil, fmt.Errorf("stage deployment keys: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE "_keep_service_env" (LIKE service_env INCLUDING DEFAULTS) ON COMMIT DROP`); err != nil {
+		return nil, fmt.Errorf("stage deployment keys: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO "_keep_global_env" SELECT * FROM global_env WHERE key = ANY($1)`, deploymentSpecificEnvKeys); err != nil {
+		return nil, fmt.Errorf("stage deployment keys: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO "_keep_service_env" SELECT * FROM service_env WHERE key = ANY($1)`, deploymentSpecificEnvKeys); err != nil {
+		return nil, fmt.Errorf("stage deployment keys: %w", err)
+	}
+	summary := &ImportSummary{Counts: map[string]int{}}
+	for _, q := range []struct{ tbl, label, sel string }{
+		{"_bk_global_env", "global", `'global:' || key`},
+		{"_bk_service_env", "service", `'service:' || service_id || ':' || key`},
+	} {
+		rows, err := tx.Query(ctx, fmt.Sprintf(`DELETE FROM %s WHERE key = ANY($1) RETURNING %s`, quoteIdent(q.tbl), q.sel), deploymentSpecificEnvKeys)
+		if err != nil {
+			return nil, fmt.Errorf("stage deployment keys: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			summary.SkippedDeploymentKeys = append(summary.SkippedDeploymentKeys, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(summary.SkippedDeploymentKeys)
+	stagedCount := map[string]int{}
+	for _, name := range []string{"global_env", "service_env"} {
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+quoteIdent("_bk_"+name)).Scan(&n); err != nil {
+			return nil, err
+		}
+		stagedCount[name] = n
+	}
+
 	// ---- REPLACE: clear everything persistent + the runtime tables that
 	// point at it, then copy the staged rows in dependency order.
 	for _, stmt := range []string{
@@ -484,8 +824,22 @@ func (s *Store) ImportBackup(ctx context.Context, p *ParsedBackup) (*ImportSumma
 		}
 	}
 
+	// Re-apply the target's own deployment-specific values (already sealed
+	// with the target's master key). Service-scoped ones only if that Service
+	// exists after the restore.
+	keptGlobal, err := tx.Exec(ctx, `INSERT INTO global_env SELECT * FROM "_keep_global_env" ON CONFLICT (key) DO NOTHING`)
+	if err != nil {
+		return nil, fmt.Errorf("keep deployment keys: %w", err)
+	}
+	keptService, err := tx.Exec(ctx, `INSERT INTO service_env SELECT k.* FROM "_keep_service_env" k WHERE EXISTS (SELECT 1 FROM services s WHERE s.id = k.service_id) ON CONFLICT (service_id, key) DO NOTHING`)
+	if err != nil {
+		return nil, fmt.Errorf("keep deployment keys: %w", err)
+	}
+	summary.KeptDeploymentKeys = int(keptGlobal.RowsAffected() + keptService.RowsAffected())
+	stagedCount["global_env"] += int(keptGlobal.RowsAffected())
+	stagedCount["service_env"] += int(keptService.RowsAffected())
+
 	// ---- VERIFY: what is now live must match what the file said.
-	summary := &ImportSummary{Counts: map[string]int{}}
 	names := make([]string, 0, len(backupTables))
 	for _, t := range backupTables {
 		names = append(names, t.name)
@@ -497,6 +851,9 @@ func (s *Store) ImportBackup(ctx context.Context, p *ParsedBackup) (*ImportSumma
 			return nil, err
 		}
 		expect := p.counts[name]
+		if v, ok := stagedCount[name]; ok {
+			expect = v // backup rows minus skipped deployment keys, plus the target's kept ones
+		}
 		if name == "services" {
 			var hasDefault bool
 			for _, row := range mustRows(p.rows[name]) {
