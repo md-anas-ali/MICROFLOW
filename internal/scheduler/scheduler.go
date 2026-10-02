@@ -288,7 +288,8 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	localMinute := minute.In(s.location)
 	for i := range s.schedules {
 		sc := s.schedules[i]
-		if !sc.Enabled {
+		if !sc.Enabled || !sc.RunAll {
+			// Workflow-level Schedule Triggers never auto-run; only Run All schedules fire.
 			continue
 		}
 		if sc.RunAll {
