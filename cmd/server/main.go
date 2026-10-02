@@ -637,7 +637,10 @@ func schedulesFromNode(workflowID, nodeName string, n *model.Node, wfActive bool
 	add := func(sc scheduler.Schedule) {
 		sc.WorkflowID = workflowID
 		sc.NodeName = nodeName
-		sc.Enabled = wfActive && !n.Disabled
+		// Workflow-level auto trigger is disabled: only Global (Run All) schedules
+		// and Manual Run start executions. Node config is kept untouched.
+		_ = wfActive
+		sc.Enabled = false
 		sc.ID = baseID
 		if len(out) > 0 {
 			sc.ID = fmt.Sprintf("%s#%d", baseID, len(out)+1)
