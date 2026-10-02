@@ -247,7 +247,7 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 	operation, _ := node.Parameters["operation"].(string)
 
 	var out []model.Item
-	for _, it := range flatten(input) {
+	for itemIdx, it := range flatten(input) {
 		exprCtx := rc.ExprContext(it.JSON)
 
 		if resource == "thumbnail" || operation == "setThumbnail" {
@@ -281,7 +281,42 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		if cat, _ := expr.EvalValue(node.ParamString("categoryId", ""), exprCtx); cat != nil && fmt.Sprint(cat) != "" {
 			snip["categoryId"] = fmt.Sprint(cat)
 		}
-		if opts, ok := node.Parameters["options"].(map[string]any); ok {
+		// Publishing Queue & Schedule Normalizer (youtube_queue.go). Opt-in
+		// via options.publishQueue=true / YT_PUBLISH_QUEUE=true; when off,
+		// the node behaves exactly as before (publishAt from the node's
+		// own expression).
+		var pq *pubQueue
+		var resv pubReservation
+		opKey := ""
+		if publishQueueEnabled(rc, node) {
+			execID := "adhoc"
+			if rc.Execution != nil && rc.Execution.ID != "" {
+				execID = rc.Execution.ID
+			}
+			// Stable across engine retries/resume of the same execution, so a
+			// retried upload re-uses its slot (and never gets a second one).
+			opKey = fmt.Sprintf("%s|%s|%d", execID, node.Name, itemIdx)
+			var qerr error
+			pq, qerr = newPubQueue(rc, token)
+			if qerr != nil {
+				return nil, engine.Permanent(fmt.Errorf("youTube %q publish queue: %w", node.Name, qerr))
+			}
+			resv, qerr = pq.Begin(ctx, opKey, strings.TrimSpace(fmt.Sprint(title)))
+			if qerr != nil {
+				return nil, fmt.Errorf("youTube %q publish queue: %w", node.Name, qerr)
+			}
+			if resv.VideoID != "" {
+				// This operation already uploaded (retry after a lost response,
+				// or resume after a restart): do NOT upload again.
+				pq.ApplyMoves(ctx, &resv)
+				item := map[string]any{"id": resv.VideoID, "videoId": resv.VideoID}
+				pq.decorate(item, &resv)
+				out = append(out, model.Item{JSON: item})
+				continue
+			}
+			status["publishAt"] = fmtPubTime(resv.Slot)
+			status["privacyStatus"] = "private"
+		} else if opts, ok := node.Parameters["options"].(map[string]any); ok {
 			if raw, ok := opts["publishAt"].(string); ok && raw != "" {
 				if v, _ := expr.EvalValue(raw, exprCtx); v != nil && fmt.Sprint(v) != "" {
 					// Scheduled publish: YouTube requires private + publishAt (RFC3339).
@@ -293,6 +328,9 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		snippet := map[string]any{"snippet": snip, "status": status}
 		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet, rc.CurrentOperationID)
 		if err != nil {
+			if pq != nil {
+				pq.Release(opKey, err) // free the slot; a retry re-reserves it
+			}
 			return nil, fmt.Errorf("youTube %q upload: %w", node.Name, err)
 		}
 		// Field name bug: this used to emit only "videoId", but every
@@ -307,7 +345,13 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		// instead of the real video ID. Emit "id" (matching real n8n)
 		// and keep "videoId" alongside it for any script written
 		// against MicroFlow's previous shape.
-		out = append(out, model.Item{JSON: map[string]any{"id": videoID, "videoId": videoID}})
+		outItem := map[string]any{"id": videoID, "videoId": videoID}
+		if pq != nil {
+			pq.Commit(opKey, videoID, &resv)
+			pq.ApplyMoves(ctx, &resv) // reconcile pre-existing scheduled videos
+			pq.decorate(outItem, &resv)
+		}
+		out = append(out, model.Item{JSON: outItem})
 	}
 	return model.NodeOutput{out}, nil
 }
