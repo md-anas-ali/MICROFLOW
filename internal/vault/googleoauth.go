@@ -132,15 +132,20 @@ func (g *GoogleOAuthApp) AuthURL(msvcID, service string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// include_granted_scopes is deliberately NOT sent. With it, Google
+	// merges every scope this account previously granted this client
+	// (e.g. youtube + youtube.force-ssl + youtubepartner + drive.file)
+	// into the new request and rejects the mix with "Error 400:
+	// invalid_request ... scopes that cannot be requested together".
+	// Each service is requested on its own.
 	q := url.Values{
-		"client_id":              {g.ClientID},
-		"redirect_uri":           {g.RedirectURL},
-		"response_type":          {"code"},
-		"scope":                  {strings.Join(allScopes, " ")},
-		"access_type":            {"offline"},
-		"prompt":                 {"consent select_account"},
-		"include_granted_scopes": {"true"},
-		"state":                  {state},
+		"client_id":     {g.ClientID},
+		"redirect_uri":  {g.RedirectURL},
+		"response_type": {"code"},
+		"scope":         {strings.Join(allScopes, " ")},
+		"access_type":   {"offline"},
+		"prompt":        {"consent select_account"},
+		"state":         {state},
 	}
 	return googleAuthEndpoint + "?" + q.Encode(), nil
 }
