@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -151,10 +150,8 @@ func (WaitExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *mo
 		}
 		waitUntil = time.Now().Add(time.Duration(seconds * mult * float64(time.Second)))
 		if rc.BeforeWait != nil {
-			// The checkpoint only helps crash recovery; a slow DB must not
-			// abort the workflow, so just log it and keep waiting.
 			if err := rc.BeforeWait(waitUntil); err != nil {
-				log.Printf("wait %q: checkpoint before wait failed (ignored, run continues): %v", node.Name, err)
+				return nil, fmt.Errorf("wait %q: checkpoint before wait: %w", node.Name, err)
 			}
 		}
 	}
