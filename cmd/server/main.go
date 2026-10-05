@@ -365,7 +365,7 @@ func main() {
 	// the cooldown: wait for finished runs' scratch directories to be removed,
 	// drop idle keep-alive connections, and hand freed heap back to the OS.
 	sch.SetCleanup(func(ctx context.Context) {
-		run.WaitScratchCleanup(ctx)
+		run.CleanupJunk(ctx) // scratch dirs + leftover /tmp working files (also waits for scratch removal)
 		nodeHTTPClient.CloseIdleConnections()
 		http.DefaultClient.CloseIdleConnections()
 		debug.FreeOSMemory()
