@@ -414,7 +414,16 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		if hashErr != nil {
 			return nil, fmt.Errorf("runner: workflow hash: %w", hashErr)
 		}
+		// If the DB is unreachable, every node would otherwise spend up to
+		// ~100s on retries (the engine checkpoints twice per node). After a
+		// save has failed all its retries, further saves are skipped for
+		// checkpointSkipWindow so the run keeps moving at normal speed. The
+		// engine calls the checkpoint from a single goroutine, so no lock.
+		var skipUntil time.Time
 		checkpointFn := func(state model.ExecutionCheckpointState) error {
+			if time.Now().Before(skipUntil) {
+				return nil
+			}
 			cp := &model.ExecutionCheckpoint{
 				ExecutionID: execID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
 				Mode: mode, StartedAt: execution.StartedAt, State: state, UpdatedAt: time.Now(),
@@ -441,6 +450,8 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 				time.Sleep(time.Duration(try) * 2 * time.Second)
 			}
 			if saveErr != nil {
+				skipUntil = time.Now().Add(60 * time.Second)
+				log.Printf("checkpoint execution=%s: DB unreachable, skipping saves for 60s", execID)
 				return saveErr
 			}
 			log.Printf("checkpoint saved execution=%s status=%s steps=%d", execID, state.Status, state.Steps)
