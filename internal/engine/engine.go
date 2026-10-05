@@ -431,11 +431,7 @@ runLoop:
 		startPending := make([]queueItem, 0, len(queue)+1)
 		startPending = append(startPending, currentItem)
 		startPending = append(startPending, queue...)
-		if err := checkpoint(model.StatusRunning, startPending, lastCompletedNode(rc.Execution), nil); err != nil {
-			runErr = fmt.Errorf("engine: checkpoint before node %q: %w", node.Name, err)
-			rc.Execution.Status = model.StatusError
-			break runLoop
-		}
+		softCheckpoint(checkpoint, model.StatusRunning, startPending, lastCompletedNode(rc.Execution), "before node "+node.Name)
 		resumeOperationID = ""
 		if node.Type == model.TypeWait {
 			rc.BeforeWait = func(until time.Time) error {
@@ -451,16 +447,21 @@ runLoop:
 		started := time.Now()
 		var out model.NodeOutput
 		var nodeErr error
-		for a := 1; a <= maxNodeTries(node); a++ {
+		tries := maxNodeTries(node)
+		for a := 1; a <= tries; a++ {
 			out, nodeErr = exec.Execute(ctx, rc, node, item.Input)
 			if nodeErr == nil {
 				break
 			}
-			if IsPermanent(nodeErr) {
+			if IsPermanent(nodeErr) || ctx.Err() != nil {
 				break
 			}
-			if a < maxNodeTries(node) {
-				time.Sleep(retryBackoff(node.WaitBetweenTriesMs, a))
+			if a < tries {
+				log.Printf("engine: node %q failed (try %d/%d): %v -- retrying", node.Name, a, tries, nodeErr)
+				select {
+				case <-ctx.Done():
+				case <-time.After(retryBackoff(node.WaitBetweenTriesMs, a)):
+				}
 			}
 		}
 		duration := time.Since(started)
@@ -495,11 +496,7 @@ runLoop:
 				result.Output = rc.Redactor.RedactOutput(errOut)
 				rc.appendNodeRun(result)
 				enqueueFromBranch(&queue, rc.Workflow, node.Name, branchIdx, []model.Item{errItem})
-				if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
-					runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
-					rc.Execution.Status = model.StatusError
-					break runLoop
-				}
+				softCheckpoint(checkpoint, model.StatusRunning, queue, node.Name, "after node "+node.Name)
 				continue
 			}
 			rc.appendNodeRun(result)
@@ -526,11 +523,7 @@ runLoop:
 				Input:    model.NodeOutput{branchItems},
 			})
 		}
-		if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
-			runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
-			rc.Execution.Status = model.StatusError
-			break runLoop
-		}
+		softCheckpoint(checkpoint, model.StatusRunning, queue, node.Name, "after node "+node.Name)
 	}
 
 	if runErr == nil && rc.Execution.Status == model.StatusRunning {
@@ -549,11 +542,41 @@ runLoop:
 	return rc.Execution, runErr
 }
 
+// defaultNodeTries is how many times a node that has NO retry configured of its
+// own is attempted before the run is failed. A transient problem (something not
+// ready yet, a brief network/DB hiccup) therefore retries instead of stopping the
+// whole workflow. Override with MICROFLOW_DEFAULT_NODE_TRIES (1 = old behaviour).
+func defaultNodeTries() int {
+	if v := os.Getenv("MICROFLOW_DEFAULT_NODE_TRIES"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n >= 1 && n <= 10 {
+			return n
+		}
+	}
+	return 3
+}
+
 func maxNodeTries(node *model.Node) int {
-	if node == nil || !node.RetryOnFail || node.MaxTries <= 1 {
+	if node == nil {
 		return 1
 	}
-	return node.MaxTries
+	if node.RetryOnFail && node.MaxTries > 1 {
+		return node.MaxTries
+	}
+	if node.RetryOnFail {
+		return 1
+	}
+	return defaultNodeTries()
+}
+
+// softCheckpoint persists recovery state but never fails the run. The checkpoint
+// is only a crash-recovery aid; a slow or briefly unreachable database (e.g.
+// "context deadline exceeded") must not kill an otherwise healthy execution.
+// The failure is logged and the next checkpoint simply tries again.
+func softCheckpoint(cp func(model.ExecutionStatus, []queueItem, string, *model.CheckpointWait) error, st model.ExecutionStatus, pending []queueItem, last, where string) {
+	if err := cp(st, pending, last, nil); err != nil {
+		log.Printf("engine: checkpoint %s failed (ignored, run continues): %v", where, err)
+	}
 }
 
 func (rc *RunContext) snapshotNodeOutputs() map[string]map[string]any {
