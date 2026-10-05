@@ -116,6 +116,12 @@ type Runner struct {
 	// global scheduler's between-run cleanup can wait for them (see
 	// WaitScratchCleanup) before the next Service starts.
 	scratchWG sync.WaitGroup
+
+	// tmpMu/tmpBaseline: entries that already existed directly under the OS
+	// temp dir when the server started (see leftovers.go). Anything that
+	// appears there afterwards is leftover junk from a finished run.
+	tmpMu       sync.Mutex
+	tmpBaseline map[string]struct{}
 }
 
 func (r *Runner) markExecutionLive(execID string) {
