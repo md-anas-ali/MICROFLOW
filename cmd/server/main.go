@@ -336,6 +336,10 @@ func main() {
 		WithEnv(envVault).
 		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
 
+	// Startup: drop scratch dirs orphaned by a previous process and remember
+	// what already lives in the OS temp dir (never deleted later).
+	run.InitTempBaseline()
+
 	// Global Scheduler: the ONLY thing that starts scheduled executions, and
 	// the one sequential queue (max concurrency 1) every run path goes
 	// through -- due Schedule Triggers, manual Run, webhooks, Run Service /
@@ -366,6 +370,7 @@ func main() {
 	// drop idle keep-alive connections, and hand freed heap back to the OS.
 	sch.SetCleanup(func(ctx context.Context) {
 		run.WaitScratchCleanup(ctx)
+		run.CleanupLeftovers()
 		nodeHTTPClient.CloseIdleConnections()
 		http.DefaultClient.CloseIdleConnections()
 		debug.FreeOSMemory()
