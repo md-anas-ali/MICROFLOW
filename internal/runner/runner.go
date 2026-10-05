@@ -11,7 +11,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -414,16 +413,9 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		if hashErr != nil {
 			return nil, fmt.Errorf("runner: workflow hash: %w", hashErr)
 		}
-		// If the DB is unreachable, every node would otherwise spend up to
-		// ~100s on retries (the engine checkpoints twice per node). After a
-		// save has failed all its retries, further saves are skipped for
-		// checkpointSkipWindow so the run keeps moving at normal speed. The
-		// engine calls the checkpoint from a single goroutine, so no lock.
-		var skipUntil time.Time
 		checkpointFn := func(state model.ExecutionCheckpointState) error {
-			if time.Now().Before(skipUntil) {
-				return nil
-			}
+			checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
 			cp := &model.ExecutionCheckpoint{
 				ExecutionID: execID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
 				Mode: mode, StartedAt: execution.StartedAt, State: state, UpdatedAt: time.Now(),
@@ -432,27 +424,8 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 				cp.LeaseOwner = resume.LeaseOwner
 				cp.LeaseUntil = time.Now().Add(recoveryLease())
 			}
-			// A slow/briefly unreachable DB gets several attempts with a longer
-			// per-attempt deadline before the save is given up (the engine then
-			// logs it and keeps running -- it never aborts the workflow).
-			var saveErr error
-			for try := 1; try <= 3; try++ {
-				checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				saveErr = r.Recovery.SaveExecutionCheckpoint(checkCtx, cp)
-				cancel()
-				if saveErr == nil {
-					break
-				}
-				if errors.Is(saveErr, model.ErrCheckpointTooLarge) {
-					return saveErr // retrying cannot shrink it
-				}
-				log.Printf("checkpoint save execution=%s try %d/3 failed: %v", execID, try, saveErr)
-				time.Sleep(time.Duration(try) * 2 * time.Second)
-			}
-			if saveErr != nil {
-				skipUntil = time.Now().Add(60 * time.Second)
-				log.Printf("checkpoint execution=%s: DB unreachable, skipping saves for 60s", execID)
-				return saveErr
+			if err := r.Recovery.SaveExecutionCheckpoint(checkCtx, cp); err != nil {
+				return err
 			}
 			log.Printf("checkpoint saved execution=%s status=%s steps=%d", execID, state.Status, state.Steps)
 			return nil
