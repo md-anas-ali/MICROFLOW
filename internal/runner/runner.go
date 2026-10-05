@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -414,8 +415,6 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 			return nil, fmt.Errorf("runner: workflow hash: %w", hashErr)
 		}
 		checkpointFn := func(state model.ExecutionCheckpointState) error {
-			checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
 			cp := &model.ExecutionCheckpoint{
 				ExecutionID: execID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
 				Mode: mode, StartedAt: execution.StartedAt, State: state, UpdatedAt: time.Now(),
@@ -424,8 +423,25 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 				cp.LeaseOwner = resume.LeaseOwner
 				cp.LeaseUntil = time.Now().Add(recoveryLease())
 			}
-			if err := r.Recovery.SaveExecutionCheckpoint(checkCtx, cp); err != nil {
-				return err
+			// A slow/briefly unreachable DB gets several attempts with a longer
+			// per-attempt deadline before the save is given up (the engine then
+			// logs it and keeps running -- it never aborts the workflow).
+			var saveErr error
+			for try := 1; try <= 3; try++ {
+				checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				saveErr = r.Recovery.SaveExecutionCheckpoint(checkCtx, cp)
+				cancel()
+				if saveErr == nil {
+					break
+				}
+				if errors.Is(saveErr, model.ErrCheckpointTooLarge) {
+					return saveErr // retrying cannot shrink it
+				}
+				log.Printf("checkpoint save execution=%s try %d/3 failed: %v", execID, try, saveErr)
+				time.Sleep(time.Duration(try) * 2 * time.Second)
+			}
+			if saveErr != nil {
+				return saveErr
 			}
 			log.Printf("checkpoint saved execution=%s status=%s steps=%d", execID, state.Status, state.Steps)
 			return nil
