@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -527,9 +528,15 @@ runLoop:
 			})
 		}
 		if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
-			runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
-			rc.Execution.Status = model.StatusError
-			break runLoop
+			// The node already succeeded. A transient DB timeout must not
+			// destroy the run; the next checkpoint will persist newer state.
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("engine: checkpoint after node %q timed out, continuing: %v", node.Name, err)
+			} else {
+				runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
+				rc.Execution.Status = model.StatusError
+				break runLoop
+			}
 		}
 	}
 
