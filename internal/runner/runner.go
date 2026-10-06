@@ -11,11 +11,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -420,8 +422,6 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 			return nil, fmt.Errorf("runner: workflow hash: %w", hashErr)
 		}
 		checkpointFn := func(state model.ExecutionCheckpointState) error {
-			checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
 			cp := &model.ExecutionCheckpoint{
 				ExecutionID: execID, WorkflowID: wf.ID, WorkflowHash: hash, WorkflowUpdatedAt: wf.UpdatedAt,
 				Mode: mode, StartedAt: execution.StartedAt, State: state, UpdatedAt: time.Now(),
@@ -430,7 +430,20 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 				cp.LeaseOwner = resume.LeaseOwner
 				cp.LeaseUntil = time.Now().Add(recoveryLease())
 			}
-			if err := r.Recovery.SaveExecutionCheckpoint(checkCtx, cp); err != nil {
+			// Slow/cold remote Postgres (e.g. Neon) can exceed a short
+			// deadline; retry transient failures with a fresh timeout.
+			var err error
+			for attempt := 1; attempt <= 3; attempt++ {
+				checkCtx, cancel := context.WithTimeout(context.Background(), checkpointTimeout())
+				err = r.Recovery.SaveExecutionCheckpoint(checkCtx, cp)
+				cancel()
+				if err == nil || errors.Is(err, model.ErrCheckpointTooLarge) {
+					break
+				}
+				log.Printf("checkpoint save attempt %d/3 failed execution=%s: %v", attempt, execID, err)
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
+			if err != nil {
 				return err
 			}
 			log.Printf("checkpoint saved execution=%s status=%s steps=%d", execID, state.Status, state.Steps)
@@ -553,4 +566,15 @@ func (r *Runner) WaitScratchCleanup(ctx context.Context) {
 	case <-done:
 	case <-ctx.Done():
 	}
+}
+
+// checkpointTimeout bounds one checkpoint write attempt. Override with
+// MICROFLOW_CHECKPOINT_TIMEOUT_SECONDS (default 45s).
+func checkpointTimeout() time.Duration {
+	if v := os.Getenv("MICROFLOW_CHECKPOINT_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 && n <= 600 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 45 * time.Second
 }
