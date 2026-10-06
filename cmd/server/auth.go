@@ -14,8 +14,9 @@
 // that is almost certainly a typo, and must not silently expose the app).
 //
 // How it works:
-//   - Every request except /login, /logout, /healthz and /webhook/* needs a
-//     valid signed session cookie. /webhook/* keeps its own token check
+//   - Every request except /login, /logout, /healthz, /privacy, /terms and
+//     /webhook/* needs a valid signed session cookie. ("/" shows a public
+//     homepage to signed-out visitors -- see public_pages.go.) /webhook/* keeps its own token check
 //     (MICROFLOW_WEBHOOK_TOKEN) because external services call it.
 //   - Unauthenticated /api/* calls get 401 JSON; browser pages redirect to /login.
 //   - The session is a stateless HMAC-signed cookie (no DB table needed). The
@@ -98,6 +99,11 @@ func newAuthGateFromEnv() (*authGate, error) {
 func (g *authGate) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		// Public pages for Google OAuth verification: "/" (signed-out
+		// visitors only), "/privacy", "/terms". See public_pages.go.
+		if g.servePublicPage(w, r) {
+			return
+		}
 		if !g.enabled {
 			// Login disabled (no credentials configured): no login page.
 			switch {
