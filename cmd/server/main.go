@@ -579,7 +579,7 @@ func main() {
 	mux.Handle("/webhook/", whServer.Handler())
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: gate.Wrap(mux), ReadTimeout: 30 * time.Second, WriteTimeout: 35 * time.Minute}
+	srv := &http.Server{Addr: addr, Handler: gate.Wrap(mux), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 15 * time.Minute, WriteTimeout: 35 * time.Minute}
 
 	go func() {
 		log.Printf("MicroFlow listening on %s", addr)
