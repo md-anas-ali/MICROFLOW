@@ -496,10 +496,15 @@ runLoop:
 				result.Output = rc.Redactor.RedactOutput(errOut)
 				rc.appendNodeRun(result)
 				enqueueFromBranch(&queue, rc.Workflow, node.Name, branchIdx, []model.Item{errItem})
-				if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
-					runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
-					rc.Execution.Status = model.StatusError
-					break runLoop
+				// The next iteration's pre-node checkpoint already persists this
+				// exact state (queue + outputs + last completed), so a second
+				// synchronous DB write here only doubles per-node latency.
+				if len(queue) == 0 {
+					if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
+						runErr = fmt.Errorf("engine: checkpoint after node %q: %w", node.Name, err)
+						rc.Execution.Status = model.StatusError
+						break runLoop
+					}
 				}
 				continue
 			}
@@ -526,6 +531,11 @@ runLoop:
 				NodeName: conn.TargetName,
 				Input:    model.NodeOutput{branchItems},
 			})
+		}
+		// Skip when more work is queued: the next node's pre-start checkpoint
+		// persists the same state immediately (halves DB round-trips/node).
+		if len(queue) > 0 {
+			continue
 		}
 		if err := checkpoint(model.StatusRunning, queue, node.Name, nil); err != nil {
 			// The node already succeeded. A transient DB timeout must not
