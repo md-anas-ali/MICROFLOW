@@ -53,6 +53,18 @@ func (s *Server) WithDatabaseBackup(st DatabaseBackupStore, reload func(ctx cont
 	return s
 }
 
+// importTimeout bounds the replace transaction. A large backup on a remote
+// (e.g. Neon) Postgres, or a big executions table cascading on DELETE, can
+// legitimately exceed the old fixed 2 minutes ("context deadline exceeded").
+func importTimeout() time.Duration {
+	if v := os.Getenv("MICROFLOW_DB_IMPORT_TIMEOUT_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return 15 * time.Minute
+}
+
 func importMaxBytes() int64 {
 	mb := int64(128)
 	if v := os.Getenv("MICROFLOW_DB_IMPORT_MAX_MB"); v != "" {
@@ -144,7 +156,7 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 	defer envWriteMu.Unlock()
 
 	// 2-4. STAGE -> REPLACE -> VERIFY -> COMMIT, atomically.
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), importTimeout())
 	defer cancel()
 	summary, err := s.dbBackup.ImportBackup(ctx, parsed)
 	if err != nil {
