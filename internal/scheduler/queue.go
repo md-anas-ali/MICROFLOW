@@ -7,7 +7,7 @@ package scheduler
 // here. A single worker goroutine takes jobs in FIFO order and runs exactly
 // one at a time (max concurrency 1):
 //
-//	submit -> queue -> [cooldown gap] -> run -> cleanup hook -> next job
+//	submit -> queue -> [cooldown gap] -> [pre-start check] -> run -> cleanup hook -> next job
 //
 // A job is identified by a key (the workflow ID; each Service has one
 // workflow). A key that is queued, reserved or running is refused with
@@ -48,6 +48,7 @@ type gq struct {
 
 	cooldown   time.Duration
 	cleanup    func(ctx context.Context)
+	hooks      Hooks
 	lastFinish time.Time // when the last job that really ran (and its cleanup) ended
 }
 
@@ -75,6 +76,27 @@ func (s *Scheduler) SetCooldown(d time.Duration) {
 	}
 	s.qmu.Lock()
 	s.cooldown = d
+	s.qmu.Unlock()
+}
+
+// Hooks are optional observers/guards around the cooldown. All fields may be nil.
+// They are advisory: a panic or slow hook never stops the queue (each call is
+// recovered, and PreStart is time-boxed).
+type Hooks struct {
+	// CooldownStart/CooldownEnd bracket a cooldown wait that really happens
+	// (not called when there is nothing left to wait). interrupted is true when
+	// shutdown ended the wait early.
+	CooldownStart func(d time.Duration)
+	CooldownEnd   func(interrupted bool)
+	// PreStart runs after the cooldown and right before the job starts
+	// (pre-service health check). It cannot veto the job.
+	PreStart func(ctx context.Context)
+}
+
+// SetHooks registers the optional Hooks (see type doc).
+func (s *Scheduler) SetHooks(h Hooks) {
+	s.qmu.Lock()
+	s.hooks = h
 	s.qmu.Unlock()
 }
 
@@ -232,6 +254,7 @@ func (s *Scheduler) worker() {
 	for {
 		j := s.next()
 		s.settle()
+		s.preStart()
 		ran := s.execute(j)
 
 		s.qmu.Lock()
@@ -253,16 +276,61 @@ func (s *Scheduler) settle() {
 	s.qmu.Lock()
 	wait := s.cooldown - time.Since(s.lastFinish)
 	ctx := s.baseCtx
+	h := s.hooks
 	s.qmu.Unlock()
 	if wait <= 0 {
 		return
 	}
+	safeHook(func() {
+		if h.CooldownStart != nil {
+			h.CooldownStart(wait)
+		}
+	})
 	t := time.NewTimer(wait)
 	defer t.Stop()
+	interrupted := false
 	select {
 	case <-t.C:
 	case <-ctx.Done():
+		interrupted = true
 	}
+	safeHook(func() {
+		if h.CooldownEnd != nil {
+			h.CooldownEnd(interrupted)
+		}
+	})
+}
+
+// preStart runs the optional PreStart hook (pre-service health check), bounded
+// by cleanupTimeout and isolated from panics: it can never stop or veto a job.
+func (s *Scheduler) preStart() {
+	s.qmu.Lock()
+	fn := s.hooks.PreStart
+	s.qmu.Unlock()
+	if fn == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		safeHook(func() { fn(ctx) })
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Printf("scheduler: pre-start hook did not finish within %s; starting the job anyway", cleanupTimeout)
+	}
+}
+
+func safeHook(f func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("scheduler: hook panicked: %v (ignored)", r)
+		}
+	}()
+	f()
 }
 
 // execute runs one job, converting a panic into "it ran and failed" so the
