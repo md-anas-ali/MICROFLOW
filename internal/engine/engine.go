@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"microflow/internal/autoopt"
 	"microflow/internal/expr"
 	"microflow/internal/model"
 )
@@ -56,6 +57,11 @@ type RunContext struct {
 	StaticData  StaticDataStore
 	Credentials CredentialResolver
 	ScratchDir  string // per-execution temp dir; engine removes it on completion (rule 7: cleanup)
+
+	// Owned is this execution's Auto Optimize ownership record (child
+	// processes, HTTP bodies, ... it started). Optional: nil is a safe no-op
+	// everywhere, so callers/tests that never set it behave exactly as before.
+	Owned *autoopt.ServiceContext
 
 	// ServiceEnv/GlobalEnv back Env(key) below: this Service's own
 	// Environment overrides and the deployment-wide Global Environment,
