@@ -473,8 +473,13 @@ func main() {
 	// take up to MICROFLOW_EXECUTION_TIMEOUT_MINUTES is in flight --
 	// past that, 429 and let the trigger's own retry/schedule handle it
 	// rather than accumulating queued memory.
+	// Service-level concurrency is always 1: a larger
+	// MICROFLOW_MAX_CONCURRENT_EXECUTIONS is ignored (NewManager enforces it too).
+	if n := envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1); n > 1 {
+		log.Printf("MICROFLOW_MAX_CONCURRENT_EXECUTIONS=%d ignored: only one Service/workflow may run at a time", n)
+	}
 	execManager := runner.NewManager(run,
-		envInt("MICROFLOW_MAX_CONCURRENT_EXECUTIONS", 1),
+		1,
 		envInt("MICROFLOW_MAX_QUEUED_EXECUTIONS", 2),
 	).WithDispatcher(sch)
 	execManager.StartRecoveryLoop(ctx)
