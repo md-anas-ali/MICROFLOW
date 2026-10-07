@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"microflow/internal/autoopt"
 	"microflow/internal/engine"
 	"microflow/internal/model"
 )
@@ -67,6 +68,12 @@ type Runner struct {
 	MemGuard *engine.MemGuard
 	// Recovery is the durable PostgreSQL-backed checkpoint store. Optional for tests.
 	Recovery CheckpointStore
+
+	// AutoOpt, if set, gives every execution an ownership record
+	// (autoopt.ServiceContext) that is released in runOnce's deferred
+	// teardown no matter how the run ends. Optional; nil = pre-Auto-Optimize
+	// behaviour exactly.
+	AutoOpt *autoopt.Optimizer
 
 	// Env resolves each run's Global/Service Environment (rule 2),
 	// looked up once per run by the workflow's owning ServiceID and
@@ -251,6 +258,13 @@ func (r *Runner) WithRecovery(s CheckpointStore) *Runner {
 	return r
 }
 
+// WithAutoOptimize attaches the Auto Optimize layer (see internal/autoopt).
+// Optional -- a Runner without it behaves exactly as before.
+func (r *Runner) WithAutoOptimize(o *autoopt.Optimizer) *Runner {
+	r.AutoOpt = o
+	return r
+}
+
 func (r *Runner) WithNodeRunCap(n int) *Runner {
 	r.NodeRunCap = n
 	return r
@@ -338,6 +352,13 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 	r.markExecutionLive(execID)
 	defer r.unmarkExecutionLive(execID)
 
+	// Auto Optimize: this execution's ownership record. The deferred Release is
+	// the reliable "finally" -- it runs on success, error, timeout, cancel and
+	// panic alike, and only ever touches resources registered by THIS execution.
+	// Both calls are no-ops when Auto Optimize is off (nil receiver).
+	owned := r.AutoOpt.Begin(execID, wf.ID)
+	defer owned.Release()
+
 	scratchDir := filepath.Join(r.ScratchRoot, execID)
 	// Bug fix: this per-execution directory was never actually created --
 	// it was only ever used as exec.Cmd.Dir for executeCommand nodes
@@ -366,6 +387,7 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 		StaticData:  r.StaticData,
 		Credentials: r.Credentials,
 		ScratchDir:  scratchDir,
+		Owned:       owned,
 		MemGuard:    r.MemGuard,
 		// Seeded fresh per run from the current process environment (not
 		// cached on Runner) so a rotated secret takes effect immediately

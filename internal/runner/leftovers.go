@@ -28,6 +28,14 @@ func (r *Runner) anyLive() bool {
 	return len(r.liveExecs) > 0
 }
 
+// LiveExecutionCount is how many executions are running right now in this
+// process (used by Auto Optimize's pre-service health check).
+func (r *Runner) LiveExecutionCount() int {
+	r.liveExecMu.Lock()
+	defer r.liveExecMu.Unlock()
+	return len(r.liveExecs)
+}
+
 // InitTempBaseline must be called once at startup, before any run starts. It
 // removes scratch directories orphaned by a previous process and records which
 // entries already live under the OS temp dir (those are never deleted).
