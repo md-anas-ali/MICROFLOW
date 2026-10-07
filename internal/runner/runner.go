@@ -206,10 +206,12 @@ func (r *Runner) IsWorkflowActive(workflowID string) bool {
 // a Manager on top of the same Runner; NewManager will reuse this
 // semaphore instead of making its own if one is already set.
 func (r *Runner) WithConcurrencyLimit(maxConcurrent int) *Runner {
-	if maxConcurrent < 1 {
-		maxConcurrent = 1
-	}
-	r.sem = make(chan struct{}, maxConcurrent)
+	// Service-level concurrency is hard-capped at 1: no setting (including
+	// MICROFLOW_MAX_CONCURRENT_EXECUTIONS) may let two Services/workflows
+	// run at the same time. maxConcurrent is accepted only for API
+	// compatibility.
+	_ = maxConcurrent
+	r.sem = make(chan struct{}, 1)
 	return r
 }
 

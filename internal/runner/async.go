@@ -265,9 +265,8 @@ func (m *Manager) WithDispatcher(s *scheduler.Scheduler) *Manager {
 // fix), NewManager sets it up using maxConcurrent so behavior is
 // unchanged for anyone who only uses the async path.
 func NewManager(r *Runner, maxConcurrent, maxQueued int) *Manager {
-	if maxConcurrent < 1 {
-		maxConcurrent = 1
-	}
+	// Service-level concurrency is always exactly 1 (see WithConcurrencyLimit).
+	maxConcurrent = 1
 	if maxQueued < maxConcurrent {
 		maxQueued = maxConcurrent
 	}
