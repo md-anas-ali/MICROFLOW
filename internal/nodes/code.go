@@ -421,6 +421,7 @@ func (e CodeExecutor) newHTTPRequestHelper(ctx context.Context, rc *engine.RunCo
 			}
 			fail("request failed: %v", err)
 		}
+		resp.Body = rc.Owned.WrapBody(resp.Body) // Auto Optimize tracking; nil-safe, no behaviour change
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			fail("HTTP %d", resp.StatusCode)

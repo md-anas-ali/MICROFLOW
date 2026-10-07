@@ -168,7 +168,9 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 
-		runErr := cmd.Run()
+		// Same as cmd.Run(), but the child is registered with this execution's
+		// Auto Optimize context (nil-safe), so leftovers can be cleaned up.
+		runErr := rc.Owned.Run(cmd)
 		cancel()
 		<-rc.HeavyWorkGate
 

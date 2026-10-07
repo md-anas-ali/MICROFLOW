@@ -260,6 +260,9 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 		if err != nil {
 			return nil, fmt.Errorf("http request %q: %w", node.Name, err)
 		}
+		// Auto Optimize: track the body so an unclosed one can be closed at the
+		// end of the Service. Reads/Close behave exactly as before (nil-safe).
+		resp.Body = rc.Owned.WrapBody(resp.Body)
 
 		// Opt-in error classification: a node only fails the run over its
 		// HTTP status code if it has explicitly asked to (RetryOnFail
