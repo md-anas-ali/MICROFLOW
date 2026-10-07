@@ -1,5 +1,16 @@
 # Changes
 
+## Auto Optimize & resource cleanup layer
+
+- New `internal/autoopt` package: per-execution ownership (`ServiceContext`),
+  deterministic time-boxed cleanup phases, verification, `[AutoOptimize]` logs.
+- Child processes started by `executeCommand` are tracked; on unix they run in
+  their own process group so timeouts/orphans are cleaned (TERM -> KILL).
+- HTTP response bodies are tracked (behaviour unchanged); unclosed ones are closed.
+- Scheduler queue: optional cooldown/pre-start hooks; default cooldown 60 s when
+  Auto Optimize is on (`SERVICE_COOLDOWN_SECONDS` still overrides).
+- `MICROFLOW_AUTO_OPTIMIZE=0` restores the previous behaviour. See `AUTO_OPTIMIZE.md`.
+
 ## Edge TTS fix — 2026-09-08
 
 - Upgraded `edge-tts` from 4.0.11 to 7.2.8.
