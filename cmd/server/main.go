@@ -33,6 +33,7 @@ import (
 	// on a host that happens to lack /usr/share/zoneinfo.
 
 	"microflow/internal/api"
+	"microflow/internal/autoopt"
 	"microflow/internal/engine"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
@@ -329,7 +330,15 @@ func main() {
 	// (see internal/runner.RunFromNode / Manager.runJob) -- time spent
 	// queued behind another run under MICROFLOW_MAX_CONCURRENT_EXECUTIONS
 	// no longer counts against it.
+	// Auto Optimize (internal/autoopt): additive per-Service resource cleanup +
+	// stabilisation layer. MICROFLOW_AUTO_OPTIMIZE=0 switches it off and restores
+	// the previous behaviour exactly.
+	aoCfg := autoopt.ConfigFromEnv()
+	aoCfg.TempRoots = []string{scratchRoot, os.TempDir()}
+	autoOpt := autoopt.New(aoCfg)
+
 	run := runner.New(st, st, eng, st, creds, scratchRoot).
+		WithAutoOptimize(autoOpt).
 		WithRecovery(st).
 		WithMemGuard(memGuard).
 		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12)).
@@ -363,18 +372,89 @@ func main() {
 	sch.SetLocation(schedulerLocation())
 	// Settling gap after every finished workflow, before the next queued
 	// Service starts. SERVICE_COOLDOWN_SECONDS=0 disables it.
-	serviceCooldown := time.Duration(envInt("SERVICE_COOLDOWN_SECONDS", 10)) * time.Second
+	// Default is 10s as before; with Auto Optimize on it is the 60-second
+	// stabilisation window. An explicit SERVICE_COOLDOWN_SECONDS always wins.
+	defaultCooldown := 10
+	if autoOpt.Enabled() {
+		defaultCooldown = 60
+	}
+	serviceCooldown := time.Duration(envInt("SERVICE_COOLDOWN_SECONDS", defaultCooldown)) * time.Second
 	sch.SetCooldown(serviceCooldown)
-	// Runs after EVERY workflow (success, error, cancelled or panic) and before
-	// the cooldown: wait for finished runs' scratch directories to be removed,
-	// drop idle keep-alive connections, and hand freed heap back to the OS.
-	sch.SetCleanup(func(ctx context.Context) {
+
+	// The existing between-run cleanup actions, defined ONCE and reused by both
+	// the legacy hook (Auto Optimize off) and the Auto Optimize steps below.
+	cleanScratch := func(ctx context.Context) error {
 		run.WaitScratchCleanup(ctx)
 		run.CleanupLeftovers()
-		nodeHTTPClient.CloseIdleConnections()
+		return nil
+	}
+	closeIdleHTTP := func(ctx context.Context) error {
+		nodeHTTPClient.CloseIdleConnections() // idle keep-alive only; active requests are untouched
 		http.DefaultClient.CloseIdleConnections()
+		return nil
+	}
+	freeMemory := func(ctx context.Context) error {
 		debug.FreeOSMemory()
-	})
+		return nil
+	}
+
+	if autoOpt.Enabled() {
+		// Runs after EVERY workflow (success, error, cancelled or panic), before
+		// the cooldown. Per-execution resources were already released by the
+		// runner's deferred teardown; this runs the global steps in phase order,
+		// then verifies. Each step is time-boxed and failures only log warnings.
+		autoOpt.AddStepWithTimeout(autoopt.PhaseReleaseHTTP, "idle-http-connections", 0, closeIdleHTTP)
+		autoOpt.AddStepWithTimeout(autoopt.PhaseTempResources, "scratch-and-leftovers", 25*time.Second, cleanScratch)
+		autoOpt.AddStepWithTimeout(autoopt.PhaseRuntimeCleanup, "free-os-memory", 0, freeMemory)
+		autoOpt.AddVerifier("scratch-dir-clean", func() error {
+			entries, err := os.ReadDir(scratchRoot)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if run.LiveExecutionCount() == 0 && len(entries) > 0 {
+				return fmt.Errorf("%d leftover scratch entr(y/ies) remain", len(entries))
+			}
+			return nil
+		})
+		autoOpt.AddVerifier("no-live-executions", func() error {
+			if n := run.LiveExecutionCount(); n > 0 {
+				return fmt.Errorf("%d execution(s) still marked live after the Service ended", n)
+			}
+			return nil
+		})
+		autoOpt.AddHealthCheck("no-live-executions", func() error {
+			if n := run.LiveExecutionCount(); n > 0 {
+				return fmt.Errorf("%d execution(s) still marked live before the next Service", n)
+			}
+			return nil
+		})
+		sch.SetCleanup(autoOpt.PostService)
+		sch.SetHooks(scheduler.Hooks{
+			CooldownStart: func(remaining time.Duration) {
+				autoOpt.Logf("Starting %d-second cooldown (%ds remaining)", int(serviceCooldown.Seconds()), int(remaining.Round(time.Second).Seconds()))
+			},
+			CooldownEnd: func(interrupted bool) {
+				if interrupted {
+					autoOpt.Logf("Cooldown interrupted by shutdown")
+					return
+				}
+				autoOpt.Logf("Cooldown completed")
+			},
+			PreStart: autoOpt.PreServiceCheck,
+		})
+		log.Printf("[AutoOptimize] enabled: per-Service resource cleanup + %s stabilisation window (best-effort; no RAM/CPU reset is guaranteed)", serviceCooldown)
+	} else {
+		// Previous behaviour, unchanged: runs after EVERY workflow (success,
+		// error, cancelled or panic) and before the cooldown.
+		sch.SetCleanup(func(ctx context.Context) {
+			_ = cleanScratch(ctx)
+			_ = closeIdleHTTP(ctx)
+			_ = freeMemory(ctx)
+		})
+	}
 	log.Printf("global scheduler: sequential queue, max concurrency 1, service cooldown %s", serviceCooldown)
 
 	// Async execution (spec sections M/N): bounded worker pool on top
