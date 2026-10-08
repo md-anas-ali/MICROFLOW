@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"log"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,10 @@ import (
 type MemGuard struct {
 	softCeilingBytes uint64
 	throttled        atomic.Bool
+	// giveUpUntil (unix nanoseconds) is set when a full maxWait did not bring
+	// the heap back under the ceiling. Until then WaitIfThrottled returns
+	// immediately instead of making every following node wait again.
+	giveUpUntil atomic.Int64
 }
 
 func NewMemGuard(softCeilingBytes uint64) *MemGuard {
@@ -71,6 +76,15 @@ func (g *MemGuard) WaitIfThrottled(ctx context.Context) {
 		step    = 250 * time.Millisecond
 		maxWait = 5 * time.Second
 	)
+	// A previous full wait already showed that the heap is not coming down
+	// (the live heap itself is above the ceiling, not just transient
+	// garbage). Waiting again cannot help, and a workflow that runs hundreds
+	// of Code/HTTP/Command nodes would otherwise pay up to maxWait for every
+	// single one of them -- minutes become hours. Skip the wait until the
+	// back-off window ends, then probe again.
+	if time.Now().UnixNano() < g.giveUpUntil.Load() {
+		return
+	}
 	deadline := time.Now().Add(maxWait)
 	for g.ShouldThrottle() && time.Now().Before(deadline) {
 		select {
@@ -79,4 +93,17 @@ func (g *MemGuard) WaitIfThrottled(ctx context.Context) {
 		case <-time.After(step):
 		}
 	}
+	if g.ShouldThrottle() {
+		g.giveUpUntil.Store(time.Now().Add(giveUpBackoff).UnixNano())
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		log.Printf("[MemGuard] heap %d MB is still over the %d MB ceiling after waiting %s; "+
+			"continuing without further waits for %s (the live heap is above the ceiling -- "+
+			"raise MICROFLOW_HEAP_CEILING_MB if this repeats)",
+			m.HeapAlloc>>20, g.softCeilingBytes>>20, maxWait, giveUpBackoff)
+	}
 }
+
+// giveUpBackoff is how long WaitIfThrottled stops waiting after a full wait
+// failed to bring the heap under the ceiling.
+const giveUpBackoff = 30 * time.Second
