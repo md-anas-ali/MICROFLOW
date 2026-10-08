@@ -26,6 +26,7 @@ import (
 
 	"microflow/internal/model"
 	"microflow/internal/runner"
+	"microflow/internal/scheduler"
 	"microflow/internal/store"
 	"microflow/internal/tenant"
 )
@@ -310,6 +311,17 @@ outer:
 				step.ExecutionID = ex.ID
 			}
 			switch {
+			case runErr != nil && (errors.Is(runErr, scheduler.ErrDuplicate) || errors.Is(runErr, runner.ErrAlreadyQueued)):
+				// The workflow is already queued or running -- typically
+				// resumed by crash recovery after a restart, or started by
+				// a manual Run/webhook. That run is already doing this
+				// Service's work, and starting it again would only create a
+				// duplicate execution. This is not a failure of the Service,
+				// so record it as skipped instead of marking the whole
+				// sweep as "error". The scheduler's single FIFO queue still
+				// keeps the next Service waiting behind the run in flight.
+				step.Status = "skipped"
+				step.Error = "already queued or running (e.g. resumed after a restart) -- not started again to avoid a duplicate run"
 			case runErr != nil:
 				step.Status, step.Error = "error", runErr.Error()
 			case ex != nil && ex.Status == model.StatusError:
