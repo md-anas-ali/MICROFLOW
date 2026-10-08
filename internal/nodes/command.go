@@ -197,6 +197,16 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 		if runErr != nil && cctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("executeCommand %q: timed out after %s", node.Name, timeout)
 		}
+		// The execution itself was cancelled (Cancel / Run-All cancel /
+		// shutdown) and that is what killed the child: exec's kill leaves
+		// exitCode -1 with a non-nil runErr, which previously fell through
+		// to the success path below. If this was the last node, the engine
+		// never saw an error or a pending-queue check, so a cancelled run
+		// was recorded as "success". Report it as an error so the engine's
+		// existing ctx.Err() check marks the run cancelled.
+		if runErr != nil && ctx.Err() != nil {
+			return nil, fmt.Errorf("executeCommand %q: cancelled: %w", node.Name, ctx.Err())
+		}
 		if runErr != nil && exitCode == 0 {
 			return nil, fmt.Errorf("executeCommand %q: %w", node.Name, runErr)
 		}
