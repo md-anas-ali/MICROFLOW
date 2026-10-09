@@ -393,8 +393,39 @@ func main() {
 		http.DefaultClient.CloseIdleConnections()
 		return nil
 	}
+	// freshStart is the "start every Service from a clean slate" reset. It runs
+	// BEFORE each Service starts and again AFTER it ends (see below). It drops
+	// everything MacroFlow itself remembers between Services: cached API
+	// responses, idle network connections, Go heap garbage (returned to the OS)
+	// and MemGuard's throttle/back-off state. Nothing in the database
+	// (Services, Workflows, Environment, Credentials, static data, schedules)
+	// is touched, and it does nothing while any execution is live.
+	// MICROFLOW_FRESH_START=0 turns it off (only the plain memory release stays).
+	freshStart := func(when string) {
+		if os.Getenv("MICROFLOW_FRESH_START") == "0" {
+			debug.FreeOSMemory()
+			return
+		}
+		if n := run.LiveExecutionCount(); n > 0 {
+			log.Printf("[FreshStart] skipped (%s): %d execution(s) still live", when, n)
+			return
+		}
+		began := time.Now()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if ex, ok := registry[model.TypeHTTPRequest].(*nodes.HTTPRequestExecutor); ok {
+			ex.ResetCaches()
+		}
+		nodeHTTPClient.CloseIdleConnections()
+		http.DefaultClient.CloseIdleConnections()
+		debug.FreeOSMemory() // forces a full GC, then hands freed memory back to the OS
+		memGuard.Reset()
+		runtime.ReadMemStats(&after)
+		log.Printf("[FreshStart] %s: caches cleared, connections reset, heap %d MB -> %d MB (%s)",
+			when, before.HeapAlloc>>20, after.HeapAlloc>>20, time.Since(began).Round(time.Millisecond))
+	}
 	freeMemory := func(ctx context.Context) error {
-		debug.FreeOSMemory()
+		freshStart("after-service")
 		return nil
 	}
 
@@ -443,7 +474,10 @@ func main() {
 				}
 				autoOpt.Logf("Cooldown completed")
 			},
-			PreStart: autoOpt.PreServiceCheck,
+			PreStart: func(ctx context.Context) {
+				freshStart("before-service")
+				autoOpt.PreServiceCheck(ctx)
+			},
 		})
 		log.Printf("[AutoOptimize] enabled: per-Service resource cleanup + %s stabilisation window (best-effort; no RAM/CPU reset is guaranteed)", serviceCooldown)
 	} else {
@@ -454,6 +488,7 @@ func main() {
 			_ = closeIdleHTTP(ctx)
 			_ = freeMemory(ctx)
 		})
+		sch.SetHooks(scheduler.Hooks{PreStart: func(ctx context.Context) { freshStart("before-service") }})
 	}
 	log.Printf("global scheduler: sequential queue, max concurrency 1, service cooldown %s", serviceCooldown)
 
