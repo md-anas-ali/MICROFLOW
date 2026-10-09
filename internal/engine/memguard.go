@@ -47,6 +47,21 @@ func (g *MemGuard) Start(stop <-chan struct{}) {
 	}
 }
 
+// Reset forgets everything the guard learned during the previous Service: the
+// "give up waiting" back-off window is cleared and the throttle flag is
+// re-evaluated against the heap as it is NOW (call it right after a GC), so the
+// next Service never starts throttled or skipping waits because of the last
+// one's memory peak. Safe on a nil *MemGuard.
+func (g *MemGuard) Reset() {
+	if g == nil {
+		return
+	}
+	g.giveUpUntil.Store(0)
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	g.throttled.Store(m.HeapAlloc >= g.softCeilingBytes)
+}
+
 // ShouldThrottle reports whether heap usage was over the soft ceiling as
 // of the last poll. Safe to call on a nil *MemGuard (returns false) so
 // callers that don't wire a guard (tests, alternate entrypoints) don't
