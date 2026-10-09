@@ -115,6 +115,26 @@ func (c *getResponseCache) get(url string) (map[string]any, bool) {
 	return e.value, true
 }
 
+// clear drops every cached entry so the next Service re-fetches fresh data.
+func (c *getResponseCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.entries = make(map[string]cachedResponse, maxCachedGETEntries)
+	c.mu.Unlock()
+}
+
+// ResetCaches discards everything this executor remembered from earlier runs
+// (the OpenRouter model-list cache), so a new Service starts with no data
+// carried over from the previous one. Safe on a nil receiver.
+func (e *HTTPRequestExecutor) ResetCaches() {
+	if e == nil {
+		return
+	}
+	e.modelListCache.clear()
+}
+
 func (c *getResponseCache) set(url string, value map[string]any) {
 	if c == nil {
 		return
