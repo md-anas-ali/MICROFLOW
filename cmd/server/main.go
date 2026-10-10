@@ -290,6 +290,16 @@ func main() {
 	// operator explicitly opts back into 2+ via
 	// MICROFLOW_MAX_CONCURRENT_HEAVY.
 	eng.MaxConcurrentHeavy = envInt("MICROFLOW_MAX_CONCURRENT_HEAVY", 1)
+	// Step limit PER EXECUTION (each Service run counts from 0). Raised from
+	// 5000: a long workflow that loops over many scenes with Wait nodes can
+	// legitimately need more. MICROFLOW_MAX_STEPS overrides.
+	eng.MaxSteps = envInt("MICROFLOW_MAX_STEPS", 15000)
+	// Optional loop detection, OFF by default (0): a node that receives the
+	// identical input more than this many times aborts the run, naming the
+	// node. Progress in this engine can live in workflow static data rather
+	// than in a node's input (see SplitInBatches), so enable it only with a
+	// value well above the longest legitimate loop -- see loopGuard.
+	eng.LoopRepeatLimit = envInt("MICROFLOW_LOOP_REPEAT_LIMIT", 0)
 
 	// RAM guard: soft ceiling well under the total container budget,
 	// leaving room for the Go runtime/OS/FFmpeg+python3+edge-tts child
@@ -343,7 +353,7 @@ func main() {
 		WithMemGuard(memGuard).
 		WithNodeRunCap(envInt("MICROFLOW_NODE_RUN_CAP", 12)).
 		WithEnv(envVault).
-		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 180)) * time.Minute)
+		WithTimeout(time.Duration(envInt("MICROFLOW_EXECUTION_TIMEOUT_MINUTES", 300)) * time.Minute)
 
 	// Startup: drop scratch dirs orphaned by a previous process and remember
 	// what already lives in the OS temp dir (never deleted later).
@@ -380,6 +390,14 @@ func main() {
 	}
 	serviceCooldown := time.Duration(envInt("SERVICE_COOLDOWN_SECONDS", defaultCooldown)) * time.Second
 	sch.SetCooldown(serviceCooldown)
+	// With Auto Optimize on and no explicit SERVICE_COOLDOWN_SECONDS, every
+	// Service gap is a random 60-120 s (1-2 minutes), chosen separately for
+	// each Service. SERVICE_COOLDOWN_MAX_SECONDS overrides the upper bound.
+	cooldownMaxDefault := int(serviceCooldown.Seconds())
+	if _, explicit := os.LookupEnv("SERVICE_COOLDOWN_SECONDS"); !explicit && autoOpt.Enabled() {
+		cooldownMaxDefault = 120
+	}
+	sch.SetCooldownRange(serviceCooldown, time.Duration(envInt("SERVICE_COOLDOWN_MAX_SECONDS", cooldownMaxDefault))*time.Second)
 
 	// The existing between-run cleanup actions, defined ONCE and reused by both
 	// the legacy hook (Auto Optimize off) and the Auto Optimize steps below.
@@ -465,7 +483,7 @@ func main() {
 		sch.SetCleanup(autoOpt.PostService)
 		sch.SetHooks(scheduler.Hooks{
 			CooldownStart: func(remaining time.Duration) {
-				autoOpt.Logf("Starting %d-second cooldown (%ds remaining)", int(serviceCooldown.Seconds()), int(remaining.Round(time.Second).Seconds()))
+				autoOpt.Logf("Starting cooldown (%ds for this Service gap)", int(remaining.Round(time.Second).Seconds()))
 			},
 			CooldownEnd: func(interrupted bool) {
 				if interrupted {
