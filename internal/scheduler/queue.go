@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -46,10 +47,11 @@ type gq struct {
 	workerOnce sync.Once
 	baseCtx    context.Context // set by Start; Background until then
 
-	cooldown   time.Duration
-	cleanup    func(ctx context.Context)
-	hooks      Hooks
-	lastFinish time.Time // when the last job that really ran (and its cleanup) ended
+	cooldown    time.Duration
+	cooldownMax time.Duration // >cooldown: each gap is a random length in [cooldown, cooldownMax]
+	cleanup     func(ctx context.Context)
+	hooks       Hooks
+	lastFinish  time.Time // when the last job that really ran (and its cleanup) ended
 }
 
 func newGQ() *gq {
@@ -76,6 +78,22 @@ func (s *Scheduler) SetCooldown(d time.Duration) {
 	}
 	s.qmu.Lock()
 	s.cooldown = d
+	s.qmu.Unlock()
+}
+
+// SetCooldownRange makes every gap between two Services a random length
+// between min and max (e.g. 1-2 minutes), chosen separately for each Service.
+// max <= min means a fixed gap of min.
+func (s *Scheduler) SetCooldownRange(min, max time.Duration) {
+	if min < 0 {
+		min = 0
+	}
+	if max < min {
+		max = min
+	}
+	s.qmu.Lock()
+	s.cooldown = min
+	s.cooldownMax = max
 	s.qmu.Unlock()
 }
 
@@ -274,7 +292,11 @@ func (s *Scheduler) worker() {
 // Interrupted by shutdown so a stopping server is not held up.
 func (s *Scheduler) settle() {
 	s.qmu.Lock()
-	wait := s.cooldown - time.Since(s.lastFinish)
+	target := s.cooldown
+	if s.cooldownMax > s.cooldown {
+		target += time.Duration(rand.Int63n(int64(s.cooldownMax-s.cooldown) + 1))
+	}
+	wait := target - time.Since(s.lastFinish)
 	ctx := s.baseCtx
 	h := s.hooks
 	s.qmu.Unlock()
