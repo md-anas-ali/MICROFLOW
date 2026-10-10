@@ -64,7 +64,7 @@ func (r *Runner) CleanupLeftovers() {
 	if r.anyLive() {
 		return
 	}
-	removed := 0
+	removed, failed := 0, 0
 
 	// 1. Orphaned scratch directories (no live execution owns any of them).
 	if r.ScratchRoot != "" {
@@ -72,6 +72,9 @@ func (r *Runner) CleanupLeftovers() {
 			for _, e := range entries {
 				if err := os.RemoveAll(filepath.Join(r.ScratchRoot, e.Name())); err == nil {
 					removed++
+				} else {
+					failed++
+					log.Printf("runner: cleanup WARNING: could not remove scratch entry %q: %v", e.Name(), err)
 				}
 			}
 		}
@@ -79,6 +82,9 @@ func (r *Runner) CleanupLeftovers() {
 
 	// 2. New entries directly under the OS temp dir.
 	if os.Getenv("MICROFLOW_CLEAN_TMP") == "0" {
+		if failed > 0 {
+			log.Printf("runner: between-run cleanup removed %d scratch item(s), %d failed", removed, failed)
+		}
 		return
 	}
 	r.tmpMu.Lock()
@@ -104,9 +110,12 @@ func (r *Runner) CleanupLeftovers() {
 		}
 		if err := os.RemoveAll(path); err == nil {
 			removed++
+		} else {
+			failed++
+			log.Printf("runner: cleanup WARNING: could not remove temp entry %q: %v", e.Name(), err)
 		}
 	}
-	if removed > 0 {
-		log.Printf("runner: between-run cleanup removed %d leftover temp item(s)", removed)
+	if removed > 0 || failed > 0 {
+		log.Printf("runner: between-run cleanup removed %d leftover temp item(s), %d failed", removed, failed)
 	}
 }

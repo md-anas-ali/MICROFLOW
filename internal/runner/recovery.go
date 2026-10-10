@@ -84,7 +84,7 @@ func validateCheckpoint(cp *model.ExecutionCheckpoint, wf *model.Workflow, scrat
 	if err != nil || !strings.EqualFold(h, cp.WorkflowHash) {
 		return fmt.Errorf("%w: workflow definition changed", ErrInvalidCheckpoint)
 	}
-	if cp.State.Steps < 0 || cp.State.Steps > 5000 || len(cp.State.Pending) > 4096 || len(cp.State.NodeAttempts) > 2048 || len(cp.State.NodeOutputs) > 2048 {
+	if cp.State.Steps < 0 || cp.State.Steps > 1000000 || len(cp.State.Pending) > 4096 || len(cp.State.NodeAttempts) > 2048 || len(cp.State.NodeOutputs) > 2048 {
 		return fmt.Errorf("%w: bounded state limits exceeded", ErrInvalidCheckpoint)
 	}
 	if cp.State.Status != model.StatusQueued && cp.State.Status != model.StatusRunning && cp.State.Status != model.StatusWaiting && cp.State.Status != model.StatusSuccess && cp.State.Status != model.StatusError && cp.State.Status != model.StatusCancelled {
