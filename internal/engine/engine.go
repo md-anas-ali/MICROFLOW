@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -302,6 +303,10 @@ type Engine struct {
 	// MaxConcurrentHeavy bounds simultaneous executeCommand/httpRequest
 	// work (FFmpeg, TTS, AI calls) for the 512MB RAM budget.
 	MaxConcurrentHeavy int
+	// LoopRepeatLimit aborts a run when one node receives the exact same
+	// input more than this many times (a stuck cycle, see loopGuard).
+	// 0 disables the check; MaxSteps stays as the backstop either way.
+	LoopRepeatLimit int
 }
 
 func New(registry map[model.NodeType]NodeExecutor) *Engine {
@@ -309,6 +314,7 @@ func New(registry map[model.NodeType]NodeExecutor) *Engine {
 		Registry:           registry,
 		MaxSteps:           5000,
 		MaxConcurrentHeavy: 2,
+		LoopRepeatLimit:    0, // opt-in: see loopGuard for why it is off by default
 	}
 }
 
@@ -336,6 +342,9 @@ func (e *Engine) RunWithCheckpoint(ctx context.Context, rc *RunContext, startNod
 	queue := []queueItem{{NodeName: startNode, Input: seed}}
 	steps := 0
 	perNodeAttempts := map[string]int{}
+	began := time.Now()
+	loops := newLoopGuard(e.LoopRepeatLimit)
+	nodeRuns := map[string]int{} // how often each node ran in THIS pass (diagnostics for MaxSteps)
 	resumeOperationID := ""
 	if resume != nil {
 		queue = append([]queueItem(nil), resume.Pending...)
@@ -397,13 +406,19 @@ runLoop:
 
 		steps++
 		if steps > e.MaxSteps {
-			runErr = fmt.Errorf("engine: exceeded MaxSteps (%d) -- probable infinite loop, aborting", e.MaxSteps)
+			runErr = fmt.Errorf("engine: exceeded MaxSteps (%d) -- probable infinite loop, aborting%s", e.MaxSteps, busiestNodes(nodeRuns))
 			rc.Execution.Status = model.StatusError
 			break runLoop
 		}
 
 		item := queue[0]
 		queue = queue[1:]
+		nodeRuns[item.NodeName]++
+		if n, stuck := loops.Observe(item.NodeName, item.Input); stuck {
+			runErr = fmt.Errorf("engine: loop detected -- node %q received the identical input %d times with no change (limit %d); aborting this run so the next Service can start%s", item.NodeName, n, e.LoopRepeatLimit, busiestNodes(nodeRuns))
+			rc.Execution.Status = model.StatusError
+			break runLoop
+		}
 
 		node, ok := rc.Workflow.Nodes[item.NodeName]
 		if !ok {
@@ -564,6 +579,14 @@ runLoop:
 			log.Printf("engine: terminal checkpoint failed: %v", err)
 		}
 	}
+	// Every execution has its OWN step counter (it starts at 0 for each
+	// Service run). This line shows how close each run came to the limit.
+	errText := ""
+	if runErr != nil {
+		errText = runErr.Error()
+	}
+	log.Printf("engine: execution %s workflow=%s ended status=%s steps=%d/%d duration=%s error=%q",
+		rc.Execution.ID, rc.Workflow.ID, rc.Execution.Status, steps, e.MaxSteps, time.Since(began).Round(time.Second), errText)
 	now := time.Now()
 	rc.Execution.FinishedAt = &now
 	if runErr != nil {
@@ -671,4 +694,29 @@ func retryBackoff(baseMs int, attempt int) time.Duration {
 		wait = maxRetryBackoff
 	}
 	return wait
+}
+
+// busiestNodes names the (up to) five nodes that ran most often, so a
+// MaxSteps abort tells the operator WHICH loop was spinning.
+func busiestNodes(runs map[string]int) string {
+	if len(runs) == 0 {
+		return ""
+	}
+	type kv struct {
+		name string
+		n    int
+	}
+	list := make([]kv, 0, len(runs))
+	for k, v := range runs {
+		list = append(list, kv{k, v})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].n > list[j].n })
+	if len(list) > 5 {
+		list = list[:5]
+	}
+	parts := make([]string, 0, len(list))
+	for _, e := range list {
+		parts = append(parts, fmt.Sprintf("%q x%d", e.name, e.n))
+	}
+	return " [most-run nodes: " + strings.Join(parts, ", ") + "]"
 }
