@@ -243,8 +243,11 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		return nil, fmt.Errorf("youTube %q: credential error: %w", node.Name, err)
 	}
 	token := creds["accessToken"]
-	resource, _ := node.Parameters["resource"].(string) // "video" | "thumbnail"
+	resource, _ := node.Parameters["resource"].(string) // "video" | "thumbnail" | "analytics"
 	operation, _ := node.Parameters["operation"].(string)
+	if resource == "analytics" {
+		return e.executeAnalytics(ctx, rc, node, token, input)
+	}
 
 	var out []model.Item
 	for itemIdx, it := range flatten(input) {
