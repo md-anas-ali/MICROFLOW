@@ -94,7 +94,9 @@ func loadYTAConfig(rc *engine.RunContext) ytaConfig {
 		CallBudget:   ytaEnvInt(rc, "MICROFLOW_YTA_DAILY_CALL_BUDGET", 150, 10, 2000),
 		Timeout:      time.Duration(ytaEnvInt(rc, "MICROFLOW_YTA_TIMEOUT_SECONDS", 90, 15, 600)) * time.Second,
 	}
-	c.Diag = yta.Config{MinPeers: ytaEnvInt(rc, "MICROFLOW_YTA_MIN_PEERS", 5, 3, 30)}
+	// TargetVideos: how many of the newest mature Shorts are judged (the rest are
+	// the comparison history). Default 12 keeps >= 5 history peers when ~20+ videos exist.
+	c.Diag = yta.Config{MinPeers: ytaEnvInt(rc, "MICROFLOW_YTA_MIN_PEERS", 5, 3, 30), TargetVideos: ytaEnvInt(rc, "MICROFLOW_YTA_TARGET_VIDEOS", 12, 3, 40)}
 	c.Evo = yta.EvoConfig{
 		MinPerArm: ytaEnvInt(rc, "MICROFLOW_YTA_MIN_PER_ARM", 4, 3, 30),
 		EvalDays:  ytaEnvInt(rc, "MICROFLOW_YTA_EVAL_DAYS", 7, 2, 60),
@@ -464,8 +466,10 @@ func (c *ytaClient) fetchVideos(ctx context.Context, cfg ytaConfig, meta map[str
 				continue // not a Short (heuristic: <= 3 minutes)
 			}
 			atoi := func(s string) float64 { x, _ := strconv.ParseFloat(s, 64); return x }
+			// A counter the API omits (hidden likes, disabled comments) is UNAVAILABLE, not a measured zero.
 			f.Videos = append(f.Videos, yta.Video{ID: v.ID, Title: v.Snippet.Title, PublishedAt: pub, DurationSec: dur,
 				Views: atoi(v.Statistics.ViewCount), Likes: atoi(v.Statistics.LikeCount), Comments: atoi(v.Statistics.CommentCount),
+				LikesHidden: strings.TrimSpace(v.Statistics.LikeCount) == "", CommentsOff: strings.TrimSpace(v.Statistics.CommentCount) == "",
 				Meta: meta[v.ID]})
 		}
 	}
@@ -842,6 +846,7 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 		res["status"] = status
 		res["guidance"] = yta.Guidance{Arm: "none"}
 		res["guidanceText"] = ""
+		res["guidanceMode"] = "none"
 		errs = append(errs, ytaScrub(msg))
 		res["errors"] = errs
 		return res
@@ -850,6 +855,7 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 		res["status"] = "disabled"
 		res["guidance"] = yta.Guidance{Arm: "none"}
 		res["guidanceText"] = ""
+		res["guidanceMode"] = "none"
 		return res
 	}
 	if len(cfg.UnknownAllowed) > 0 {
@@ -933,6 +939,7 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 	var recs []yta.Recommendation
 	var brief yta.Brief
 	var repairs []string
+	var advisory string
 	recommendOnly := len(cfg.Evo.Allow) == 0
 	cached := fresh
 	err := ytaUpdate(runCtx, rc, func(st *yta.State) error {
@@ -977,7 +984,8 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 			notes := append(append([]string{}, fetch.Notes...), unavailableMetrics...)
 			brief = yta.BuildBrief(summary, recs, plan, events, recommendOnly, notes)
 			st.LastRun = now
-			st.Report = compactReport(summary, recs, plan, fetch, brief)
+			advisory = yta.AdvisoryText(recs)
+			st.Report = compactReport(summary, recs, plan, fetch, brief, advisory)
 		}
 		guidance = st.AssignFor(execID, evo, now)
 		return nil
@@ -992,6 +1000,14 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 	if cached {
 		var st yta.State
 		_ = ytaRead(runCtx, rc, func(s *yta.State) { st = *s })
+		if st.Report != nil {
+			if v, ok := st.Report["recommendations"]; !ok || v == nil {
+				st.Report["recommendations"] = []any{} // old reports persisted null
+			}
+			if t, ok := st.Report["advisoryText"].(string); ok {
+				advisory = t
+			}
+		}
 		res["report"] = st.Report
 		res["brief"] = st.Report["brief"]
 		res["reusedLastAnalysis"] = true
@@ -999,6 +1015,7 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 		res["report"] = map[string]any{
 			"summary": summary, "recommendations": recs, "experimentPlan": plan, "mode": modeName(fetch),
 			"audience": fetch.Audience, "notes": fetch.Notes, "partial": fetch.Partial, "videosFetched": len(fetch.Videos),
+			"coverage": summary.Coverage, "advisoryText": advisory,
 		}
 		res["decisions"] = events
 		res["brief"] = brief
@@ -1010,7 +1027,17 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 		res["integrityRepairs"] = repairs
 	}
 	res["guidance"] = guidance
-	res["guidanceText"] = guidance.Text
+	// guidanceText is never empty on a healthy run. "applied" text (adopted
+	// setting or experiment arm) is injected into the script prompt by the
+	// workflow; "advisory" text (recommend-only) is reported but NOT injected.
+	if guidance.Text != "" {
+		res["guidanceText"], res["guidanceMode"] = guidance.Text, "applied"
+	} else {
+		if advisory == "" {
+			advisory = yta.AdvisoryText(nil)
+		}
+		res["guidanceText"], res["guidanceMode"] = advisory, "advisory"
+	}
 	res["errors"] = errs
 
 	var ms1 runtime.MemStats
@@ -1067,16 +1094,20 @@ func modeName(f ytaFetch) string {
 }
 
 // compactReport is the small summary persisted between runs.
-func compactReport(sum yta.Summary, recs []yta.Recommendation, plan yta.Plan, f ytaFetch, brief yta.Brief) map[string]any {
+func compactReport(sum yta.Summary, recs []yta.Recommendation, plan yta.Plan, f ytaFetch, brief yta.Brief, advisory string) map[string]any {
 	diag := sum.Diagnoses
 	if len(diag) > 3 {
 		diag = diag[:3]
 	}
-	if len(recs) > 4 {
-		recs = recs[:4]
+	if len(recs) > 5 {
+		recs = recs[:5]
+	}
+	if recs == nil {
+		recs = []yta.Recommendation{}
 	}
 	b, _ := json.Marshal(map[string]any{
-		"summary":         map[string]any{"examinedVideos": sum.Examined, "diagnoses": diag, "notes": sum.Notes},
+		"summary":         map[string]any{"examinedVideos": sum.Examined, "diagnoses": diag, "notes": sum.Notes, "coverage": sum.Coverage},
+		"advisoryText":    advisory,
 		"recommendations": recs, "experimentPlan": plan, "mode": modeName(f), "videosFetched": len(f.Videos), "brief": brief,
 	})
 	var m map[string]any
