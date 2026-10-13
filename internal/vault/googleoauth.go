@@ -65,7 +65,20 @@ type GoogleOAuthApp struct {
 	// Cloud Console (e.g. "https://your-app.example.com/api/oauth/google/callback").
 	RedirectURL string
 	httpClient  *http.Client
+	// ExtraScopes are additional scopes requested per service ON TOP of
+	// GoogleServiceScopes. Empty by default, so the consent screen is
+	// unchanged unless the operator opts in (see YouTubeAnalyticsScopeEnvKey).
+	ExtraScopes map[string][]string
 }
+
+// YouTubeAnalyticsScopeEnvKey, when set to "true", adds the READ-ONLY
+// YouTube Analytics scope to the next YouTube "Connect"/"Reconnect". It is an
+// explicit operator opt-in; nothing ever adds a scope automatically, and
+// already-connected accounts keep their current grant until reconnected.
+const YouTubeAnalyticsScopeEnvKey = "MICROFLOW_YT_ANALYTICS_SCOPE"
+
+// YouTubeAnalyticsScope grants read-only access to YouTube Analytics reports.
+const YouTubeAnalyticsScope = "https://www.googleapis.com/auth/yt-analytics.readonly"
 
 // HostURLEnvKey is the optional Environment variable holding the canonical
 // public Host URL (e.g. "https://example.com"). It is resolved through the
@@ -102,7 +115,11 @@ func GoogleOAuthAppFromEnv(getenv func(string) string) (app *GoogleOAuthApp, ok 
 	if id == "" || secret == "" || redirect == "" {
 		return nil, false
 	}
-	return NewGoogleOAuthApp(id, secret, redirect), true
+	app = NewGoogleOAuthApp(id, secret, redirect)
+	if strings.EqualFold(strings.TrimSpace(getenv(YouTubeAnalyticsScopeEnvKey)), "true") {
+		app.ExtraScopes = map[string][]string{"youtube": {YouTubeAnalyticsScope}}
+	}
+	return app, true
 }
 
 func NewGoogleOAuthApp(clientID, clientSecret, redirectURL string) *GoogleOAuthApp {
@@ -128,6 +145,7 @@ func (g *GoogleOAuthApp) AuthURL(msvcID, service string) (string, error) {
 		return "", fmt.Errorf("vault: unknown google service %q", service)
 	}
 	allScopes := append([]string{"openid", "https://www.googleapis.com/auth/userinfo.email"}, scopes...)
+	allScopes = append(allScopes, g.ExtraScopes[service]...)
 	state, err := g.signState(msvcID, service)
 	if err != nil {
 		return "", err
