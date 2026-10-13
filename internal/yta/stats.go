@@ -91,6 +91,12 @@ type Video struct {
 	// EarlyViews are the views in the first EarlyDays days (see MEarlyViews).
 	EarlyViews float64
 	HasEarly   bool
+	// LikesHidden / CommentsOff are set when the Data API did not return the
+	// counter at all (hidden likes, disabled comments). The zero value means
+	// "available", so existing callers are unaffected. A missing counter is
+	// UNAVAILABLE, never a measured zero.
+	LikesHidden bool
+	CommentsOff bool
 }
 
 // AgeDays is the age at `now`, never below a small positive floor so
@@ -108,8 +114,11 @@ func (v Video) Value(m Metric, now time.Time) (float64, bool) {
 	a := v.Analytics
 	switch m {
 	case MViewsPerDay:
+		// Lifetime public views over lifetime age: both cover the same span.
+		// (Analytics views only cover the look-back window, so dividing them
+		// by the full age would understate older videos.)
 		views := v.Views
-		if a != nil && a.Views > 0 {
+		if views <= 0 && a != nil && a.Views > 0 {
 			views = a.Views
 		}
 		return views / v.AgeDays(now), true
@@ -118,7 +127,8 @@ func (v Video) Value(m Metric, now time.Time) (float64, bool) {
 			return v.EarlyViews, true
 		}
 	case MAvgViewPct:
-		if a != nil && a.HasAvgViewPct {
+		// 0 with real views is an API gap, not a measurement; so is a row with no views.
+		if a != nil && a.HasAvgViewPct && a.Views > 0 && a.AvgViewPct > 0 {
 			return a.AvgViewPct, true
 		}
 	case MEngagedRate:
@@ -126,11 +136,11 @@ func (v Video) Value(m Metric, now time.Time) (float64, bool) {
 			return a.EngagedViews / a.Views, true
 		}
 	case MLikeRate:
-		if v.Views > 0 {
+		if v.Views > 0 && !v.LikesHidden {
 			return v.Likes / v.Views, true
 		}
 	case MCommentRate:
-		if v.Views > 0 {
+		if v.Views > 0 && !v.CommentsOff {
 			return v.Comments / v.Views, true
 		}
 	case MShareRate:
@@ -142,7 +152,7 @@ func (v Video) Value(m Metric, now time.Time) (float64, bool) {
 			return a.SubsGained / a.Views * 1000, true
 		}
 	case MHookRetention:
-		if a != nil && a.HasHook {
+		if a != nil && a.HasHook && a.Views > 0 && a.HookRetention > 0 {
 			return a.HookRetention, true
 		}
 	}

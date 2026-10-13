@@ -80,6 +80,10 @@ type Summary struct {
 	Regressions []Regression     `json:"regressions,omitempty"`
 	Features    []FeatureFinding `json:"contentFeatures,omitempty"`
 	Topics      []TopicScore     `json:"topicRanking,omitempty"`
+
+	Coverage  Coverage    `json:"coverage"`
+	Bands     []BandScore `json:"lengthBands,omitempty"`
+	Standouts []Standout  `json:"standouts,omitempty"`
 }
 
 var diagMetrics = []Metric{MEarlyViews, MViewsPerDay, MAvgViewPct, MHookRetention, MEngagedRate, MLikeRate, MCommentRate, MShareRate, MSubsPerKViews}
@@ -105,7 +109,21 @@ func Diagnose(videos []Video, now time.Time, cfg Config) Summary {
 			break
 		}
 	}
+	// Keep enough older videos to benchmark against: shrink the target set
+	// rather than starve the peer pool (insufficient peers => no verdicts).
+	if hist := len(videos) - len(targets); hist < cfg.minPeers() && len(targets) > 3 {
+		keep := len(videos) - cfg.minPeers()
+		if keep < 3 {
+			keep = 3
+		}
+		if keep < len(targets) {
+			targets = targets[:keep]
+		}
+	}
 	sum.Examined = len(targets)
+	sum.Coverage = buildCoverage(videos, targets, now)
+	sum.Bands = lengthBands(videos, now)
+	sum.Standouts = standouts(videos, now, 3)
 	if len(targets) < 3 {
 		sum.Notes = append(sum.Notes, fmt.Sprintf("only %d video(s) older than %.0f days: not enough history to benchmark", len(targets), MinMatureAgeDays))
 		sum.Diagnoses = []Diagnosis{{Cause: CauseImmatureData, Level: LevelInsufficient,

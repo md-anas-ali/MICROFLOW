@@ -28,7 +28,7 @@ func firstN[T any](xs []T, n int) []T {
 
 // BuildBrief condenses one analysis into the per-run report.
 func BuildBrief(sum Summary, recs []Recommendation, plan Plan, events []Event, recommendOnly bool, notes []string) Brief {
-	b := Brief{Mode: "auto-evolve (allow-listed settings only)"}
+	b := Brief{Mode: "auto-evolve (allow-listed settings only)", Evidence: []string{}, Recommendations: []string{}, Changes: []string{}, Results: []string{}, Uncertainty: []string{}}
 	if recommendOnly {
 		b.Mode = "recommend-only (no setting is changed automatically)"
 	}
@@ -55,7 +55,7 @@ func BuildBrief(sum Summary, recs []Recommendation, plan Plan, events []Event, r
 	for _, r := range sum.Regressions {
 		b.Problem += " Regression: " + r.String() + "."
 	}
-	for _, r := range firstN(recs, 4) {
+	for _, r := range firstN(recs, 5) {
 		b.Recommendations = append(b.Recommendations, r.Area+": "+r.Action)
 	}
 	for _, e := range events {
