@@ -2,7 +2,7 @@
 # workflow (see LOWRAM.md for the measured numbers and honest limits of
 # this tuning).
 #
-# TTS ENGINE: real, online Microsoft Edge TTS via the `"edge-tts==7.2.8"`
+# TTS ENGINE: real, online Microsoft Edge TTS via the `"edge-tts==7.3.1"`
 # PyPI package (see scripts/edge_tts/edge_tts_min.py and
 # scripts/edge_tts/README.md). This deliberately replaces an earlier
 # pure-Go reimplementation of the same undocumented Microsoft protocol
@@ -11,7 +11,7 @@
 # never had network access to it either; see LOWRAM.md's history) and
 # reverse-engineered protocol details like the Sec-MS-GEC anti-abuse
 # token are exactly the kind of thing Microsoft can silently change.
-# "edge-tts==7.2.8" is the actual upstream project every "Edge TTS"
+# "edge-tts==7.3.1" is the actual upstream project every "Edge TTS"
 # integration in the wild is built on, so it degrades the same way
 # everyone else's does, not in some bespoke way only this repo hits.
 #
@@ -53,7 +53,7 @@
 # base back to `debian:bookworm-slim` with `apt-get install -y
 # --no-install-recommends ffmpeg python3 ca-certificates`, and for
 # stage 2 use `python:3.11-slim-bookworm` with `pip install
-# --no-cache-dir --target=... "edge-tts==7.2.8"` (manylinux wheels for
+# --no-cache-dir --target=... "edge-tts==7.3.1"` (manylinux wheels for
 # aiohttp cover glibc too, so this swap doesn't reintroduce a compiler
 # requirement).
 
@@ -63,7 +63,7 @@ COPY . .
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
 RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
 
-# Fetches "edge-tts==7.2.8" and its one direct dependency (aiohttp) as
+# Fetches "edge-tts==7.3.1" and its one direct dependency (aiohttp) as
 # prebuilt wheels ONLY (--only-binary=:all: below turns a missing
 # wheel into a hard build failure instead of silently compiling, per
 # the caveat above). aiohttp's own transitive deps (multidict, yarl,
@@ -75,7 +75,7 @@ RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
 # -- no pip/setuptools/wheel need to exist in the runtime image at all.
 FROM python:3.11-alpine3.19 AS pytts
 RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
-      --target=/pytts-deps "edge-tts==7.2.8" "aiohttp==3.14.3" \
+      --target=/pytts-deps "edge-tts==7.3.1" "aiohttp==3.14.3" \
  && find /pytts-deps -name "*.dist-info" -type d -exec rm -rf {} + \
  && find /pytts-deps -name "__pycache__" -type d -exec rm -rf {} + \
  && find /pytts-deps -name "*.egg-info" -type d -exec rm -rf {} + \
