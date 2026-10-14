@@ -238,6 +238,13 @@ type YouTubeExecutor struct {
 }
 
 func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, node *model.Node, input model.NodeOutput) (model.NodeOutput, error) {
+	// The Script Quality Gate is a purely local computation: it needs no Google
+	// credential, so a credential problem must never be able to stop it.
+	if r, _ := node.Parameters["resource"].(string); r == "analytics" {
+		if op, _ := node.Parameters["operation"].(string); op == "quality" {
+			return e.executeAnalytics(ctx, rc, node, "", input)
+		}
+	}
 	creds, err := resolveGoogleCreds(ctx, e.Creds, e.Accounts, e.Service, rc.Workflow.ServiceID, rc.Workflow.ID, node.Name)
 	if err != nil {
 		return nil, fmt.Errorf("youTube %q: credential error: %w", node.Name, err)

@@ -70,6 +70,10 @@ type ytaConfig struct {
 	Diag           yta.Config
 	Evo            yta.EvoConfig
 	UnknownAllowed []string
+	// Market research + topic steering (advisory inputs to the NEXT topic).
+	ResearchEvery time.Duration
+	MarketSignals bool
+	TopicWeights  bool
 }
 
 func ytaEnvInt(rc *engine.RunContext, key string, def, min, max int) int {
@@ -103,6 +107,9 @@ func loadYTAConfig(rc *engine.RunContext) ytaConfig {
 		MaxDays:   ytaEnvInt(rc, "MICROFLOW_YTA_EXPERIMENT_MAX_DAYS", 45, 14, 180),
 	}
 	c.Evo.Allow, c.UnknownAllowed = yta.ParseAllow(rc.Env("MICROFLOW_YTA_EVOLVE_ALLOW"))
+	c.ResearchEvery = time.Duration(ytaEnvInt(rc, "MICROFLOW_YTA_RESEARCH_HOURS", 24, 1, 168)) * time.Hour
+	c.MarketSignals = ytaQualityEnvBool(rc, "MICROFLOW_YTA_MARKET_SIGNALS", true)
+	c.TopicWeights = ytaQualityEnvBool(rc, "MICROFLOW_YTA_TOPIC_WEIGHTS", true)
 	return c
 }
 
@@ -368,6 +375,10 @@ type ytaFetch struct {
 	Audience      map[string]any
 	Notes         []string
 	Partial       bool
+	// Market research (competitor outliers / category chart) and category weights.
+	Research   *yta.Research
+	ResearchAt string
+	Weights    map[string]float64
 }
 
 var isoDur = regexp.MustCompile(`^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$`)
@@ -645,6 +656,11 @@ func (c *ytaClient) fetchAnalytics(ctx context.Context, cfg ytaConfig, now time.
 		if h, ok := hookRetention(rep); ok {
 			v.Analytics.HookRetention, v.Analytics.HasHook = h, true
 		}
+		if pts := curvePoints(rep); len(pts) > 0 {
+			if cv, ok := yta.AnalyzeCurve(pts, v.DurationSec, v.Meta.SceneWords); ok {
+				v.Analytics.Curve = &cv
+			}
+		}
 		n++
 	}
 
@@ -678,6 +694,22 @@ func (c *ytaClient) fetchAnalytics(ctx context.Context, cfg ytaConfig, now time.
 		}
 		f.Audience["topTrafficSources"] = top
 	}
+}
+
+// curvePoints converts an elapsedVideoTimeRatio/audienceWatchRatio report
+// into curve points (nil when the columns are missing).
+func curvePoints(r ytaReport) []yta.CurvePoint {
+	ri, vi := r.col("elapsedVideoTimeRatio"), r.col("audienceWatchRatio")
+	if ri < 0 || vi < 0 {
+		return nil
+	}
+	pts := make([]yta.CurvePoint, 0, len(r.Rows))
+	for _, row := range r.Rows {
+		if ri < len(row) && vi < len(row) {
+			pts = append(pts, yta.CurvePoint{X: num(row[ri]), Y: num(row[vi])})
+		}
+	}
+	return pts
 }
 
 // hookRetention reads audienceWatchRatio at ~10% of the runtime.
@@ -743,6 +775,8 @@ func (e *YouTubeExecutor) executeAnalytics(ctx context.Context, rc *engine.RunCo
 	}
 
 	switch op {
+	case "quality":
+		return ytaQuality(ctx, rc, node, execID, items)
 	case "register":
 		return ytaRegister(ctx, rc, node, cfg, execID, items)
 	default:
@@ -776,6 +810,30 @@ func ytaRegister(ctx context.Context, rc *engine.RunContext, node *model.Node, c
 		if category == "<nil>" {
 			category = ""
 		}
+		// Pre-publish quality context from the Script Quality Gate (optional).
+		evalInt := func(name string) int {
+			v, err := expr.EvalValue(node.ParamString(name, ""), ec)
+			if err != nil {
+				return 0
+			}
+			n, _ := strconv.Atoi(strings.TrimSpace(fmt.Sprint(v)))
+			if n < 0 || n > 100 {
+				return 0
+			}
+			return n
+		}
+		hs, ts := evalInt("hookScore"), evalInt("titleScore")
+		var sw []int
+		if v, err := expr.EvalValue(node.ParamString("sceneWords", ""), ec); err == nil {
+			for _, p := range strings.Split(fmt.Sprint(v), ",") {
+				if n, e := strconv.Atoi(strings.TrimSpace(p)); e == nil && n > 0 && n < 200 {
+					sw = append(sw, n)
+				}
+			}
+			if len(sw) > 12 {
+				sw = nil
+			}
+		}
 		j := map[string]any{}
 		for k, v := range it.JSON {
 			j[k] = v
@@ -788,6 +846,7 @@ func ytaRegister(ctx context.Context, rc *engine.RunContext, node *model.Node, c
 		var meta yta.VideoMeta
 		err := ytaUpdate(ctx, rc, func(st *yta.State) error {
 			meta = yta.VideoMeta{Category: category, At: time.Now().UTC().Format(time.RFC3339)}
+			meta.HookScore, meta.TitleScore, meta.SceneWords = hs, ts, sw
 			// Attribute an arm ONLY if analyze pinned one for this execution, i.e.
 			// the guidance really reached the script prompt.
 			if g, ok := st.Pinned(execID); ok {
@@ -931,6 +990,38 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 		}
 	}
 
+	// Market research: refreshed at most every MICROFLOW_YTA_RESEARCH_HOURS, otherwise
+	// the previous summary is reused (no API calls). Failure never affects the run.
+	if !fresh && client != nil {
+		var prev *yta.Research
+		prevAt := time.Time{}
+		if snap.Report != nil {
+			if b, err := json.Marshal(snap.Report["research"]); err == nil && string(b) != "null" {
+				var r yta.Research
+				if json.Unmarshal(b, &r) == nil && r.Source != "" {
+					prev = &r
+				}
+			}
+			if ts, ok := snap.Report["researchAt"].(string); ok {
+				prevAt, _ = time.Parse(time.RFC3339, ts)
+			}
+		}
+		if prev != nil && now.Sub(prevAt) < cfg.ResearchEvery {
+			fetch.Research, fetch.ResearchAt = prev, prevAt.Format(time.RFC3339)
+		} else if cfg.MarketSignals {
+			r, notes := client.fetchMarket(runCtx, rc, now)
+			fetch.Notes = append(fetch.Notes, notes...)
+			if r.Source != "none" || prev == nil {
+				fetch.Research, fetch.ResearchAt = &r, now.Format(time.RFC3339)
+			} else {
+				fetch.Research, fetch.ResearchAt = prev, prevAt.Format(time.RFC3339)
+			}
+		}
+		if cfg.TopicWeights {
+			fetch.Weights = yta.TopicWeights(fetch.Videos, now)
+		}
+	}
+
 	// Phase C: apply decisions atomically on the freshest state.
 	var guidance yta.Guidance
 	var events []yta.Event
@@ -966,6 +1057,9 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 			}
 			summary = yta.Diagnose(fetch.Videos, now, cfg.Diag)
 			recs = yta.Recommend(summary)
+			if fetch.Research != nil {
+				recs = append(recs, yta.RecommendFromResearch(*fetch.Research)...)
+			}
 			events = st.Verify(fetch.Videos, now, evo)
 			plan = st.Next(summary, fetch.HaveAnalytics, now, evo)
 			for _, e := range events {
@@ -1016,10 +1110,45 @@ func ytaAnalyze(ctx context.Context, rc *engine.RunContext, cfg ytaConfig, token
 			"summary": summary, "recommendations": recs, "experimentPlan": plan, "mode": modeName(fetch),
 			"audience": fetch.Audience, "notes": fetch.Notes, "partial": fetch.Partial, "videosFetched": len(fetch.Videos),
 			"coverage": summary.Coverage, "advisoryText": advisory,
+			"research": fetch.Research, "topicWeights": fetch.Weights, "retentionPattern": summary.Retention,
 		}
 		res["decisions"] = events
 		res["brief"] = brief
 		res["mode"] = modeName(fetch)
+	}
+	// Advisory inputs for the NEXT topic (kill switches: MICROFLOW_YTA_MARKET_SIGNALS /
+	// MICROFLOW_YTA_TOPIC_WEIGHTS = off). Both are subject-level only and bounded: market
+	// text names subjects worth an unexplored angle, weights lean 0.4x-1.8x and never
+	// exclude a category. They never touch hook/title/pacing, so experiments stay clean.
+	res["researchText"], res["topicWeights"] = "", map[string]float64{}
+	if cached {
+		var st yta.State
+		_ = ytaRead(runCtx, rc, func(s *yta.State) { st = *s })
+		if cfg.MarketSignals {
+			if rm, ok := st.Report["research"].(map[string]any); ok {
+				if t, ok := rm["topicText"].(string); ok {
+					res["researchText"] = t
+				}
+			}
+		}
+		if cfg.TopicWeights {
+			if wm, ok := st.Report["topicWeights"].(map[string]any); ok {
+				out := map[string]float64{}
+				for k, v := range wm {
+					if f, ok := v.(float64); ok {
+						out[k] = f
+					}
+				}
+				res["topicWeights"] = out
+			}
+		}
+	} else {
+		if cfg.MarketSignals && fetch.Research != nil {
+			res["researchText"] = fetch.Research.TopicText
+		}
+		if cfg.TopicWeights && fetch.Weights != nil {
+			res["topicWeights"] = fetch.Weights
+		}
 	}
 	res["policy"] = cfg.Evo.Snapshot()
 	res["unavailableMetrics"] = unavailableMetrics
@@ -1106,7 +1235,8 @@ func compactReport(sum yta.Summary, recs []yta.Recommendation, plan yta.Plan, f 
 		recs = []yta.Recommendation{}
 	}
 	b, _ := json.Marshal(map[string]any{
-		"summary":         map[string]any{"examinedVideos": sum.Examined, "diagnoses": diag, "notes": sum.Notes, "coverage": sum.Coverage},
+		"summary":  map[string]any{"examinedVideos": sum.Examined, "diagnoses": diag, "notes": sum.Notes, "coverage": sum.Coverage, "retentionPattern": sum.Retention},
+		"research": f.Research, "researchAt": f.ResearchAt, "topicWeights": f.Weights,
 		"advisoryText":    advisory,
 		"recommendations": recs, "experimentPlan": plan, "mode": modeName(f), "videosFetched": len(f.Videos), "brief": brief,
 	})
