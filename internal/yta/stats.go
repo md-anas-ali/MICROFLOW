@@ -62,6 +62,9 @@ type VideoAnalytics struct {
 	SubsGained     float64
 	HookRetention  float64
 	HasHook        bool
+	// Curve is the shape of the audience-retention curve (where viewers left).
+	// Transient: computed on every fetch, never persisted.
+	Curve *Retention
 }
 
 // VideoMeta is the minimal per-video state MICROFLOW persists itself
@@ -74,6 +77,11 @@ type VideoMeta struct {
 	Setting      string `json:"s,omitempty"`
 	Variant      string `json:"v,omitempty"`
 	At           string `json:"t,omitempty"`
+	// Pre-publish quality context recorded by the Script Quality Gate so later
+	// runs can test whether these heuristics actually predict results here.
+	HookScore  int   `json:"hs,omitempty"`
+	TitleScore int   `json:"ts,omitempty"`
+	SceneWords []int `json:"sw,omitempty"`
 }
 
 // Video is one published Short with public (Data API) counters and, when the

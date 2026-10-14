@@ -110,6 +110,11 @@ func FeatureInsights(videos []Video, now time.Time, minGroup int) []FeatureFindi
 		{"title_is_question", func(v Video) (bool, bool) { return reQuestion.MatchString(strings.TrimSpace(v.Title)), v.Title != "" }},
 		{"title_longer_than_50_chars", func(v Video) (bool, bool) { return len([]rune(v.Title)) > 50, v.Title != "" }},
 		{"duration_over_40s", func(v Video) (bool, bool) { return v.DurationSec > 40, v.DurationSec > 0 }},
+		// Recorded by the Script Quality Gate at publish time: tests whether the
+		// pre-publish heuristics predict anything on THIS channel. Videos made
+		// before the gate existed are simply not applicable.
+		{"hook_score_70_plus", func(v Video) (bool, bool) { return v.Meta.HookScore >= 70, v.Meta.HookScore > 0 }},
+		{"title_score_80_plus", func(v Video) (bool, bool) { return v.Meta.TitleScore >= 80, v.Meta.TitleScore > 0 }},
 	}
 	var out []FeatureFinding
 	for _, f := range feats {

@@ -81,6 +81,8 @@ type Summary struct {
 	Features    []FeatureFinding `json:"contentFeatures,omitempty"`
 	Topics      []TopicScore     `json:"topicRanking,omitempty"`
 
+	Retention *RetentionPattern `json:"retentionPattern,omitempty"`
+
 	Coverage  Coverage    `json:"coverage"`
 	Bands     []BandScore `json:"lengthBands,omitempty"`
 	Standouts []Standout  `json:"standouts,omitempty"`
@@ -98,6 +100,7 @@ func Diagnose(videos []Video, now time.Time, cfg Config) Summary {
 	sum.Regressions = DetectRegression(videos, now, 5, 8)
 	sum.Features = FeatureInsights(videos, now, 5)
 	sum.Topics = RankTopics(videos, now)
+	sum.Retention = AggregateRetention(videos)
 	var targets []Video
 	sorted := append([]Video(nil), videos...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].PublishedAt.After(sorted[j].PublishedAt) })
@@ -194,6 +197,16 @@ func Diagnose(videos []Video, now time.Time, cfg Config) Summary {
 	if ret.low() {
 		d.Supporting = append(d.Supporting, describe("average view percentage", ret))
 		d.score++
+	}
+	// The retention-curve shape is a second, independent look at the opening: it
+	// reads where the audience actually left, not only a single point at 10%.
+	if rp := sum.Retention; rp != nil && rp.Videos >= 4 {
+		if rp.MedianHookLeak >= 35 && float64(rp.LeakyHooks)/float64(rp.Videos) >= 0.5 {
+			d.Supporting = append(d.Supporting, fmt.Sprintf("retention curves: the median video loses %.0f points of its audience by 10%% of the runtime (%d of %d curves lose over 35)", rp.MedianHookLeak, rp.LeakyHooks, rp.Videos))
+			d.score++
+		} else if rp.LeakyHooks == 0 {
+			d.Contradicting = append(d.Contradicting, fmt.Sprintf("retention curves show no heavy opening loss (median %.0f points by 10%% of the runtime)", rp.MedianHookLeak))
+		}
 	}
 	if hook.fine() {
 		d.Contradicting = append(d.Contradicting, "hook retention is in line with peers")

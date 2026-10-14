@@ -55,6 +55,13 @@ func BuildBrief(sum Summary, recs []Recommendation, plan Plan, events []Event, r
 	for _, r := range sum.Regressions {
 		b.Problem += " Regression: " + r.String() + "."
 	}
+	if rp := sum.Retention; rp != nil && rp.Videos >= 4 {
+		line := fmt.Sprintf("Retention curves (%d videos): median opening loss %.0f points by 10%% of the runtime", rp.Videos, rp.MedianHookLeak)
+		if rp.TopScene > 0 && rp.SceneKnown >= 4 {
+			line += fmt.Sprintf("; biggest drop most often in scene %d (%.0f%% of mapped videos)", rp.TopScene, rp.TopSceneShare*100)
+		}
+		b.Evidence = append(b.Evidence, line+".")
+	}
 	for _, r := range firstN(recs, 5) {
 		b.Recommendations = append(b.Recommendations, r.Area+": "+r.Action)
 	}

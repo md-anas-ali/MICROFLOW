@@ -47,17 +47,23 @@ func Recommend(sum Summary) []Recommendation {
 	}
 	// Observational content-feature associations (suggest what to test, not proven causes).
 	for _, f := range sum.Features {
+		area := "title"
+		if strings.HasPrefix(f.Feature, "hook_") {
+			area = "hook"
+		}
 		switch f.Verdict {
 		case "better":
-			out = append(out, Recommendation{Area: "title", Cause: "observed_association", Evidence: LevelWeak,
+			out = append(out, Recommendation{Area: area, Cause: "observed_association", Evidence: LevelWeak,
 				Action:  fmt.Sprintf("Own videos with %q earned %.0f%% more (median %s, %d vs %d videos). Treat as a hypothesis to test, not a proven cause.", f.Feature, f.Relative*100, f.Metric, f.With, f.Without),
 				TestHow: "Change only this feature in a controlled experiment before relying on it."})
 		case "worse":
-			out = append(out, Recommendation{Area: "title", Cause: "observed_association", Evidence: LevelWeak,
+			out = append(out, Recommendation{Area: area, Cause: "observed_association", Evidence: LevelWeak,
 				Action:  fmt.Sprintf("Own videos with %q earned %.0f%% less (median %s, %d vs %d videos). Treat as a hypothesis, not a proven cause.", f.Feature, -f.Relative*100, f.Metric, f.With, f.Without),
 				TestHow: "Change only this feature in a controlled experiment before relying on it."})
 		}
 	}
+	// Where viewers actually leave (retention-curve shape, own videos only).
+	out = append(out, RecommendFromRetention(sum.Retention)...)
 	// Next-topic ranking (only categories with evidence).
 	var names []string
 	for _, t := range sum.Topics {
@@ -82,7 +88,12 @@ func Recommend(sum Summary) []Recommendation {
 	var best, worst []string
 	for _, st := range sum.Standouts {
 		if st.Best {
-			best = append(best, fmt.Sprintf("%q (x%.1f)", st.Title, st.Rel))
+			f, _ := ClassifyFormula(st.Title)
+			if f == "Unclassified" {
+				best = append(best, fmt.Sprintf("%q (x%.1f)", st.Title, st.Rel))
+			} else {
+				best = append(best, fmt.Sprintf("%q (x%.1f, %s wording)", st.Title, st.Rel, f))
+			}
 		} else if st.Rel < 0.5 {
 			worst = append(worst, fmt.Sprintf("%q (x%.1f)", st.Title, st.Rel))
 		}
