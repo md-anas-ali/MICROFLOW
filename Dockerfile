@@ -86,7 +86,12 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
 FROM alpine:3.19
 
 # fontconfig + ttf-dejavu: ফন্ট না থাকলে ffmpeg subtitles আঁকে না, অথচ error-ও দেয় না
-RUN apk add --no-cache ffmpeg python3 ca-certificates bash fontconfig ttf-dejavu espeak-ng
+RUN apk add --no-cache ffmpeg python3 ca-certificates bash fontconfig ttf-dejavu
+# Optional offline voice (only used if Edge TTS is unreachable). Alpine 3.19 has NO
+# "espeak-ng" package, and a hard failure here broke the whole image build, so it is
+# best-effort: the build continues without it and the TTS node reports
+# TTS_ESPEAK_INSTALLED_False in its output.
+RUN apk add --no-cache espeak-ng 2>/dev/null || apk add --no-cache espeak 2>/dev/null || echo "NOTE: no offline voice package on this Alpine release - continuing without it"
 COPY --from=pytts /pytts-deps /opt/microflow/pytts-deps
 
 # Verify the vendored Edge TTS runtime at image build time.
