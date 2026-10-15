@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"microflow/internal/engine"
 	"microflow/internal/expr"
@@ -210,6 +211,25 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 		if runErr != nil && exitCode == 0 {
 			return nil, fmt.Errorf("executeCommand %q: %w", node.Name, runErr)
 		}
+		// n8n semantics: a command that exits with a non-zero status FAILS the
+		// node. Until now it was reported as a success (only the exitCode
+		// field of the result was set), so every `exit 1` guard in a workflow
+		// (silent-voice / silent-video checks, "not all clips yet", missing
+		// image ...) was a silent no-op: the run carried on and e.g. uploaded
+		// a video with no voice. The failure goes through the normal path:
+		// the node's retryOnFail/maxTries, then continueOnFail's error output
+		// or a failed run. stdout is included because the workflow scripts
+		// print their diagnostic markers there (VOICE_..., FINAL_AUDIO_...).
+		if exitCode != 0 {
+			msg := strings.TrimSpace(tailString(stdout.String(), 1500))
+			if es := strings.TrimSpace(tailString(stderr.String(), 600)); es != "" {
+				if msg != "" {
+					msg += "\n--- stderr ---\n"
+				}
+				msg += es
+			}
+			return nil, fmt.Errorf("executeCommand %q: exited with code %d: %s", node.Name, exitCode, msg)
+		}
 		out = append(out, model.Item{JSON: result})
 	}
 	return model.NodeOutput{out}, nil
@@ -220,4 +240,17 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "...[truncated]"
+}
+
+// tailString returns the last n bytes of s (the end of a log is where the
+// failure reason is), cut on a rune boundary.
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	t := s[len(s)-n:]
+	for len(t) > 0 && !utf8.RuneStart(t[0]) {
+		t = t[1:]
+	}
+	return "..." + t
 }
