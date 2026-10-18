@@ -2,6 +2,7 @@ package nodes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -361,14 +362,16 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 			continue
 		}
 
-		limited := io.LimitReader(resp.Body, maxResponseBytes+1)
-		respBody, readErr := io.ReadAll(limited)
+		// Large bodies are staged on Storage (when usable) and read back into
+		// one exact buffer; small ones stay in RAM; any Storage problem falls
+		// back to the plain in-memory read (see spill.go).
+		respBody, readErr := readBodyCapped(resp.Body, maxResponseBytes, rc.ScratchDir)
 		resp.Body.Close()
+		if errors.Is(readErr, errBodyTooLarge) {
+			return nil, fmt.Errorf("http request %q: response exceeded %d byte cap", node.Name, maxResponseBytes)
+		}
 		if readErr != nil {
 			return nil, readErr
-		}
-		if len(respBody) > maxResponseBytes {
-			return nil, fmt.Errorf("http request %q: response exceeded %d byte cap", node.Name, maxResponseBytes)
 		}
 
 		if strings.Contains(ct, "application/json") {

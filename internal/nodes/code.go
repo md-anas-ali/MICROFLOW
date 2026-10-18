@@ -2,7 +2,6 @@ package nodes
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -426,12 +425,12 @@ func (e CodeExecutor) newHTTPRequestHelper(ctx context.Context, rc *engine.RunCo
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			fail("HTTP %d", resp.StatusCode)
 		}
-		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+		respBody, err := readBodyCapped(resp.Body, maxResponseBytes, rc.ScratchDir)
+		if errors.Is(err, errBodyTooLarge) {
+			fail("response exceeded %d byte cap", maxResponseBytes)
+		}
 		if err != nil {
 			fail("reading response failed")
-		}
-		if len(respBody) > maxResponseBytes {
-			fail("response exceeded %d byte cap", maxResponseBytes)
 		}
 		if !wantJSON {
 			return vm.ToValue(string(respBody))
@@ -486,11 +485,12 @@ func readFileBase64ForCode(rc *engine.RunContext, path string) any {
 	if info.Size() > maxReadFileBase64Bytes {
 		return nil
 	}
-	b, err := os.ReadFile(path)
+	// Chunked read straight from Storage: no whole-file []byte, no second copy.
+	out, err := fileToBase64(path, info.Size())
 	if err != nil {
 		return nil
 	}
-	return base64.StdEncoding.EncodeToString(b)
+	return out
 }
 
 // readFileTextForCode implements $readFileText for Code node scripts --
@@ -514,11 +514,11 @@ func readFileTextForCode(rc *engine.RunContext, path string) any {
 	if info.Size() > maxReadFileBase64Bytes {
 		return nil
 	}
-	b, err := os.ReadFile(path)
+	out, err := fileToString(path, info.Size())
 	if err != nil {
 		return nil
 	}
-	return string(b)
+	return out
 }
 
 // maxConsoleLogBytes bounds a single console.log/warn/etc call's
