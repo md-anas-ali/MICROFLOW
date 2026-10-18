@@ -254,6 +254,11 @@ func main() {
 		"CEREBRAS_API_KEY",
 		"CLOUDFLARE_API_TOKEN",
 		"CLOUDFLARE_ACCOUNT_ID",
+		// Image generator (Generate Scene Image): free-tier attestations and optional keys.
+		"CLOUDFLARE_FREE_TIER_CONFIRMED",
+		"HF_FREE_TIER_CONFIRMED",
+		"AI_HORDE_API_KEY",
+		"POLLINATIONS_API_KEY",
 	}
 
 	// MaxIdleConnsPerHost/MaxIdleConns kept small on purpose: this
