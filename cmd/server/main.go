@@ -135,6 +135,19 @@ func main() {
 		}
 	}
 	cleanupRecoveryState()
+	// Rows still queued/running/waiting from a previous process can never be
+	// continued by this one (the async Manager is in memory) unless they have a
+	// recovery checkpoint -- those are left for the recovery loop. Close the rest
+	// once, so the monitor shows no stale "running" runs and no dead Cancel buttons.
+	{
+		sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if n, sweepErr := st.MarkInterruptedExecutions(sweepCtx); sweepErr != nil {
+			log.Printf("startup stale-execution sweep failed: %v", sweepErr)
+		} else if n > 0 {
+			log.Printf("startup stale-execution sweep: closed %d interrupted execution(s)", n)
+		}
+		sweepCancel()
+	}
 	go func() {
 		ticker := time.NewTicker(12 * time.Hour)
 		defer ticker.Stop()
