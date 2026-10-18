@@ -537,11 +537,35 @@ func (s *Store) MarkInterruptedExecutions(ctx context.Context) (int64, error) {
 		SET status='cancelled', finished_at=COALESCE(finished_at, now()),
 			error=CASE WHEN error IS NULL OR error='' THEN 'execution interrupted by server restart' ELSE error END
 		WHERE status IN ('queued', 'running', 'waiting') AND finished_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM execution_checkpoints c WHERE c.execution_id = executions.id)
 	`)
 	if err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// FinalizeStaleExecution marks ONE non-terminal execution that no process
+// is running any more as cancelled, and drops its checkpoint so crash
+// recovery can never resume it afterwards. The UPDATE is conditional on the
+// row still being queued/running/waiting with no finish time, so a run that
+// finished in the meantime is left untouched (changed=false). It only ever
+// touches the row with this exact id.
+func (s *Store) FinalizeStaleExecution(ctx context.Context, executionID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE executions
+		SET status='cancelled', finished_at=COALESCE(finished_at, now()),
+			error=CASE WHEN error IS NULL OR error='' THEN 'execution cancelled: it was no longer running on this server' ELSE error END
+		WHERE id=$1 AND status IN ('queued', 'running', 'waiting') AND finished_at IS NULL
+	`, executionID)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	_, _ = s.pool.Exec(ctx, `DELETE FROM execution_checkpoints WHERE execution_id=$1`, executionID)
+	return true, nil
 }
 
 // DeleteExecution permanently removes one terminal execution immediately.
