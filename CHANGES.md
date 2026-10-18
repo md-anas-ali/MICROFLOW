@@ -1,5 +1,19 @@
 # Changes
 
+## Storage-if-available RAM reduction
+
+- `internal/nodes/spill.go` (+ `spill_linux.go`, `spill_other.go`): large (>1 MiB)
+  non-media HTTP/Code-node response bodies are staged in the execution scratch dir
+  and read back into one exact buffer; `$readFileBase64`/`$readFileText` read the
+  file in chunks. Small bodies never touch disk.
+- Storage is used only if the scratch dir is writable, has free space
+  (`MICROFLOW_STORAGE_MIN_FREE_MB`, default 64) and is not tmpfs/ramfs. Otherwise the
+  previous in-memory path runs unchanged. `MICROFLOW_STORAGE_SPILL=0` forces RAM-only;
+  `MICROFLOW_SPILL_THRESHOLD_KB` (default 1024) sets the size cut-off.
+- `cmd/server/main.go`: scratch root probe with fallback to the OS temp dir; the server
+  starts even with no writable Storage. `internal/runner/runner.go`: a missing scratch
+  dir no longer fails the whole run.
+
 ## Auto Optimize & resource cleanup layer
 
 - New `internal/autoopt` package: per-execution ownership (`ServiceContext`),
