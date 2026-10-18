@@ -56,6 +56,15 @@ type ExecutionLoader interface {
 	GetExecution(ctx context.Context, id string) (*model.Execution, error)
 }
 
+// StaleExecutionFinalizer is an OPTIONAL extra on the ExecutionLoader
+// (*store.Store implements it): it closes one execution row that the
+// database still shows as queued/running/waiting although no process is
+// running it. Checked with a type assertion so existing loaders/fakes keep
+// compiling unchanged.
+type StaleExecutionFinalizer interface {
+	FinalizeStaleExecution(ctx context.Context, executionID string) (bool, error)
+}
+
 // ExecutionHistoryStore supplies durable execution history for the live
 // monitor/history page. *store.Store implements it.
 type ExecutionHistoryStore interface {
@@ -831,11 +840,34 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 		// shown as a misleading "execution not found" failure.
 		if errors.Is(err, runner.ErrExecutionNotFound) && s.execLoader != nil {
 			if ex, loadErr := s.execLoader.GetExecution(r.Context(), execID); loadErr == nil && ex != nil {
+				// Another Service's execution must stay invisible and untouched.
+				if !s.authorizeExecutionService(w, r, ex) {
+					return
+				}
 				switch ex.Status {
 				case model.StatusSuccess, model.StatusError, model.StatusCancelled:
 					writeJSON(w, http.StatusOK, map[string]string{"status": string(ex.Status)})
 					return
 				default:
+					// Not in the Manager. If the Runner still has it live (a scheduler/webhook
+					// run), it really is running: leave it alone.
+					if s.run != nil && s.run.IsExecutionLive(execID) {
+						writeErr(w, http.StatusConflict, errors.New("execution is no longer live on this server and cannot be cancelled"))
+						return
+					}
+					// Nothing in this process runs it (e.g. it survived a restart): sync the
+					// durable row to its final state with one conditional update.
+					if fin, ok := s.execLoader.(StaleExecutionFinalizer); ok {
+						if _, finErr := fin.FinalizeStaleExecution(r.Context(), execID); finErr == nil {
+							if now, reErr := s.execLoader.GetExecution(r.Context(), execID); reErr == nil && now != nil {
+								switch now.Status {
+								case model.StatusSuccess, model.StatusError, model.StatusCancelled:
+									writeJSON(w, http.StatusOK, map[string]string{"status": string(now.Status)})
+									return
+								}
+							}
+						}
+					}
 					writeErr(w, http.StatusConflict, errors.New("execution is no longer live on this server and cannot be cancelled"))
 					return
 				}
