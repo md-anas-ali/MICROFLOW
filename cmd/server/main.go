@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -202,8 +203,7 @@ func main() {
 	// vault.GoogleServiceAccounts's doc comment.
 	googleAccounts := vault.NewGoogleServiceAccounts(accountVault)
 
-	scratchRoot := envOr("MICROFLOW_SCRATCH_DIR", "/tmp/microflow")
-	_ = os.MkdirAll(scratchRoot, 0o700)
+	scratchRoot := resolveScratchRoot(envOr("MICROFLOW_SCRATCH_DIR", "/tmp/microflow"))
 
 	allowedBinaries := map[string]string{
 		"ffmpeg":   envOr("MICROFLOW_FFMPEG_PATH", "/usr/bin/ffmpeg"),
@@ -1035,4 +1035,38 @@ func envInt(k string, def int) int {
 		return def
 	}
 	return n
+}
+
+// resolveScratchRoot picks the directory used for temporary files (media
+// spool, staged HTTP bodies, per-execution scratch). It is "Storage if
+// available": the configured dir is used when it can really be created and
+// written; otherwise the OS temp dir is tried; if neither works the
+// configured path is kept unchanged and the server still starts -- runs that
+// need no temp files keep working and the temp-file steps report their own
+// clear error (nothing here can crash the process).
+func resolveScratchRoot(preferred string) string {
+	usable := func(dir string) bool {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return false
+		}
+		f, err := os.CreateTemp(dir, ".probe-*")
+		if err != nil {
+			return false
+		}
+		name := f.Name()
+		_, werr := f.Write([]byte("ok"))
+		f.Close()
+		_ = os.Remove(name)
+		return werr == nil
+	}
+	if usable(preferred) {
+		return preferred
+	}
+	alt := filepath.Join(os.TempDir(), "microflow")
+	if alt != preferred && usable(alt) {
+		log.Printf("storage: scratch dir %q is not writable, using %q instead", preferred, alt)
+		return alt
+	}
+	log.Printf("storage: WARNING no writable scratch dir (%q); continuing without Storage -- steps that need temp files will report an error, everything else runs as before", preferred)
+	return preferred
 }
