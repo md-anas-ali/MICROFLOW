@@ -369,7 +369,9 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 	// nodes/command.go). spoolBinary's own os.MkdirAll calls masked this
 	// for HTTP-response/file-write nodes, which is why it went unnoticed.
 	if err := os.MkdirAll(scratchDir, 0o700); err != nil {
-		return nil, fmt.Errorf("runner: create scratch dir for execution %q: %w", execID, err)
+		// No Storage: do not fail the whole run. Workflows that need no temp
+		// files run as before; nodes that do need them report their own error.
+		log.Printf("runner: scratch dir for execution %q unavailable (%v) -- continuing without Storage", execID, err)
 	}
 
 	startAt := time.Now()
