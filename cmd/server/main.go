@@ -224,41 +224,16 @@ func main() {
 		"python3":  envOr("MICROFLOW_PYTHON_PATH", "/usr/bin/python3"),
 	}
 
-	// Env vars the workflow's Code nodes are allowed to read via $env
-	// (security rule 11/22: never expose the whole process environment,
-	// only names an operator has explicitly opted in). The original six
-	// are what the sample workflow's Code nodes actually reference (AI
-	// provider keys for the multi-model fallback chain, the YouTube
-	// Data API key, the app's referer URL for API calls that require
-	// one, the failure-notification webhook, and the Google Sheets
-	// URL used by Code nodes instead of a hardcoded Spreadsheet ID).
-	// The rest are additional AI-provider/API credentials an operator
-	// may opt a workflow into (Together, Fireworks, SambaNova,
-	// DeepInfra, Hugging Face, Groq, Cerebras, Cloudflare) -- none of
-	// these are referenced by the sample workflow itself.
-	codeEnvAllowlist := []string{
-		"OPENROUTER_API_KEY",
-		"GEMINI_API_KEY",
-		"YOUTUBE_DATA_API_KEY",
-		"APP_REFERER_URL",
-		"NOTIFY_WEBHOOK_URL",
-		"GOOGLE_SHEETS_URL",
-		"GOOGLE_SHEET_ID",
-		"YOUTUBE_CATEGORY_ID",
-		"TOGETHER_API_KEY",
-		"FIREWORKS_API_KEY",
-		"SAMBANOVA_API_KEY",
-		"DEEPINFRA_API_KEY",
-		"HF_TOKEN",
-		"GROQ_API_KEY",
-		"CEREBRAS_API_KEY",
-		"CLOUDFLARE_API_TOKEN",
-		"CLOUDFLARE_ACCOUNT_ID",
-		// Image generator (Generate Scene Image): free-tier attestations and optional keys.
-		"CLOUDFLARE_FREE_TIER_CONFIRMED",
-		"HF_FREE_TIER_CONFIRMED",
-		"AI_HORDE_API_KEY",
-		"POLLINATIONS_API_KEY",
+	// Code nodes may read ALL environment variables via $env (no hardcoded
+	// allow list): every variable name present in the process environment
+	// at startup is allowed. Variables stored in the dashboard's Global /
+	// Service Environment are already exposed automatically by
+	// CodeExecutor.envAllowlist, so they need no entry here.
+	codeEnvAllowlist := []string{}
+	for _, kv := range os.Environ() {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			codeEnvAllowlist = append(codeEnvAllowlist, kv[:i])
+		}
 	}
 
 	// MaxIdleConnsPerHost/MaxIdleConns kept small on purpose: this
