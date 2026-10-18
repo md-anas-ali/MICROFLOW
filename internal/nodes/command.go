@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -83,6 +84,13 @@ func (e *ExecuteCommandExecutor) Execute(ctx context.Context, rc *engine.RunCont
 	timeout := e.Timeout
 	if timeout == 0 {
 		timeout = 5 * time.Minute
+	}
+	// Optional per-node override: parameters.timeoutSeconds (1..maxNodeTimeoutSeconds).
+	// Without it nothing changes (5 min default). A step that legitimately waits on
+	// slow free services (e.g. the image generator polling a public queue) can ask
+	// for more time without raising the limit for every other command in the flow.
+	if d, ok := nodeTimeoutOverride(node); ok {
+		timeout = d
 	}
 
 	var out []model.Item
@@ -253,4 +261,41 @@ func tailString(s string, n int) string {
 		t = t[1:]
 	}
 	return "..." + t
+}
+
+// maxNodeTimeoutSeconds caps parameters.timeoutSeconds so a typo can never leave
+// a child process running for hours.
+const maxNodeTimeoutSeconds = 1800
+
+// nodeTimeoutOverride reads parameters.timeoutSeconds (number or numeric string).
+// Invalid, zero or negative values are ignored (the default timeout stays).
+func nodeTimeoutOverride(node *model.Node) (time.Duration, bool) {
+	v, ok := node.Parameters["timeoutSeconds"]
+	if !ok {
+		return 0, false
+	}
+	var sec float64
+	switch x := v.(type) {
+	case float64:
+		sec = x
+	case int:
+		sec = float64(x)
+	case int64:
+		sec = float64(x)
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0, false
+		}
+		sec = f
+	default:
+		return 0, false
+	}
+	if sec < 1 {
+		return 0, false
+	}
+	if sec > maxNodeTimeoutSeconds {
+		sec = maxNodeTimeoutSeconds
+	}
+	return time.Duration(sec * float64(time.Second)), true
 }
