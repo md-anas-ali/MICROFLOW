@@ -1,3 +1,11 @@
+# MicroFlow — Local Qwen3 1.7B model (Settings → Model)
+
+New optional local model manager; see LOCALMODEL.md. New: internal/localmodel/, internal/api/localmodel.go,
+internal/nodes/localmodel_hook.go. Small edits: internal/nodes/{http,registry,control}.go, internal/api/server.go,
+cmd/server/main.go, cmd/server/static/{index.html,app.js,app.css}. Off by default; with it off nothing changes.
+
+---
+
 # Changes
 
 ## Storage-if-available RAM reduction
