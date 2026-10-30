@@ -148,6 +148,9 @@ type Server struct {
 	// refused (fail closed), never silently allowed.
 	reauth ReauthFunc
 
+	// localModel backs /api/local-model/* (see WithLocalModel); nil-safe.
+	localModel LocalModelController
+
 	// dbBackup/dbReload back GET /api/database/export and
 	// POST /api/database/import (see WithDatabaseBackup); nil-safe.
 	dbBackup DatabaseBackupStore
