@@ -106,7 +106,13 @@ func loadYTAConfig(rc *engine.RunContext) ytaConfig {
 		EvalDays:  ytaEnvInt(rc, "MICROFLOW_YTA_EVAL_DAYS", 7, 2, 60),
 		MaxDays:   ytaEnvInt(rc, "MICROFLOW_YTA_EXPERIMENT_MAX_DAYS", 45, 14, 180),
 	}
-	c.Evo.Allow, c.UnknownAllowed = yta.ParseAllow(rc.Env("MICROFLOW_YTA_EVOLVE_ALLOW"))
+	// Default: every evolvable content setting is allowed when the variable is not
+	// set at all. Setting it to an empty string keeps recommend-only mode.
+	allowRaw, allowSet := rc.LookupEnv("MICROFLOW_YTA_EVOLVE_ALLOW")
+	if !allowSet {
+		allowRaw = "hook_style,title_style,pacing"
+	}
+	c.Evo.Allow, c.UnknownAllowed = yta.ParseAllow(allowRaw)
 	c.ResearchEvery = time.Duration(ytaEnvInt(rc, "MICROFLOW_YTA_RESEARCH_HOURS", 24, 1, 168)) * time.Hour
 	c.MarketSignals = ytaQualityEnvBool(rc, "MICROFLOW_YTA_MARKET_SIGNALS", true)
 	c.TopicWeights = ytaQualityEnvBool(rc, "MICROFLOW_YTA_TOPIC_WEIGHTS", true)
