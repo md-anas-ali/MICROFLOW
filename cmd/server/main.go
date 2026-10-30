@@ -36,6 +36,7 @@ import (
 	"microflow/internal/api"
 	"microflow/internal/autoopt"
 	"microflow/internal/engine"
+	"microflow/internal/localmodel"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
 	"microflow/internal/runall"
@@ -260,7 +261,14 @@ func main() {
 		},
 	}
 
+	// Optional local Qwen3 1.7B (Settings -> Model). Lives on THIS machine only
+	// (refused on Render); AI requests try it first when enabled+running and
+	// otherwise use the existing free providers untouched.
+	localModel := localmodel.New(os.Getenv("MICROFLOW_LOCAL_MODEL_DIR"), log.Printf)
+	go localModel.Resume()
+
 	registry := nodes.DefaultRegistry(nodes.Deps{
+		LocalModel:      localModel,
 		HTTPClient:      nodeHTTPClient,
 		AllowedBinaries: allowedBinaries,
 		EnvAllowlist:    codeEnvAllowlist,
@@ -571,7 +579,7 @@ func main() {
 	// satisfies api.ExecutionLoader (GetExecution) -- the durable
 	// fallback for GET /api/executions/{id} once execManager evicts a
 	// finished execution from memory.
-	apiServer := api.New(st, run, st, baseVault, accountVault).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword).
+	apiServer := api.New(st, run, st, baseVault, accountVault).WithLocalModel(localModel).WithAsync(execManager, st).WithTenancy(st, envVault, runAllManager).WithReauth(gate.verifyPassword).
 		WithRunAllSchedules(st, func(rows []store.RunAllScheduleRow) {
 			sch.ReplaceRunAll(runAllSchedulesToScheduler(rows))
 			log.Printf("run-all schedule sync: %d schedule(s) registered", len(rows))
@@ -720,6 +728,7 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	localModel.Shutdown() // stop the local model process so no llama-server is left behind
 	shutdownManagerCtx, cancelManager := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelManager()
 	if err := execManager.Shutdown(shutdownManagerCtx); err != nil {
