@@ -168,9 +168,11 @@ func envInt(name string, def, min, max int) int {
 	return def
 }
 
-// ContextSize is the model context window (tokens). 4096 keeps the KV cache
-// around 0.45 GB; raise with MICROFLOW_QWEN_CTX if you have RAM to spare.
-func ContextSize() int { return envInt("MICROFLOW_QWEN_CTX", 4096, 1024, 32768) }
+// ContextSize is the model context window (tokens). The default 16384 lets the
+// Script Writer prompt (about 6.4k tokens) plus its 5000-token answer fit; the KV
+// cache then needs roughly 1.9 GB. Lower it with MICROFLOW_QWEN_CTX on small
+// machines (4096 needs about 0.45 GB but is too small for the Script Writer).
+func ContextSize() int { return envInt("MICROFLOW_QWEN_CTX", 16384, 1024, 32768) }
 
 // Threads defaults to half the cores (max 4) so the rest of MicroFlow keeps CPU.
 func Threads() int {
