@@ -28,6 +28,9 @@ type Deps struct {
 	// OAuth isn't configured on this server, so those nodes only work via
 	// an explicit per-node CredentialResolver override.
 	GoogleAccounts GoogleAccountResolver
+	// LocalModel is the optional local Qwen3 1.7B runtime (nil = off). See
+	// localmodel_hook.go.
+	LocalModel LocalModel
 }
 
 // PassThroughExecutor is used for trigger nodes (the scheduler/webhook/

@@ -45,6 +45,12 @@ type HTTPRequestExecutor struct {
 	// nil falls back to always fetching (used by tests/other callers
 	// that don't wire one).
 	modelListCache *getResponseCache
+
+	// Local, when set (see Deps.LocalModel), lets an AI request run on the
+	// optional local Qwen3 model first; see localmodel_hook.go. Nil = off,
+	// every request behaves exactly as before.
+	Local      LocalModel
+	localTrack localTracker
 }
 
 const maxResponseBytes = 25 * 1024 * 1024 // 25MB cap so one response can't blow the 512MB budget
@@ -134,6 +140,7 @@ func (e *HTTPRequestExecutor) ResetCaches() {
 		return
 	}
 	e.modelListCache.clear()
+	e.localTrack.reset()
 }
 
 func (c *getResponseCache) set(url string, value map[string]any) {
@@ -216,12 +223,24 @@ func (e *HTTPRequestExecutor) Execute(ctx context.Context, rc *engine.RunContext
 		}
 
 		var body io.Reader
+		var resolvedBodyStr string
 		if bodyTmpl, ok := node.Parameters["body"].(string); ok && bodyTmpl != "" {
 			resolvedBody, err := expr.Eval(bodyTmpl, exprCtx)
 			if err != nil {
 				return nil, err
 			}
+			resolvedBodyStr = resolvedBody
 			body = strings.NewReader(resolvedBody)
+		}
+
+		// Optional local Qwen3 first (see localmodel_hook.go). Any reason it
+		// cannot or should not answer falls straight through to the normal
+		// provider request below, unchanged.
+		if method == "POST" && e.Local != nil {
+			if res, ok := e.tryLocal(ctx, rc, node, resolvedURL, resolvedBodyStr); ok {
+				out = append(out, model.Item{JSON: res})
+				continue
+			}
 		}
 
 		// rate-limit heavy outbound calls to MaxConcurrentHeavy (rule 19/20),
