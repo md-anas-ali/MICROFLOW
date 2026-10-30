@@ -207,6 +207,7 @@
     if (executionsMonitorES) { executionsMonitorES.close(); executionsMonitorES = null; }
     if (executionDetailES) { executionDetailES.close(); executionDetailES = null; }
     if (executionsMonitorTimer) { clearInterval(executionsMonitorTimer); executionsMonitorTimer = null; }
+    if (modelPageTimer) { clearInterval(modelPageTimer); modelPageTimer = null; }
   }
 
   async function route() {
@@ -242,6 +243,9 @@
       } else if (p0 === "database") {
         setPageNav("#/dashboard", "Home");
         renderDatabasePage();
+      } else if (p0 === "model") {
+        setPageNav("#/dashboard", "Home");
+        await renderModelPage();
       } else {
         setPageNav("#/dashboard", "Home");
         viewEl.innerHTML = emptyState("Not found", "That page doesn't exist.");
@@ -709,6 +713,92 @@
         btn.textContent = "Import";
       }
     });
+  }
+
+
+  // ---------------- Settings -> Model (local Qwen3 1.7B) ----------------
+  // Talks to /api/local-model/*. The model runs on the computer MicroFlow runs
+  // on (never on Render). While it is enabled AND running, AI requests try it
+  // first; otherwise (or on any failure) the existing free providers answer.
+  let modelPageTimer = null;
+  function fmtBytes(n) {
+    if (!n) return "0 MB";
+    return n >= 1073741824 ? (n / 1073741824).toFixed(2) + " GB" : (n / 1048576).toFixed(0) + " MB";
+  }
+  async function renderModelPage() {
+    const row = (k, v) => '<div class="model-row"><span class="model-k">' + k + '</span><span class="model-v">' + v + "</span></div>";
+    const badge = (txt, cls) => '<span class="model-badge model-' + cls + '">' + escapeHtml(txt) + "</span>";
+    viewEl.innerHTML =
+      '<div class="narrow"><div class="page-head"><div><h1>\uD83E\uDD16 Model</h1>' +
+      '<div class="sub">Qwen3 1.7B \u2014 a small local model that runs on this computer. When it is enabled and running, AI requests try it first. ' +
+      "If it is stopped, disabled, busy or fails, your existing free AI providers are used automatically. No paid API is required.</div></div></div>" +
+      '<div id="modelBody" class="card">' + loadingRow("Loading model status\u2026") + "</div></div>";
+    const body = document.getElementById("modelBody");
+    let busy = false;
+
+    const draw = (st) => {
+      const stage = st.installing ? (st.installStage || "working") : "";
+      let pct = "";
+      if (st.installing && st.installTotalBytes > 0) pct = " \u00B7 " + Math.min(100, Math.floor((st.installDoneBytes / st.installTotalBytes) * 100)) + "% (" + fmtBytes(st.installDoneBytes) + " / " + fmtBytes(st.installTotalBytes) + ")";
+      const modelStatus = st.modelInstalled ? badge("Installed \u00B7 " + fmtBytes(st.modelBytes), "ok") : st.installing ? badge("Installing\u2026", "warn") : badge("Not installed", "off");
+      const rtStatus = st.runtimeInstalled ? badge("Installed" + (st.runtimeVersion ? " \u00B7 " + st.runtimeVersion : ""), "ok") : st.installing ? badge("Installing\u2026", "warn") : badge("Not installed", "off");
+      const procMap = { running: badge("Running", "ok"), starting: badge("Starting (loading model)\u2026", "warn"), stopping: badge("Stopping\u2026", "warn"), stopped: badge("Stopped", "off") };
+      let inUse;
+      if (st.available) inUse = badge("Yes \u2014 AI requests use Qwen3 first", "ok");
+      else if (!st.enabled) inUse = badge("No \u2014 disabled", "off");
+      else if (st.cooldownSeconds > 0) inUse = badge("Paused \u2014 recent failures, using fallback providers (" + st.cooldownSeconds + "s)", "warn");
+      else inUse = badge("No \u2014 not running, using fallback providers", "off");
+
+      let html = "";
+      if (!st.supported) html += '<div class="unsupported-box">' + escapeHtml(st.blockedReason || "Not supported on this host.") + "</div>";
+      html += row("Model (Qwen3 1.7B)", modelStatus) + row("Runtime (llama.cpp)", rtStatus) +
+        row("Process", procMap[st.process] || escapeHtml(st.process)) +
+        row("Enabled", st.enabled ? badge("Enabled", "ok") : badge("Disabled", "off")) +
+        row("Used for AI requests", inUse);
+      if (st.installing) html += '<div class="model-progress"><span class="spinner"></span> ' + escapeHtml(stage) + escapeHtml(pct) + "</div>";
+      if (st.installError) html += '<div class="unsupported-box">Install problem: ' + escapeHtml(st.installError) + "</div>";
+      if (st.lastError) html += '<div class="unsupported-box">' + escapeHtml(st.lastError) + "</div>";
+      html += '<div class="sub" style="margin:10px 0;">Resources: context ' + st.contextSize + " tokens, " + st.threads + " CPU thread(s), runs at low CPU priority. Roughly 2\u20133 GB RAM while running; nothing is used while stopped.</div>";
+
+      const canInstall = st.supported && !st.installed && !st.installing;
+      const canStart = st.supported && st.installed && !st.installing && st.process === "stopped";
+      const canStop = st.process === "running" || st.process === "starting";
+      html += '<div class="model-actions">' +
+        (st.installing
+          ? '<button class="btn" data-act="cancel-install">Cancel install</button>'
+          : st.installed
+            ? '<button class="btn btn-danger" data-act="uninstall">Uninstall</button>'
+            : '<button class="btn btn-primary" data-act="install"' + (canInstall ? "" : " disabled") + ">Install</button>") +
+        (canStop ? '<button class="btn" data-act="stop">Stop</button>' : '<button class="btn btn-primary" data-act="start"' + (canStart ? "" : " disabled") + ">Start</button>") +
+        (st.enabled ? '<button class="btn" data-act="disable">Disable</button>' : '<button class="btn btn-primary" data-act="enable"' + (st.installed ? "" : " disabled") + ">Enable</button>") +
+        "</div>";
+      body.innerHTML = html;
+      body.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => act(b.getAttribute("data-act"))));
+    };
+
+    const refresh = async () => {
+      if (busy) return null;
+      if (location.hash.replace(/^#\/?/, "").split("/")[0] !== "model") { clearInterval(modelPageTimer); modelPageTimer = null; return null; }
+      try { const st = await apiJSON("/api/local-model/status"); draw(st); return st; } catch (e) { body.innerHTML = emptyState("Could not load model status", escapeHtml(e.message || String(e))); return null; }
+    };
+    const act = async (a) => {
+      if (a === "uninstall" && !confirm("Uninstall Qwen3 1.7B? This deletes the downloaded runtime and model (about 2 GB) from this computer. AI requests keep working through your free providers.")) return;
+      busy = true;
+      body.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      try {
+        const st = await apiJSON("/api/local-model/" + a, { method: "POST" });
+        busy = false;
+        draw(st);
+        if (a === "install") toast("Install started \u2014 downloading runtime and model\u2026");
+      } catch (e) {
+        busy = false;
+        toast(e.message || String(e), "error");
+        await refresh();
+      }
+    };
+    clearInterval(modelPageTimer);
+    await refresh();
+    modelPageTimer = setInterval(refresh, 1500);
   }
 
   // ---------------- Database: Export / Import ----------------
