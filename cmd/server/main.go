@@ -36,6 +36,7 @@ import (
 	"microflow/internal/api"
 	"microflow/internal/autoopt"
 	"microflow/internal/engine"
+	"microflow/internal/httpx"
 	"microflow/internal/localmodel"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
@@ -718,7 +719,7 @@ func main() {
 	mux.Handle("/webhook/", whServer.Handler())
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: gate.Wrap(mux), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 15 * time.Minute, WriteTimeout: 35 * time.Minute}
+	srv := &http.Server{Addr: addr, Handler: httpx.Gzip(gate.Wrap(mux)), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 15 * time.Minute, WriteTimeout: 35 * time.Minute}
 
 	go func() {
 		log.Printf("MicroFlow listening on %s", addr)
