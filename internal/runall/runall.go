@@ -98,6 +98,14 @@ func NewManager(st Store, run WorkflowRunner) *Manager {
 	return &Manager{store: st, run: run}
 }
 
+// IsActive reports whether this process is currently running a sweep. The
+// stale-job reaper uses it so it never closes a sweep this process owns.
+func (m *Manager) IsActive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.active
+}
+
 // Resume is called once at server startup: if a sweep was left
 // queued/running when the process last stopped, it picks back up from
 // the last persisted step instead of losing the queue (rule 17).
