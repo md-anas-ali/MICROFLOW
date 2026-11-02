@@ -474,7 +474,7 @@ runLoop:
 		var out model.NodeOutput
 		var nodeErr error
 		for a := 1; a <= maxNodeTries(node); a++ {
-			out, nodeErr = exec.Execute(ctx, rc, node, item.Input)
+			out, nodeErr = safeExecute(ctx, exec, rc, node, item.Input)
 			if nodeErr == nil {
 				break
 			}
@@ -482,7 +482,14 @@ runLoop:
 				break
 			}
 			if a < maxNodeTries(node) {
-				time.Sleep(retryBackoff(node.WaitBetweenTriesMs, a))
+				// Context-aware: a Cancel()/timeout must not wait out the backoff.
+				select {
+				case <-ctx.Done():
+				case <-time.After(retryBackoff(node.WaitBetweenTriesMs, a)):
+				}
+				if ctx.Err() != nil {
+					break
+				}
 			}
 		}
 		duration := time.Since(started)
