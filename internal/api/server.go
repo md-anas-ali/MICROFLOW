@@ -854,8 +854,10 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 				default:
 					// Not in the Manager. If the Runner still has it live (a scheduler/webhook
 					// run), it really is running: leave it alone.
-					if s.run != nil && s.run.IsExecutionLive(execID) {
-						writeErr(w, http.StatusConflict, errors.New("execution is no longer live on this server and cannot be cancelled"))
+					if s.run != nil && s.run.CancelLiveExecution(execID) {
+						// Scheduler/webhook run: not tracked by the Manager, but this
+						// process IS running it, so cancel its context directly.
+						writeJSON(w, http.StatusOK, map[string]string{"status": "cancelling"})
 						return
 					}
 					// Nothing in this process runs it (e.g. it survived a restart): sync the
