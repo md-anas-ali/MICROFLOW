@@ -3,7 +3,7 @@ module microflow
 go 1.22
 
 // VERIFIED: `go build ./...`, `go vet ./...`, and `go test ./... -race` all
-// pass in-sandbox against these exact resolved versions (see STATUS.md).
+// pass in-sandbox against these exact resolved versions (see STATUS.md); golang.org/x/* now at crypto v0.31.0, net v0.33.0, sys v0.28.0, text v0.21.0, sync v0.10.0, term v0.27.0.
 // The golang.org/x/* replaces point at official GitHub mirrors, and the
 // gopkg.in/yaml.v2, yaml.v3, check.v1, errgo.v2 replaces point at
 // ./third_party (real upstream source, vendored here because this sandbox's
@@ -24,20 +24,20 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
-	golang.org/x/crypto v0.17.0 // indirect
-	golang.org/x/sync v0.5.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/crypto v0.31.0 // indirect
+	golang.org/x/sync v0.10.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
 )
 
-replace golang.org/x/text => github.com/golang/text v0.14.0
+replace golang.org/x/text => github.com/golang/text v0.21.0
 
-replace golang.org/x/crypto => github.com/golang/crypto v0.17.0
+replace golang.org/x/crypto => github.com/golang/crypto v0.31.0
 
-replace golang.org/x/sync => github.com/golang/sync v0.1.0
+replace golang.org/x/sync => github.com/golang/sync v0.10.0
 
-replace golang.org/x/sys => github.com/golang/sys v0.15.0
+replace golang.org/x/sys => github.com/golang/sys v0.28.0
 
-replace golang.org/x/net => github.com/golang/net v0.17.0
+replace golang.org/x/net => github.com/golang/net v0.33.0
 
 replace golang.org/x/mod => github.com/golang/mod v0.14.0
 
@@ -51,4 +51,4 @@ replace gopkg.in/check.v1 => ./third_party/gopkg.in_check.v1
 
 replace gopkg.in/errgo.v2 => ./third_party/gopkg.in_errgo.v2
 
-replace golang.org/x/term => github.com/golang/term v0.13.0
+replace golang.org/x/term => github.com/golang/term v0.27.0

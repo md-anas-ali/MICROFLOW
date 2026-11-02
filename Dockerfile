@@ -57,7 +57,7 @@
 # aiohttp cover glibc too, so this swap doesn't reintroduce a compiler
 # requirement).
 
-FROM golang:1.22-alpine AS build
+FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY . .
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
@@ -73,7 +73,7 @@ RUN go build -ldflags="-s -w" -o /out/microflow-server ./cmd/server
 # imports. --target installs into a plain directory (not a venv), so
 # the final stage only needs to COPY that directory and set PYTHONPATH
 # -- no pip/setuptools/wheel need to exist in the runtime image at all.
-FROM python:3.11-alpine3.19 AS pytts
+FROM python:3.11-alpine3.22 AS pytts
 RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
       --target=/pytts-deps "edge-tts==7.3.1" "aiohttp==3.14.3" \
  && find /pytts-deps -name "*.dist-info" -type d -exec rm -rf {} + \
@@ -83,7 +83,7 @@ RUN pip install --no-cache-dir --no-compile --only-binary=:all: \
  # from this deployment's CLI-only usage -- drop it, it's dead weight.
  && rm -rf /pytts-deps/edge_playback
 
-FROM alpine:3.19
+FROM alpine:3.22
 
 # fontconfig + ttf-dejavu: ফন্ট না থাকলে ffmpeg subtitles আঁকে না, অথচ error-ও দেয় না
 RUN apk add --no-cache ffmpeg python3 ca-certificates bash fontconfig ttf-dejavu
