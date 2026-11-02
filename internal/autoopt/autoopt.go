@@ -42,18 +42,18 @@ import (
 type Phase int
 
 const (
-	PhaseStopNewWork       Phase = iota + 1 // 1. refuse new tracked work
-	PhaseCancelBackground                   // 2. cancel Service-owned background tasks
-	PhaseWaitGraceful                       // 3. give tracked processes a moment to end on their own
-	PhaseTerminateProcs                     // 4. terminate leftover child processes (TERM -> KILL)
-	PhaseCloseHTTPBodies                    // 5. close unclosed HTTP response bodies
-	PhaseReleaseHTTP                        // 6. release HTTP client/session resources
-	PhaseReleaseSockets                     // 7. release sockets/streams
-	PhaseTimersListeners                    // 8. stop timers/listeners
-	PhaseTempResources                      // 9. remove Service-owned temp paths
-	PhaseReleaseMemory                      // 10. drop large temporary references
-	PhaseRuntimeCleanup                     // 11. runtime cleanup / GC (global steps)
-	PhaseVerify                             // 12. verify
+	PhaseStopNewWork      Phase = iota + 1 // 1. refuse new tracked work
+	PhaseCancelBackground                  // 2. cancel Service-owned background tasks
+	PhaseWaitGraceful                      // 3. give tracked processes a moment to end on their own
+	PhaseTerminateProcs                    // 4. terminate leftover child processes (TERM -> KILL)
+	PhaseCloseHTTPBodies                   // 5. close unclosed HTTP response bodies
+	PhaseReleaseHTTP                       // 6. release HTTP client/session resources
+	PhaseReleaseSockets                    // 7. release sockets/streams
+	PhaseTimersListeners                   // 8. stop timers/listeners
+	PhaseTempResources                     // 9. remove Service-owned temp paths
+	PhaseReleaseMemory                     // 10. drop large temporary references
+	PhaseRuntimeCleanup                    // 11. runtime cleanup / GC (global steps)
+	PhaseVerify                            // 12. verify
 )
 
 func (p Phase) String() string {
