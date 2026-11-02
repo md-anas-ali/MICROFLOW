@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -268,6 +270,16 @@ func (m *Manager) runSweep(ctx context.Context, jobID string, serviceIDs []strin
 	finalStatus := "success"
 	var jobErr string
 
+	// A panic anywhere below must not take the whole server down; keep the
+	// progress recorded so far and mark the sweep as failed.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("runall: sweep %s panicked: %v", jobID, r)
+			jobErr = fmt.Sprintf("internal panic: %v", r)
+			persist("error", jobErr)
+		}
+	}()
+
 outer:
 	for _, svcID := range serviceIDs {
 		if ctx.Err() != nil {
@@ -306,7 +318,7 @@ outer:
 				continue
 			}
 			seed := model.NodeOutput{{{JSON: map[string]any{}}}}
-			ex, runErr := m.run.RunFromNode(ctx, wf.ID, start, "run-all", seed)
+			ex, runErr := m.runWaitingForActive(ctx, wf.ID, start, seed)
 			if ex != nil {
 				step.ExecutionID = ex.ID
 			}
@@ -371,4 +383,40 @@ func newID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "runall-" + hex.EncodeToString(b)
+}
+
+// dupWaitMax bounds how long a Run All step waits for a workflow that is
+// already queued/running (e.g. a run resumed after a restart, or an
+// overlapping schedule) before it gives up and records the step as skipped.
+// Override with MICROFLOW_RUNALL_DUP_WAIT_SECONDS (0 = skip immediately).
+var dupPollInterval = 5 * time.Second
+
+func dupWaitMax() time.Duration {
+	if v := os.Getenv("MICROFLOW_RUNALL_DUP_WAIT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 45 * time.Minute
+}
+
+// runWaitingForActive starts the workflow, but if it is already queued or
+// running it waits (polling) until that run finishes and then starts this
+// Service's run, instead of silently dropping the Service. ErrAlreadyQueued
+// is returned before any execution state exists, so retrying is safe and can
+// never create a duplicate run.
+func (m *Manager) runWaitingForActive(ctx context.Context, workflowID, start string, seed model.NodeOutput) (*model.Execution, error) {
+	deadline := time.Now().Add(dupWaitMax())
+	for {
+		ex, err := m.run.RunFromNode(ctx, workflowID, start, "run-all", seed)
+		dup := err != nil && (errors.Is(err, scheduler.ErrDuplicate) || errors.Is(err, runner.ErrAlreadyQueued))
+		if !dup || time.Now().After(deadline) {
+			return ex, err
+		}
+		select {
+		case <-ctx.Done():
+			return ex, ctx.Err()
+		case <-time.After(dupPollInterval):
+		}
+	}
 }
