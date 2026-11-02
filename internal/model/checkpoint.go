@@ -87,7 +87,11 @@ func decompressCheckpointJSON(s checkpointCompressedField, dst any) error {
 		if err != nil {
 			return err
 		}
-		raw, err := io.ReadAll(r)
+		const maxCheckpointInflate = 128 << 20 // guards against a corrupt/gzip-bomb row exhausting RAM
+		raw, err := io.ReadAll(io.LimitReader(r, maxCheckpointInflate+1))
+		if err == nil && len(raw) > maxCheckpointInflate {
+			err = ErrCheckpointTooLarge
+		}
 		closeErr := r.Close()
 		if err != nil {
 			return err
