@@ -89,6 +89,27 @@ func main() {
 	}
 	defer st.Close()
 
+	// One server per database. Must come BEFORE the schema step and the
+	// startup stale-execution sweep below: that sweep closes every
+	// queued/running row it finds, which is only correct if no other server
+	// is alive. A second copy started by mistake now stops here instead of
+	// cancelling the first copy's live runs.
+	if singleInstanceEnabled() {
+		wait := time.Duration(envInt("MICROFLOW_INSTANCE_LOCK_WAIT_SECONDS", 20)) * time.Second
+		lock, lockErr := st.AcquireInstanceLock(ctx, wait)
+		if lockErr != nil {
+			if errors.Is(lockErr, store.ErrAnotherInstance) {
+				log.Fatalf("refusing to start: %v. Stop the other MicroFlow window/process first (or set MICROFLOW_SINGLE_INSTANCE=0 to disable this check).", lockErr)
+			}
+			log.Fatalf("single-instance check failed: %v", lockErr)
+		}
+		defer lock.Close()
+		lock.Watch(ctx, 15*time.Second, func(err error) {
+			log.Printf("another MicroFlow server took over this database (%v); shutting this one down", err)
+			stop()
+		})
+	}
+
 	schemaBytes, err := os.ReadFile("internal/store/schema.sql")
 	if err == nil {
 		if err := st.ApplySchema(ctx, string(schemaBytes)); err != nil {
@@ -544,6 +565,41 @@ func main() {
 	// restart from its last persisted step (no duplicate re-runs).
 	runAllManager := runall.NewManager(st, queuedRunner{sch: sch, run: run})
 	runAllManager.Resume(ctx)
+
+	// Periodic cleanup of "Running" rows that nothing is running any more
+	// (the startup sweep only covers rows left by a previous process). Only
+	// safe because of the single-instance lock above, so it is skipped when
+	// that guard is turned off.
+	if singleInstanceEnabled() {
+		reapEvery := time.Duration(envInt("MICROFLOW_STALE_REAP_INTERVAL_SECONDS", 300)) * time.Second
+		if reapEvery < 30*time.Second {
+			reapEvery = 30 * time.Second
+		}
+		reapGrace := time.Duration(envInt("MICROFLOW_STALE_EXEC_GRACE_SECONDS", 180)) * time.Second
+		if reapGrace < 60*time.Second {
+			reapGrace = 60 * time.Second
+		}
+		runner.StartStaleReaper(ctx, st,
+			func(id string) bool {
+				if run.IsExecutionLive(id) {
+					return true
+				}
+				_, queued := execManager.Get(id)
+				return queued
+			},
+			func(rctx context.Context) {
+				if runAllManager.IsActive() {
+					return
+				}
+				n, err := st.FailStaleRunAllJobs(rctx, time.Now().Add(-10*time.Minute))
+				if err != nil {
+					log.Printf("reaper: stale Run-All check failed: %v", err)
+				} else if n > 0 {
+					log.Printf("reaper: closed %d stale Run-All sweep(s)", n)
+				}
+			},
+			reapEvery, reapGrace)
+	}
 
 	// Run All Services Schedule: the ONE global scheduler above also
 	// drives this -- when a due Run All Services schedule fires, it
