@@ -118,7 +118,7 @@ type Runner struct {
 	// have a non-terminal executions row and no checkpoint lease) and would
 	// resume or fail-and-delete an execution that is still running.
 	liveExecMu sync.Mutex
-	liveExecs  map[string]struct{}
+	liveExecs  map[string]context.CancelFunc
 
 	// scratchWG counts scratch-directory removals still in flight (they are
 	// deleted in the background so a run's result is never delayed), so the
@@ -133,12 +133,12 @@ type Runner struct {
 	tmpBaseline map[string]struct{}
 }
 
-func (r *Runner) markExecutionLive(execID string) {
+func (r *Runner) markExecutionLive(execID string, cancel context.CancelFunc) {
 	r.liveExecMu.Lock()
 	if r.liveExecs == nil {
-		r.liveExecs = map[string]struct{}{}
+		r.liveExecs = map[string]context.CancelFunc{}
 	}
-	r.liveExecs[execID] = struct{}{}
+	r.liveExecs[execID] = cancel
 	r.liveExecMu.Unlock()
 }
 
@@ -155,6 +155,25 @@ func (r *Runner) IsExecutionLive(execID string) bool {
 	_, ok := r.liveExecs[execID]
 	r.liveExecMu.Unlock()
 	return ok
+}
+
+// CancelLiveExecution cancels an execution that this process is running
+// right now, whatever started it (async Manager, scheduler, webhook).
+// Scheduler/webhook runs are not tracked by the async Manager, so without
+// this the Cancel button could never stop them and returned a 409
+// ("no longer live on this server and cannot be cancelled"). Returns false
+// if this process is not running execID.
+func (r *Runner) CancelLiveExecution(execID string) bool {
+	r.liveExecMu.Lock()
+	cancel, ok := r.liveExecs[execID]
+	r.liveExecMu.Unlock()
+	if !ok {
+		return false
+	}
+	if cancel != nil {
+		cancel()
+	}
+	return true
 }
 
 // markActive/unmarkActive/IsWorkflowActive back IsWorkflowActive; see
@@ -351,7 +370,9 @@ func (r *Runner) runOnce(ctx context.Context, wf *model.Workflow, execID, startN
 	// Registered before the execution row/first checkpoint exist and released
 	// only after the terminal cleanup below, so the recovery loop can never
 	// treat this still-running execution as an orphan (see liveExecs).
-	r.markExecutionLive(execID)
+	ctx, cancelLive := context.WithCancel(ctx)
+	defer cancelLive()
+	r.markExecutionLive(execID, cancelLive)
 	defer r.unmarkExecutionLive(execID)
 
 	// Auto Optimize: this execution's ownership record. The deferred Release is
