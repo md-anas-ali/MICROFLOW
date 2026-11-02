@@ -100,9 +100,9 @@ func TestPubQueue_ReconcileExisting(t *testing.T) {
 		{ID: "A", PublishAt: dk(2, 22, 0)},
 		{ID: "B", PublishAt: dk(2, 21, 13)}, // off-grid
 		{ID: "C", PublishAt: dk(3, 7, 0)},
-		{ID: "D", PublishAt: dk(3, 7, 0)},    // duplicate of C
-		{ID: "E", PublishAt: dk(3, 8, 30)},   // off-grid
-		{ID: "F", PublishAt: dk(3, 22, 0)},   // duplicate of G
+		{ID: "D", PublishAt: dk(3, 7, 0)},  // duplicate of C
+		{ID: "E", PublishAt: dk(3, 8, 30)}, // off-grid
+		{ID: "F", PublishAt: dk(3, 22, 0)}, // duplicate of G
 	}
 	r := reserveAt(t, &st, now, "new", snap)
 	want := map[string]time.Time{

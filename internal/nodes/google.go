@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"microflow/internal/engine"
 	"microflow/internal/expr"
@@ -399,7 +401,26 @@ func (e *GmailExecutor) Execute(ctx context.Context, rc *engine.RunContext, node
 
 // --- shared helpers ---
 
+// googleHTTP replaces http.DefaultClient (which has no timeouts at all) for
+// Google/YouTube calls. There is deliberately no overall Client.Timeout --
+// large video uploads legitimately take minutes -- but connection setup,
+// TLS and waiting for response headers are all bounded, so a stalled
+// connection can no longer hang a run until the whole workflow times out.
+var googleHTTP = &http.Client{Transport: &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 20 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	TLSHandshakeTimeout:   15 * time.Second,
+	ResponseHeaderTimeout: 3 * time.Minute,
+	MaxIdleConns:          4,
+	MaxIdleConnsPerHost:   2,
+	IdleConnTimeout:       20 * time.Second,
+	ForceAttemptHTTP2:     true,
+}}
+
 func googleAPICall(ctx context.Context, method, url, token string, body []byte, into any, operationID string) error {
+	// Plain JSON API calls are small: bound the whole call.
+	ctx, cancelCall := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancelCall()
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -413,7 +434,7 @@ func googleAPICall(ctx context.Context, method, url, token string, body []byte, 
 	if operationID != "" {
 		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := googleHTTP.Do(req)
 	if err != nil {
 		// Network-level failures (DNS, connection reset, timeout) are
 		// transient by nature -- let the node's own RetryOnFail/MaxTries
@@ -461,7 +482,7 @@ func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType, opera
 	if operationID != "" {
 		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := googleHTTP.Do(req)
 	if err != nil {
 		return err
 	}
@@ -513,7 +534,7 @@ func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string,
 		req.Header.Set("X-MicroFlow-Operation-ID", operationID)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := googleHTTP.Do(req)
 	if err != nil {
 		return "", err
 	}
