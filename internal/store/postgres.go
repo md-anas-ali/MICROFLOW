@@ -548,7 +548,7 @@ func (s *Store) MarkInterruptedExecutions(ctx context.Context) (int64, error) {
 // FinalizeStaleExecution marks ONE non-terminal execution that no process
 // is running any more as cancelled, and drops its checkpoint so crash
 // recovery can never resume it afterwards. The UPDATE is conditional on the
-// row still being queued/running/waiting with no finish time, so a run that
+// row still being queued/running/waiting, so a run that
 // finished in the meantime is left untouched (changed=false). It only ever
 // touches the row with this exact id.
 func (s *Store) FinalizeStaleExecution(ctx context.Context, executionID string) (bool, error) {
@@ -556,7 +556,7 @@ func (s *Store) FinalizeStaleExecution(ctx context.Context, executionID string) 
 		UPDATE executions
 		SET status='cancelled', finished_at=COALESCE(finished_at, now()),
 			error=CASE WHEN error IS NULL OR error='' THEN 'execution cancelled: it was no longer running on this server' ELSE error END
-		WHERE id=$1 AND status IN ('queued', 'running', 'waiting') AND finished_at IS NULL
+		WHERE id=$1 AND status IN ('queued', 'running', 'waiting')
 	`, executionID)
 	if err != nil {
 		return false, err
