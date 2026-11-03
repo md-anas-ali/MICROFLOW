@@ -98,7 +98,10 @@ func (s *Server) handleDatabaseExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(b); err != nil {
+	// No HTML escaping: the file must hold the table text as exported.
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(b); err != nil {
 		log.Printf("database export: write failed: %v", err)
 		return
 	}
