@@ -166,8 +166,9 @@ type Backup struct {
 	ExportedAt time.Time         `json:"exportedAt"`
 	Counts     map[string]int    `json:"counts"`
 	Encryption *BackupEncryption `json:"encryption"`
-	Checksum   string            `json:"checksum"` // hex sha256 of the compacted "tables" JSON
-	MAC        string            `json:"mac"`      // hex HMAC-SHA256 (backup key) of the same bytes
+	Canonical  string            `json:"canonical,omitempty"` // canonical form of "tables" that Checksum/MAC cover ("" = legacy, "c2"); see backup_canon.go
+	Checksum   string            `json:"checksum"`            // hex sha256 of the canonical "tables" JSON
+	MAC        string            `json:"mac"`                 // hex HMAC-SHA256 (backup key) of the same bytes
 	Tables     json.RawMessage   `json:"tables"`
 }
 
@@ -221,13 +222,13 @@ func (bc *backupCrypto) open(ct, aad []byte) ([]byte, error) {
 	return bc.aead.Open(nil, ct[:ns], ct[ns:], aad)
 }
 
-func (bc *backupCrypto) mac(tablesJSON []byte) (string, error) {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, tablesJSON); err != nil {
+func (bc *backupCrypto) mac(tablesJSON []byte, mode string) (string, error) {
+	canon, err := canonicalize(tablesJSON, mode)
+	if err != nil {
 		return "", err
 	}
 	m := hmac.New(sha256.New, bc.macKey)
-	m.Write(buf.Bytes())
+	m.Write(canon)
 	return hex.EncodeToString(m.Sum(nil)), nil
 }
 
@@ -291,12 +292,12 @@ func rekeyRows(t backupTable, arr []byte, fn func(row map[string]json.RawMessage
 	return json.Marshal(rows)
 }
 
-func checksumOf(tablesJSON []byte) (string, error) {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, tablesJSON); err != nil {
+func checksumOf(tablesJSON []byte, mode string) (string, error) {
+	canon, err := canonicalize(tablesJSON, mode)
+	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(buf.Bytes())
+	sum := sha256.Sum256(canon)
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -372,11 +373,11 @@ func (s *Store) ExportBackup(ctx context.Context, open func(ciphertext []byte) (
 	buf.WriteByte('}')
 
 	tables := json.RawMessage(buf.Bytes())
-	sum, err := checksumOf(tables)
+	sum, err := checksumOf(tables, canonV2)
 	if err != nil {
 		return nil, err
 	}
-	mac, err := bc.mac(tables)
+	mac, err := bc.mac(tables, canonV2)
 	if err != nil {
 		return nil, err
 	}
@@ -395,9 +396,10 @@ func (s *Store) ExportBackup(ctx context.Context, open func(ciphertext []byte) (
 			Key:      base64.StdEncoding.EncodeToString(key),
 			Verifier: base64.StdEncoding.EncodeToString(ver),
 		},
-		Checksum: sum,
-		MAC:      mac,
-		Tables:   tables,
+		Canonical: canonV2,
+		Checksum:  sum,
+		MAC:       mac,
+		Tables:    tables,
 	}, nil
 }
 
@@ -459,7 +461,10 @@ func ParseBackup(r io.Reader, seal func(plaintext []byte) ([]byte, error)) (*Par
 	if len(b.Tables) == 0 {
 		return nil, invalidf("backup contains no tables")
 	}
-	want, err := checksumOf(b.Tables)
+	if b.Canonical != canonLegacy && b.Canonical != canonV2 {
+		return nil, invalidf("backup uses an unsupported checksum form %q -- it was made by a newer MicroFlow", b.Canonical)
+	}
+	want, err := checksumOf(b.Tables, b.Canonical)
 	if err != nil {
 		return nil, invalidf("backup data is damaged (%v)", err)
 	}
@@ -473,7 +478,7 @@ func ParseBackup(r io.Reader, seal func(plaintext []byte) ([]byte, error)) (*Par
 	if pt, err := bc.open(verifier, []byte("verifier")); err != nil || !bytes.Equal(pt, backupVerifierPlain) {
 		return nil, invalidf("backup encryption header is damaged")
 	}
-	wantMAC, err := bc.mac(b.Tables)
+	wantMAC, err := bc.mac(b.Tables, b.Canonical)
 	if err != nil || !hmac.Equal([]byte(wantMAC), []byte(strings.ToLower(b.MAC))) {
 		return nil, invalidf("backup authentication failed -- the file is corrupted or was modified")
 	}
