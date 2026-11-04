@@ -43,6 +43,7 @@ import (
 	"microflow/internal/runall"
 	"microflow/internal/runner"
 	"microflow/internal/scheduler"
+	"microflow/internal/standby"
 	"microflow/internal/store"
 	"microflow/internal/vault"
 	"microflow/internal/webhook"
@@ -94,16 +95,28 @@ func main() {
 	// queued/running row it finds, which is only correct if no other server
 	// is alive. A second copy started by mistake now stops here instead of
 	// cancelling the first copy's live runs.
+	var lock *store.InstanceLock
 	if singleInstanceEnabled() {
-		wait := time.Duration(envInt("MICROFLOW_INSTANCE_LOCK_WAIT_SECONDS", 20)) * time.Second
-		lock, lockErr := st.AcquireInstanceLock(ctx, wait)
+		// Bounded wait for a rolling deploy: the previous instance only
+		// releases the lock once it has been stopped. Meanwhile a health-only
+		// standby listener lets the platform see this instance as alive (so it
+		// proceeds to stop the old one) without processing anything.
+		wait := time.Duration(envInt("MICROFLOW_INSTANCE_LOCK_WAIT_SECONDS", 120)) * time.Second
+		sb := standby.Start(envOr("MICROFLOW_ADDR", ":8080"))
+		var lockErr error
+		lock, lockErr = st.AcquireInstanceLock(ctx, wait)
+		sb.Close() // free the port before the real server binds it
 		if lockErr != nil {
+			if ctx.Err() != nil {
+				log.Printf("shutdown requested while waiting for the instance lock; exiting without touching the database")
+				return
+			}
 			if errors.Is(lockErr, store.ErrAnotherInstance) {
-				log.Fatalf("refusing to start: %v. Stop the other MicroFlow window/process first (or set MICROFLOW_SINGLE_INSTANCE=0 to disable this check).", lockErr)
+				log.Fatalf("refusing to start: %v. Waited %s. Stop the other MicroFlow window/process first (it is NOT force-stopped); MICROFLOW_SINGLE_INSTANCE stays on.", lockErr, wait)
 			}
 			log.Fatalf("single-instance check failed: %v", lockErr)
 		}
-		defer lock.Close()
+		defer lock.Close() // idempotent; also covers early returns
 		lock.Watch(ctx, 15*time.Second, func(err error) {
 			log.Printf("another MicroFlow server took over this database (%v); shutting this one down", err)
 			stop()
@@ -794,6 +807,10 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	// Everything that processes executions has stopped: only now hand the
+	// database over to the next instance (explicit unlock on the lock's own
+	// session; the deferred Close is then a no-op).
+	lock.Close()
 }
 
 // schedulerLocation reads MICROFLOW_SCHEDULER_TIMEZONE (an IANA zone name,
