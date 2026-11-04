@@ -32,8 +32,8 @@ var variantLibrary = map[string][]struct{ Name, Text string }{
 		{"how_why", "The TITLE must start with 'How' or 'Why' (still under 60 characters, still include a number)."},
 	},
 	SettingPacing: {
-		{"tight", "VOICE: 14-18 words per scene, shortest natural sentence, one idea per scene."},
-		{"dense", "VOICE: 20-24 words per scene, one fact-rich sentence per scene."},
+		{"tight", "VOICE (8-10 second Short, 3 scenes): scene 1 = 4-6 words, scenes 2 and 3 = 7-9 words each, shortest natural sentence, one idea per scene."},
+		{"dense", "VOICE (8-10 second Short, 3 scenes): scene 1 = 6-8 words, scenes 2 and 3 = 10-12 words each, one fact-rich sentence per scene, never more than 32 words in total."},
 	},
 }
 

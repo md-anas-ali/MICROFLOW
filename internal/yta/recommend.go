@@ -31,7 +31,7 @@ func Recommend(sum Summary) []Recommendation {
 		case CauseWeakHook:
 			add("hook", "Open scene 1 with a concrete, specific claim, number or question about the topic; remove any setup before the first fact.", "Change only the hook style; compare average view percentage against concurrent baseline videos.")
 		case CauseMidVideoDrop:
-			add("pacing", "Shorten scenes 2-4 and make each reveal escalate; cut filler words so something new is revealed in every scene.", "Change only voice length per scene; compare average view percentage.")
+			add("pacing", "Shorten scenes 2-3 and make each reveal escalate; cut filler words so something new is revealed in every scene.", "Change only voice length per scene; compare average view percentage.")
 			add("script", "Move the strongest reveal earlier and keep the final scene short.", "Evaluate after the pacing experiment; do not change both at once.")
 		case CauseLowDistribution:
 			add("title", "Test a different title pattern (number first, curiosity gap, How/Why) while keeping it accurate.", "Change only the title style; compare first-window views against concurrent baseline videos.")

@@ -519,26 +519,26 @@ func ReviewScript(voices []string) ScriptReport {
 			r.Issues = append(r.Issues, fmt.Sprintf("scene %d uses the generic phrase %q", i+1, p))
 		}
 		switch {
-		case i == 0 && n > 14:
-			r.Issues = append(r.Issues, fmt.Sprintf("scene 1 (the hook) has %d words; 5-14 holds attention best", n))
-		case i > 0 && (n < 12 || n > 26):
-			r.Issues = append(r.Issues, fmt.Sprintf("scene %d has %d words; 14-24 keeps the pace even", i+1, n))
+		case i == 0 && n > 10:
+			r.Issues = append(r.Issues, fmt.Sprintf("scene 1 (the hook) has %d words; 5-8 holds attention best in an 8-10s Short", n))
+		case i > 0 && (n < 7 || n > 15):
+			r.Issues = append(r.Issues, fmt.Sprintf("scene %d has %d words; 9-12 keeps an 8-10s Short even", i+1, n))
 		}
 	}
-	if len(voices) >= 3 && minW > 0 && float64(maxW)/float64(minW) > 2.0 {
+	if len(voices) >= 3 && minW > 0 && float64(maxW)/float64(minW) > 3.0 {
 		r.Issues = append(r.Issues, "scene lengths are very uneven; the longest is more than twice the shortest")
 	}
 	if len(voices) > 0 && !hasNum {
 		r.Issues = append(r.Issues, "no concrete number or measurement anywhere in the script")
 	}
-	if len(voices) > 0 && !reCTA.MatchString(voices[len(voices)-1]) {
-		r.Issues = append(r.Issues, "the closing scene has no follow/comment request")
+	if len(voices) > 0 && !reCTA.MatchString(voices[len(voices)-1]) && !strings.Contains(voices[len(voices)-1], "?") {
+		r.Issues = append(r.Issues, "the closing scene has no question or comment request")
 	}
 	r.EstSeconds = math.Round(float64(r.TotalWords)/spokenWPS*10) / 10
-	if r.EstSeconds > 58 {
-		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is close to or over the 60s Shorts limit", r.EstSeconds))
-	} else if len(voices) > 0 && r.EstSeconds < 22 {
-		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is short; 30-45s usually carries more watch time", r.EstSeconds))
+	if r.EstSeconds > 14 {
+		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is over the 8-10s target; cut words", r.EstSeconds))
+	} else if len(voices) > 0 && r.EstSeconds < 6 {
+		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is too short for a complete fact; 8-10s is the target", r.EstSeconds))
 	}
 	r.Score = clampInt(100-12*len(r.Issues), 0, 100)
 	return r
