@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"microflow/internal/expr"
 	"microflow/internal/model"
@@ -156,14 +157,17 @@ func cleanYouTubeTags(v any) []string {
 	return out
 }
 
-// ensureVideoLocation makes sure the Studio "Location" really is on the video. It reads the
-// video back; when the location is missing or different it writes it with videos.update
-// (part=recordingDetails) and reads it back once more. It never returns an error to the caller:
-// the second return value is a short human-readable result for the run log.
+// ensureVideoLocation makes sure the Studio "Location" really is on the video. YouTube can drop
+// or reset recordingDetails right after videos.insert (and again while it processes the file), so
+// this reads the video back and, whenever the coordinates OR the place name are missing or
+// different, writes them with videos.update (part=recordingDetails). It re-checks a few times with
+// pauses so a late reset is also repaired. It never returns an error to the caller: the second
+// return value is a short human-readable result for the run log.
 func ensureVideoLocation(ctx context.Context, token, videoID string, rec map[string]any, operationID string) (bool, string) {
 	loc, _ := rec["location"].(map[string]any)
 	wantLat, _ := loc["latitude"].(float64)
 	wantLng, _ := loc["longitude"].(float64)
+	wantDesc, _ := rec["locationDescription"].(string)
 	getURL := "https://www.googleapis.com/youtube/v3/videos?part=recordingDetails&id=" + url.QueryEscape(videoID)
 
 	read := func() (bool, error) {
@@ -174,6 +178,7 @@ func ensureVideoLocation(ctx context.Context, token, videoID string, rec map[str
 						Latitude  float64 `json:"latitude"`
 						Longitude float64 `json:"longitude"`
 					} `json:"location"`
+					LocationDescription string `json:"locationDescription"`
 				} `json:"recordingDetails"`
 			} `json:"items"`
 		}
@@ -183,21 +188,46 @@ func ensureVideoLocation(ctx context.Context, token, videoID string, rec map[str
 		if len(out.Items) == 0 {
 			return false, nil
 		}
-		l := out.Items[0].RecordingDetails.Location
-		return math.Abs(l.Latitude-wantLat) < 0.01 && math.Abs(l.Longitude-wantLng) < 0.01, nil
+		rd := out.Items[0].RecordingDetails
+		coordsOK := math.Abs(rd.Location.Latitude-wantLat) < 0.01 && math.Abs(rd.Location.Longitude-wantLng) < 0.01
+		descOK := wantDesc == "" || strings.EqualFold(strings.TrimSpace(rd.LocationDescription), wantDesc)
+		return coordsOK && descOK, nil
+	}
+	pause := func(d time.Duration) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(d):
+			return true
+		}
 	}
 
 	if ok, err := read(); err == nil && ok {
 		return true, "location set on upload"
 	}
 	body, _ := json.Marshal(map[string]any{"id": videoID, "recordingDetails": rec})
-	if err := googleAPICall(ctx, "PUT", "https://www.googleapis.com/youtube/v3/videos?part=recordingDetails", token, body, nil, operationID); err != nil {
-		return false, "location update failed: " + err.Error()
+	putURL := "https://www.googleapis.com/youtube/v3/videos?part=recordingDetails"
+	lastNote := ""
+	for attempt, wait := range []time.Duration{0, 5 * time.Second, 20 * time.Second, 60 * time.Second} {
+		if wait > 0 && !pause(wait) {
+			break
+		}
+		if err := googleAPICall(ctx, "PUT", putURL, token, body, nil, operationID); err != nil {
+			lastNote = "location update failed: " + err.Error()
+			continue
+		}
+		ok, err := read()
+		if err != nil {
+			lastNote = "location written but could not be verified: " + err.Error()
+			continue
+		}
+		if ok {
+			return true, fmt.Sprintf("location set with videos.update (attempt %d)", attempt+1)
+		}
+		lastNote = "location written but YouTube still reports none"
 	}
-	if ok, err := read(); err != nil {
-		return false, "location written but could not be verified: " + err.Error()
-	} else if !ok {
-		return false, "location written but YouTube still reports none"
+	if lastNote == "" {
+		lastNote = "location not confirmed"
 	}
-	return true, "location set with videos.update"
+	return false, lastNote
 }
