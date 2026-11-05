@@ -338,6 +338,10 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 			}
 		}
 		snippet := map[string]any{"snippet": snip, "status": status}
+		// Tags, default (audio) language and Studio "Location" -- see youtube_upload_meta.go.
+		if rec := applyYouTubeUploadOptions(node, exprCtx, snip); rec != nil {
+			snippet["recordingDetails"] = rec
+		}
 		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet, rc.CurrentOperationID)
 		if err != nil {
 			if pq != nil {
@@ -494,6 +498,14 @@ func uploadBinaryFile(ctx context.Context, url, token, filePath, mimeType, opera
 	return nil
 }
 
+// videoInsertParts lists the videos.insert "part" values the request body carries.
+func videoInsertParts(metadata map[string]any) string {
+	if _, ok := metadata["recordingDetails"]; ok {
+		return "snippet,status,recordingDetails"
+	}
+	return "snippet,status"
+}
+
 func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string, metadata map[string]any, operationID string) (string, error) {
 	f, err := openForUpload(filePath)
 	if err != nil {
@@ -524,7 +536,7 @@ func uploadVideoMultipart(ctx context.Context, token, filePath, mimeType string,
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status", pr)
+		"https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part="+videoInsertParts(metadata), pr)
 	if err != nil {
 		return "", err
 	}
