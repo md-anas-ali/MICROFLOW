@@ -339,8 +339,9 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		}
 		snippet := map[string]any{"snippet": snip, "status": status}
 		// Tags, default (audio) language and Studio "Location" -- see youtube_upload_meta.go.
-		if rec := applyYouTubeUploadOptions(node, exprCtx, snip); rec != nil {
-			snippet["recordingDetails"] = rec
+		recDetails := applyYouTubeUploadOptions(node, exprCtx, snip)
+		if recDetails != nil {
+			snippet["recordingDetails"] = recDetails
 		}
 		videoID, err := uploadVideoMultipart(ctx, token, ref.FileName, ref.MimeType, snippet, rc.CurrentOperationID)
 		if err != nil {
@@ -362,6 +363,13 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 		// and keep "videoId" alongside it for any script written
 		// against MicroFlow's previous shape.
 		outItem := map[string]any{"id": videoID, "videoId": videoID}
+		if recDetails != nil {
+			// YouTube sometimes drops recordingDetails sent with videos.insert: confirm it
+			// stuck, re-apply it with videos.update if not, and report the result (never fails the run).
+			ok, note := ensureVideoLocation(ctx, token, videoID, recDetails, rc.CurrentOperationID)
+			outItem["locationSet"] = ok
+			outItem["locationNote"] = note
+		}
 		if pq != nil {
 			pq.Commit(opKey, videoID, &resv)
 			pq.ApplyMoves(ctx, &resv) // reconcile pre-existing scheduled videos

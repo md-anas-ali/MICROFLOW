@@ -1,8 +1,11 @@
 package nodes
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -151,4 +154,50 @@ func cleanYouTubeTags(v any) []string {
 		total += cost
 	}
 	return out
+}
+
+// ensureVideoLocation makes sure the Studio "Location" really is on the video. It reads the
+// video back; when the location is missing or different it writes it with videos.update
+// (part=recordingDetails) and reads it back once more. It never returns an error to the caller:
+// the second return value is a short human-readable result for the run log.
+func ensureVideoLocation(ctx context.Context, token, videoID string, rec map[string]any, operationID string) (bool, string) {
+	loc, _ := rec["location"].(map[string]any)
+	wantLat, _ := loc["latitude"].(float64)
+	wantLng, _ := loc["longitude"].(float64)
+	getURL := "https://www.googleapis.com/youtube/v3/videos?part=recordingDetails&id=" + url.QueryEscape(videoID)
+
+	read := func() (bool, error) {
+		var out struct {
+			Items []struct {
+				RecordingDetails struct {
+					Location struct {
+						Latitude  float64 `json:"latitude"`
+						Longitude float64 `json:"longitude"`
+					} `json:"location"`
+				} `json:"recordingDetails"`
+			} `json:"items"`
+		}
+		if err := googleAPICall(ctx, "GET", getURL, token, nil, &out, operationID); err != nil {
+			return false, err
+		}
+		if len(out.Items) == 0 {
+			return false, nil
+		}
+		l := out.Items[0].RecordingDetails.Location
+		return math.Abs(l.Latitude-wantLat) < 0.01 && math.Abs(l.Longitude-wantLng) < 0.01, nil
+	}
+
+	if ok, err := read(); err == nil && ok {
+		return true, "location set on upload"
+	}
+	body, _ := json.Marshal(map[string]any{"id": videoID, "recordingDetails": rec})
+	if err := googleAPICall(ctx, "PUT", "https://www.googleapis.com/youtube/v3/videos?part=recordingDetails", token, body, nil, operationID); err != nil {
+		return false, "location update failed: " + err.Error()
+	}
+	if ok, err := read(); err != nil {
+		return false, "location written but could not be verified: " + err.Error()
+	} else if !ok {
+		return false, "location written but YouTube still reports none"
+	}
+	return true, "location set with videos.update"
 }
