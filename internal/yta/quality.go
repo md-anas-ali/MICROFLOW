@@ -535,10 +535,18 @@ func ReviewScript(voices []string) ScriptReport {
 		r.Issues = append(r.Issues, "the closing scene has no question or comment request")
 	}
 	r.EstSeconds = math.Round(float64(r.TotalWords)/spokenWPS*10) / 10
-	if r.EstSeconds > 14 {
-		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is over the 8-10s target; cut words", r.EstSeconds))
-	} else if len(voices) > 0 && r.EstSeconds < 6 {
-		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is too short for a complete fact; 8-10s is the target", r.EstSeconds))
+	// Runtime limits follow the scene count: 3 scenes keeps the original 8-10s Short;
+	// longer videos (MICROFLOW_SCENE_COUNT > 3) get proportionally larger limits.
+	maxSec, minSec, target := 14.0, 6.0, "8-10s"
+	if n := len(voices); n > 3 {
+		maxSec = 4.7 * float64(n)
+		minSec = 2.0 * float64(n)
+		target = fmt.Sprintf("about %.0fs", 3.3*float64(n))
+	}
+	if r.EstSeconds > maxSec {
+		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is over the %s target; cut words", r.EstSeconds, target))
+	} else if len(voices) > 0 && r.EstSeconds < minSec {
+		r.Issues = append(r.Issues, fmt.Sprintf("estimated runtime %.0fs is too short for a complete fact; %s is the target", r.EstSeconds, target))
 	}
 	r.Score = clampInt(100-12*len(r.Issues), 0, 100)
 	return r
