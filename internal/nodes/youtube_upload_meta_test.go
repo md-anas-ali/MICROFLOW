@@ -76,3 +76,27 @@ func TestCleanTagsCommaStringAndLimit(t *testing.T) {
 		t.Fatalf("tags exceed 500: %d", total)
 	}
 }
+
+func TestUploadSyntheticFlag(t *testing.T) {
+	ec := expr.Context{}
+	cases := []struct {
+		name string
+		opts map[string]any
+		want any
+		set  bool
+	}{
+		{"bool true", map[string]any{"containsSyntheticMedia": true}, true, true},
+		{"string true", map[string]any{"containsSyntheticMedia": "true"}, true, true},
+		{"string false", map[string]any{"containsSyntheticMedia": "false"}, false, true},
+		{"absent", map[string]any{}, nil, false},
+		{"junk", map[string]any{"containsSyntheticMedia": "maybe"}, nil, false},
+	}
+	for _, c := range cases {
+		status := map[string]any{"privacyStatus": "private"}
+		applyYouTubeSyntheticFlag(uploadNode(c.opts), ec, status)
+		got, ok := status["containsSyntheticMedia"]
+		if ok != c.set || (c.set && got != c.want) {
+			t.Fatalf("%s: got %v (set=%v), want %v (set=%v)", c.name, got, ok, c.want, c.set)
+		}
+	}
+}

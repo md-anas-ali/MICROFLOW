@@ -337,6 +337,8 @@ func (e *YouTubeExecutor) Execute(ctx context.Context, rc *engine.RunContext, no
 				}
 			}
 		}
+		// Optional AI-generated disclosure (options.containsSyntheticMedia) -- see youtube_upload_meta.go.
+		applyYouTubeSyntheticFlag(node, exprCtx, status)
 		snippet := map[string]any{"snippet": snip, "status": status}
 		// Tags, default (audio) language and Studio "Location" -- see youtube_upload_meta.go.
 		recDetails := applyYouTubeUploadOptions(node, exprCtx, snip)

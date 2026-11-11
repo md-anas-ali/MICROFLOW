@@ -231,3 +231,37 @@ func ensureVideoLocation(ctx context.Context, token, videoID string, rec map[str
 	}
 	return false, lastNote
 }
+
+// applyYouTubeSyntheticFlag sets status.containsSyntheticMedia (the Studio
+// "Altered content" / AI-generated disclosure) from options.containsSyntheticMedia.
+// The value may be a bool, "true"/"false", or a {{ expression }}. When the option is
+// absent or unusable nothing is added, so existing workflows behave exactly as before.
+func applyYouTubeSyntheticFlag(node *model.Node, ec expr.Context, status map[string]any) {
+	opts, _ := node.Parameters["options"].(map[string]any)
+	if opts == nil {
+		return
+	}
+	raw, ok := opts["containsSyntheticMedia"]
+	if !ok || raw == nil {
+		return
+	}
+	v := raw
+	if s, isStr := raw.(string); isStr {
+		ev, err := expr.EvalValue(s, ec)
+		if err != nil {
+			return
+		}
+		v = ev
+	}
+	switch t := v.(type) {
+	case bool:
+		status["containsSyntheticMedia"] = t
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes":
+			status["containsSyntheticMedia"] = true
+		case "false", "0", "no":
+			status["containsSyntheticMedia"] = false
+		}
+	}
+}
