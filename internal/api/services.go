@@ -47,6 +47,8 @@ func (s *Server) routesTenancy() {
 	s.mux.HandleFunc("POST /api/services/{id}/env/import", s.handleImportServiceEnv)
 	s.mux.HandleFunc("POST /api/services/{id}/env/delete-all", s.handleDeleteAllServiceEnv)
 
+	s.mux.HandleFunc("POST /api/global-workflow", s.handleGlobalWorkflow)
+
 	s.mux.HandleFunc("POST /api/run-all", s.handleRunAll)
 	s.mux.HandleFunc("GET /api/run-all", s.handleRunAllStatus)
 	s.mux.HandleFunc("POST /api/run-all/cancel", s.handleRunAllCancel)
