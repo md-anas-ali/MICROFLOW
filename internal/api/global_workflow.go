@@ -12,6 +12,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -86,6 +87,16 @@ func (s *Server) handleGlobalWorkflow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, o := range old[sv.ID] {
+			// Nothing is really running (checked above): close leftover
+			// "running" DB rows from stopped runs so they can't block the delete.
+			if c, ok := s.workflows.(interface {
+				CloseActiveExecutions(context.Context, string) error
+			}); ok {
+				if cerr := c.CloseActiveExecutions(ctx, o.ID); cerr != nil {
+					writeErr(w, http.StatusInternalServerError, fmt.Errorf("service %q: could not close stopped runs: %v", sv.Name, cerr))
+					return
+				}
+			}
 			s.persistMu.Lock()
 			derr := s.workflows.DeleteWorkflow(ctx, o.ID)
 			if derr == nil && s.onWorkflowChanged != nil {
