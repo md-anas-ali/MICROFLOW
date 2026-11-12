@@ -240,6 +240,9 @@
       } else if (p0 === "global-env") {
         setPageNav("#/dashboard", "Home");
         await renderEnvPage("global");
+      } else if (p0 === "global-workflow") {
+        setPageNav("#/dashboard", "Home");
+        renderGlobalWorkflow();
       } else if (p0 === "database") {
         setPageNav("#/dashboard", "Home");
         renderDatabasePage();
@@ -336,6 +339,7 @@
       '<h2 class="section-title">\uD83E\uDDE9 Services</h2>' +
       '<div class="svc-list">' + cards +
       '<button id="svcCreateBtn" class="svc-card svc-new">\u2795 New Service</button></div>' +
+      '<a class="btn btn-big btn-block" style="margin-top:14px;" href="#/global-workflow">\uD83D\uDD04 Global Workflow</a>' +
       '<details class="runall-details"><summary>\u25B6\uFE0F Run all Services</summary>' + runAllPanelHTML() + "</details>" +
       "</div>";
     document.getElementById("svcCreateBtn").addEventListener("click", createServiceFlow);
@@ -715,6 +719,46 @@
     });
   }
 
+
+  // ---------------- Global Workflow ----------------
+  // One upload replaces the workflow of EVERY Service (POST /api/global-workflow).
+  function renderGlobalWorkflow() {
+    viewEl.innerHTML =
+      '<div class="page-head"><div><h1>\uD83D\uDD04 Global Workflow</h1>' +
+      '<div class="sub">Upload one workflow. It <b>replaces the existing workflow in every Service</b>. ' +
+      'Environment, credentials and settings are not touched.</div></div></div>' +
+      '<div id="gwDrop" class="import-drop">Drop a <code>.json</code> file here, or click to choose one' +
+      '<input id="gwFile" type="file" accept="application/json,.json" style="display:none"></div>' +
+      '<div style="margin:14px 0;color:var(--text-dim);font-size:12px;">\u2014 or paste JSON below \u2014</div>' +
+      '<textarea id="gwText" class="json-paste" placeholder="{ &quot;nodes&quot;: [...], &quot;connections&quot;: {...} }"></textarea>' +
+      '<div style="margin-top:12px;"><button id="gwBtn" class="btn btn-danger btn-big">Replace workflow in all Services</button></div>' +
+      '<div id="gwResult"></div>';
+    const drop = document.getElementById("gwDrop");
+    const fileInput = document.getElementById("gwFile");
+    const textArea = document.getElementById("gwText");
+    const resultEl = document.getElementById("gwResult");
+    drop.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => { const f = fileInput.files[0]; if (f) readFileInto(f, textArea); });
+    ["dragover", "dragenter"].forEach((evt) => drop.addEventListener(evt, (e) => { e.preventDefault(); drop.classList.add("dragover"); }));
+    ["dragleave", "drop"].forEach((evt) => drop.addEventListener(evt, (e) => { e.preventDefault(); drop.classList.remove("dragover"); }));
+    drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) readFileInto(f, textArea); });
+    document.getElementById("gwBtn").addEventListener("click", async () => {
+      const raw = textArea.value.trim();
+      if (!raw) { toast("Paste or choose a JSON file first", "error"); return; }
+      if (!confirm("This deletes the current workflow of EVERY Service and replaces it with the uploaded one. Continue?")) return;
+      const btn = document.getElementById("gwBtn");
+      btn.disabled = true; btn.textContent = "Replacing\u2026"; resultEl.innerHTML = "";
+      try {
+        const r = await apiJSON("/api/global-workflow", { method: "POST", headers: { "Content-Type": "application/json" }, body: raw });
+        resultEl.innerHTML = '<div class="card" style="margin-top:12px;">\u2705 \u201c' + escapeHtml(r.name || "workflow") +
+          "\u201d is now the workflow of " + r.services + " Service(s).</div>";
+        toast("Global Workflow applied", "success");
+      } catch (e) {
+        toast(e.message, "error");
+        resultEl.innerHTML = '<div class="unsupported-box">' + escapeHtml(e.message) + "</div>";
+      } finally { btn.disabled = false; btn.textContent = "Replace workflow in all Services"; }
+    });
+  }
 
   // ---------------- Settings -> Model (local Qwen3 1.7B) ----------------
   // Talks to /api/local-model/*. The model runs on the computer MicroFlow runs
