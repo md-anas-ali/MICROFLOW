@@ -62,3 +62,28 @@ func (s *Store) FailStaleRunAllJobs(ctx context.Context, updatedBefore time.Time
 	}
 	return tag.RowsAffected(), nil
 }
+
+// CloseActiveExecutions marks every execution of workflowID that the database
+// still shows as queued/running/waiting as cancelled and drops its recovery
+// checkpoints. Call it only after confirming nothing in this process is really
+// running the workflow (runner.IsWorkflowActive == false): such rows are left
+// behind by a stopped/killed run and would otherwise block DeleteWorkflow.
+func (s *Store) CloseActiveExecutions(ctx context.Context, workflowID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM execution_checkpoints WHERE workflow_id=$1`, workflowID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE executions
+		SET status='cancelled', finished_at=COALESCE(finished_at, now()),
+		    error=CASE WHEN error IS NULL OR error='' THEN 'stopped before the workflow was replaced' ELSE error END
+		WHERE workflow_id=$1 AND finished_at IS NULL AND status IN ('queued','running','waiting')
+	`, workflowID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
