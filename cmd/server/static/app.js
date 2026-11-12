@@ -339,7 +339,6 @@
       '<h2 class="section-title">\uD83E\uDDE9 Services</h2>' +
       '<div class="svc-list">' + cards +
       '<button id="svcCreateBtn" class="svc-card svc-new">\u2795 New Service</button></div>' +
-      '<a class="btn btn-big btn-block" style="margin-top:14px;" href="#/global-workflow">\uD83D\uDD04 Global Workflow</a>' +
       '<details class="runall-details"><summary>\u25B6\uFE0F Run all Services</summary>' + runAllPanelHTML() + "</details>" +
       "</div>";
     document.getElementById("svcCreateBtn").addEventListener("click", createServiceFlow);
