@@ -796,7 +796,9 @@ func main() {
 		log.Fatal(mcpErr)
 	}
 	if mcpCfg.Enabled() {
-		mux.Handle("/mcp", mcp.NewHandler(apiServer.Handler(), mcpCfg))
+		mcpHandler := mcp.NewHandler(apiServer.Handler(), mcpCfg)
+		mux.Handle("/mcp", mcpHandler)
+		mux.Handle("/mcp/", mcpHandler) // token-in-URL form: /mcp/<token>
 		log.Printf("MCP endpoint enabled at /mcp (read-only=%v)", mcpCfg.ReadOnly)
 	}
 

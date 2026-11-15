@@ -145,7 +145,7 @@ func (g *authGate) Wrap(next http.Handler) http.Handler {
 		case strings.HasPrefix(p, "/webhook/"):
 			next.ServeHTTP(w, r) // has its own MICROFLOW_WEBHOOK_TOKEN check
 			return
-		case p == "/mcp":
+		case p == "/mcp" || strings.HasPrefix(p, "/mcp/"):
 			next.ServeHTTP(w, r) // has its own MICROFLOW_MCP_TOKEN bearer check (internal/mcp)
 			return
 		}
