@@ -10,9 +10,12 @@
 //   - Auth is a dedicated bearer token (MICROFLOW_MCP_TOKEN). Without it the
 //     endpoint is not registered at all (fail closed). The browser login
 //     cookie is NOT accepted here and the MCP token is NOT valid for /api/*.
-//   - MICROFLOW_MCP_READONLY=true removes the run/cancel tools.
+//   - MICROFLOW_MCP_READONLY=true removes the run/cancel tools (and the edit tools).
+//   - MICROFLOW_MCP_ALLOW_EDIT=true adds update_node / revert_last_edit (edit.go).
+//     Off by default; read-only always wins.
 //   - No secrets are ever returned: workflow summaries omit node parameters,
-//     and execution details come from the existing redacting debug report.
+//     get_node masks secret-looking keys, and execution details come from the
+//     existing redacting debug report.
 package mcp
 
 import (
@@ -51,8 +54,9 @@ var supportedProtos = map[string]bool{
 
 // Config is read from the environment by ConfigFromEnv.
 type Config struct {
-	Token    string // MICROFLOW_MCP_TOKEN; empty = MCP disabled
-	ReadOnly bool   // MICROFLOW_MCP_READONLY
+	Token     string // MICROFLOW_MCP_TOKEN; empty = MCP disabled
+	ReadOnly  bool   // MICROFLOW_MCP_READONLY
+	AllowEdit bool   // MICROFLOW_MCP_ALLOW_EDIT (opt-in; ignored when ReadOnly)
 }
 
 // Enabled reports whether the /mcp endpoint should be registered.
@@ -66,6 +70,10 @@ func ConfigFromEnv() (Config, error) {
 	case "1", "true", "yes", "on":
 		c.ReadOnly = true
 	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MICROFLOW_MCP_ALLOW_EDIT"))) {
+	case "1", "true", "yes", "on":
+		c.AllowEdit = true
+	}
 	if c.Token != "" && len(c.Token) < minTokenLen {
 		return c, fmt.Errorf("MICROFLOW_MCP_TOKEN must be at least %d characters (use a long random value)", minTokenLen)
 	}
@@ -78,10 +86,11 @@ type Handler struct {
 	api   http.Handler
 	cfg   Config
 	token [32]byte
+	hist  *editHistory
 }
 
 func NewHandler(api http.Handler, cfg Config) *Handler {
-	return &Handler{api: api, cfg: cfg, token: sha256.Sum256([]byte(cfg.Token))}
+	return &Handler{api: api, cfg: cfg, token: sha256.Sum256([]byte(cfg.Token)), hist: newEditHistory()}
 }
 
 func (h *Handler) tokenOK(candidate string) bool {
@@ -233,7 +242,7 @@ func (h *Handler) dispatch(ctx context.Context, req rpcRequest) (rpcResponse, bo
 			"serverInfo":      map[string]any{"name": serverName, "version": serverVersion},
 			"instructions": "MicroFlow workflow runner. Use list_workflows to find workflow ids, " +
 				"run_workflow to start one (it returns an executionId immediately), then " +
-				"get_execution / get_execution_report to follow progress or diagnose failures.",
+				"get_execution / get_execution_report to follow progress or diagnose failures." + h.editInstructions(),
 		})
 	case "ping":
 		return reply(map[string]any{})
@@ -264,6 +273,7 @@ type toolDef struct {
 	InputSchema map[string]any `json:"inputSchema"`
 	Annotations map[string]any `json:"annotations,omitempty"`
 	write       bool
+	edit        bool // workflow-editing tool: needs Config.AllowEdit
 }
 
 func obj(required []string, props map[string]any) map[string]any {
@@ -344,6 +354,9 @@ func (h *Handler) tools() []toolDef {
 	out := make([]toolDef, 0, len(allTools))
 	for _, t := range allTools {
 		if t.write && h.cfg.ReadOnly {
+			continue
+		}
+		if t.edit && !h.cfg.AllowEdit {
 			continue
 		}
 		out = append(out, t)
@@ -437,6 +450,24 @@ func (h *Handler) callTool(ctx context.Context, name string, raw json.RawMessage
 		}
 		status, body, err := h.call(ctx, http.MethodPost, path, a.ServiceID)
 		return plainOrErr(status, body, err)
+	case "get_node", "update_node", "revert_last_edit":
+		var ea editArgs
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &ea); err != nil {
+				return textResult("invalid arguments: "+err.Error(), true)
+			}
+		}
+		switch name {
+		case "get_node":
+			if ea.WorkflowID == "" || ea.NodeName == "" {
+				return textResult("workflowId and nodeName are required", true)
+			}
+			return h.getNode(ctx, ea)
+		case "update_node":
+			return h.updateNode(ctx, ea)
+		default:
+			return h.revertLastEdit(ctx, ea)
+		}
 	case "cancel_execution":
 		if a.ExecutionID == "" {
 			return textResult("executionId is required", true)
@@ -457,9 +488,15 @@ func (h *Handler) call(ctx context.Context, method, path, serviceID string) (int
 		req.Header.Set("X-Microflow-Service", serviceID)
 	}
 	req.RemoteAddr = "127.0.0.1:0"
+	status, out := h.serve(req)
+	return status, out, nil
+}
+
+// serve runs a prepared request through the API handler in-process.
+func (h *Handler) serve(req *http.Request) (int, []byte) {
 	rec := httptest.NewRecorder()
 	h.api.ServeHTTP(rec, req)
-	return rec.Code, rec.Body.Bytes(), nil
+	return rec.Code, rec.Body.Bytes()
 }
 
 func plainOrErr(status int, body []byte, err error) toolResult {
