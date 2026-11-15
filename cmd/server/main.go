@@ -38,6 +38,7 @@ import (
 	"microflow/internal/engine"
 	"microflow/internal/httpx"
 	"microflow/internal/localmodel"
+	"microflow/internal/mcp"
 	"microflow/internal/model"
 	"microflow/internal/nodes"
 	"microflow/internal/runall"
@@ -786,6 +787,18 @@ func main() {
 	})
 
 	mux.Handle("/webhook/", whServer.Handler())
+
+	// MCP server (Model Context Protocol) for AI clients. Registered ONLY when
+	// MICROFLOW_MCP_TOKEN is set; it calls the API handler above in-process and
+	// authenticates with that bearer token (not the browser login cookie).
+	mcpCfg, mcpErr := mcp.ConfigFromEnv()
+	if mcpErr != nil {
+		log.Fatal(mcpErr)
+	}
+	if mcpCfg.Enabled() {
+		mux.Handle("/mcp", mcp.NewHandler(apiServer.Handler(), mcpCfg))
+		log.Printf("MCP endpoint enabled at /mcp (read-only=%v)", mcpCfg.ReadOnly)
+	}
 
 	addr := envOr("MICROFLOW_ADDR", ":8080")
 	srv := &http.Server{Addr: addr, Handler: httpx.Gzip(gate.Wrap(mux)), ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 15 * time.Minute, WriteTimeout: 35 * time.Minute}

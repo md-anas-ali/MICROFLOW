@@ -17,7 +17,9 @@
 //   - Every request except /login, /logout, /healthz, /privacy, /terms and
 //     /webhook/* needs a valid signed session cookie. ("/" shows a public
 //     homepage to signed-out visitors -- see public_pages.go.) /webhook/* keeps its own token check
-//     (MICROFLOW_WEBHOOK_TOKEN) because external services call it.
+//     (MICROFLOW_WEBHOOK_TOKEN) because external services call it. /mcp is
+//     likewise exempt and checks its own bearer token (MICROFLOW_MCP_TOKEN);
+//     it is only registered when that token is set.
 //   - Unauthenticated /api/* calls get 401 JSON; browser pages redirect to /login.
 //   - The session is a stateless HMAC-signed cookie (no DB table needed). The
 //     signing key is derived from user+password+MICROFLOW_MASTER_KEY, so
@@ -142,6 +144,9 @@ func (g *authGate) Wrap(next http.Handler) http.Handler {
 			return
 		case strings.HasPrefix(p, "/webhook/"):
 			next.ServeHTTP(w, r) // has its own MICROFLOW_WEBHOOK_TOKEN check
+			return
+		case p == "/mcp":
+			next.ServeHTTP(w, r) // has its own MICROFLOW_MCP_TOKEN bearer check (internal/mcp)
 			return
 		}
 		if g.validSession(r) {
