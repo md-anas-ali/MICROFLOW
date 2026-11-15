@@ -195,3 +195,25 @@ func TestGetNotAllowed(t *testing.T) {
 		t.Fatalf("GET: %d", rec.Code)
 	}
 }
+
+func TestTokenInURL(t *testing.T) {
+	h := NewHandler(fakeAPI(), Config{Token: tok})
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	do := func(path string) int {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := do("/mcp/" + tok); c != 200 {
+		t.Errorf("url token: %d", c)
+	}
+	if c := do("/mcp/" + tok + "/"); c != 200 {
+		t.Errorf("url token trailing slash: %d", c)
+	}
+	for _, p := range []string{"/mcp/wrong", "/mcp/", "/mcp", "/mcp/" + tok + "x"} {
+		if c := do(p); c != 401 {
+			t.Errorf("%s: got %d want 401", p, c)
+		}
+	}
+}

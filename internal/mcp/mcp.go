@@ -84,14 +84,29 @@ func NewHandler(api http.Handler, cfg Config) *Handler {
 	return &Handler{api: api, cfg: cfg, token: sha256.Sum256([]byte(cfg.Token))}
 }
 
-func (h *Handler) authorized(r *http.Request) bool {
-	const p = "Bearer "
-	v := r.Header.Get("Authorization")
-	if len(v) <= len(p) || !strings.EqualFold(v[:len(p)], p) {
+func (h *Handler) tokenOK(candidate string) bool {
+	if candidate == "" {
 		return false
 	}
-	got := sha256.Sum256([]byte(strings.TrimSpace(v[len(p):])))
+	got := sha256.Sum256([]byte(candidate))
 	return subtle.ConstantTimeCompare(got[:], h.token[:]) == 1
+}
+
+// authorized accepts the token either as "Authorization: Bearer <token>" or,
+// for clients that cannot send headers (e.g. the Claude "Add custom
+// connector" form), as the last URL segment: /mcp/<token>. Same token, same
+// constant-time check. Note the URL form puts the token in access logs.
+func (h *Handler) authorized(r *http.Request) bool {
+	const p = "Bearer "
+	if v := r.Header.Get("Authorization"); len(v) > len(p) && strings.EqualFold(v[:len(p)], p) {
+		if h.tokenOK(strings.TrimSpace(v[len(p):])) {
+			return true
+		}
+	}
+	if rest, ok := strings.CutPrefix(r.URL.Path, "/mcp/"); ok {
+		return h.tokenOK(strings.Trim(rest, "/"))
+	}
+	return false
 }
 
 // ---------------- JSON-RPC ----------------
