@@ -2845,8 +2845,9 @@
       : "Values for <b>" + escapeHtml(currentServiceName()) + "</b> only. Anything missing here comes from Global.";
     const ENV_MENU = [
       ["view", "\uD83D\uDC41\uFE0F", "View"], ["edit", "\u270F\uFE0F", "Edit"], ["add", "\u2795", "Add"],
-      ["import", "\uD83D\uDCE5", "Import"], ["remove", "\uD83D\uDDD1\uFE0F", "Remove"], ["delete", "\uD83D\uDD34", "Delete"],
-    ];
+      ["import", "\uD83D\uDCE5", "Import"], ["export", "\uD83D\uDCE4", "Export"],
+      ["remove", "\uD83D\uDDD1\uFE0F", "Remove"], ["delete", "\uD83D\uDD34", "Delete"],
+    ].filter((m) => !(isGlobal && m[0] === "export")); // Export is per Service
     const sectionTitle = isGlobal ? "\uD83C\uDF10 Global Environment" : "\u2699\uFE0F Service Environment";
     // Both scopes (Global and Service) carry the same \u22EE menu in the section header.
     const envPath = (suffix) => (isGlobal ? "/api/global-env" : svcPath("/env")) + (suffix || "");
@@ -3056,6 +3057,53 @@
       });
     }
 
+    // Export: download this Service's whole Environment as a .env file
+    // (the format Import reads). Every value leaves the server decrypted,
+    // so the server requires the login password (same step as Delete) and
+    // the request is a POST. The password and the downloaded text only
+    // ever live in the input field / a short-lived Blob URL.
+    async function openExport() {
+      if (needKeys("\uD83D\uDCE4 Export", "No variables in this Service yet \u2014 nothing to export.")) return;
+      let needPw = true;
+      try { const st = await apiJSON("/api/auth-status"); needPw = !st || st.loginRequired !== false; } catch (_) { needPw = true; }
+      openPanel("\uD83D\uDCE4 Export .env",
+        '<div class="sub" style="margin-bottom:10px;">Downloads all <b>' + envList.length + " variable(s)</b> of <b>" + escapeHtml(scopeName) +
+        '</b> as a <code>.env</code> file you can re-import with Import. Global and other Services are not included.</div>' +
+        '<div class="unsupported-box" style="margin-bottom:10px;"><b>The file contains your secrets in plain text</b> \u2014 store it privately and delete it when done. ' +
+        "The Secret flag is not stored in a .env file; re-imported values become secrets.</div>" +
+        (needPw ? '<div class="field"><label>Verify with your login password</label><input type="password" id="envExpPw" autocomplete="current-password"></div>' : "") +
+        '<button id="envExpGo" class="btn btn-primary btn-big"' + (needPw ? " disabled" : "") + ">Download .env</button>");
+      const pwIn = document.getElementById("envExpPw"), go = document.getElementById("envExpGo");
+      if (pwIn) {
+        pwIn.addEventListener("input", () => { go.disabled = pwIn.value.length === 0; });
+        pwIn.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !go.disabled) go.click(); });
+      }
+      go.addEventListener("click", async () => {
+        go.disabled = true;
+        try {
+          const res = await api(envPath("/export"), {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: pwIn ? pwIn.value : "" }),
+          });
+          const blob = await res.blob();
+          let filename = "microflow-service.env";
+          const m = /filename="?([^";]+)"?/.exec(res.headers.get("Content-Disposition") || "");
+          if (m && m[1]) filename = m[1];
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = filename;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 0);
+          if (pwIn) pwIn.value = "";
+          toast("\u2713 Environment exported (" + filename + ")", "success");
+          closePanel();
+        } catch (e) {
+          if (pwIn) { pwIn.value = ""; go.disabled = true; } else { go.disabled = false; }
+          toast(e.message, "error");
+        }
+      });
+    }
+
     async function openDelete() {
       const name = scopeName;
       let needPw = true;
@@ -3091,7 +3139,7 @@
       });
     }
 
-    const ACTIONS = { view: openView, edit: openEdit, add: openAdd, import: openImport, remove: openRemove, delete: openDelete };
+    const ACTIONS = { view: openView, edit: openEdit, add: openAdd, import: openImport, export: openExport, remove: openRemove, delete: openDelete };
     const menuBtn = document.getElementById("envMenuBtn"), menu = document.getElementById("envMenu");
     function outsideClick(ev) { if (!menu.contains(ev.target) && !menuBtn.contains(ev.target)) closeMenu(); }
     function closeMenu() {
