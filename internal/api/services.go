@@ -45,6 +45,7 @@ func (s *Server) routesTenancy() {
 	s.mux.HandleFunc("DELETE /api/services/{id}/env/{key}", s.handleDeleteServiceEnv)
 	s.mux.HandleFunc("GET /api/services/{id}/env/{key}", s.handleRevealServiceEnv)
 	s.mux.HandleFunc("POST /api/services/{id}/env/import", s.handleImportServiceEnv)
+	s.mux.HandleFunc("POST /api/services/{id}/env/export", s.handleExportServiceEnv)
 	s.mux.HandleFunc("POST /api/services/{id}/env/delete-all", s.handleDeleteAllServiceEnv)
 
 	s.mux.HandleFunc("POST /api/global-workflow", s.handleGlobalWorkflow)
@@ -486,6 +487,132 @@ func (s *Server) handleRevealServiceEnv(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": val})
 }
 
+type envExportRequest struct {
+	Password string `json:"password"`
+}
+
+// formatDotEnvValue renders v as a double-quoted .env value that
+// parseDotEnvValue reads back unchanged (backslash, quote, newline, CR and
+// tab are escaped), so an
+// exported file can be re-imported into any Service without losing or
+// corrupting a value.
+func formatDotEnvValue(v string) string {
+	var b strings.Builder
+	b.Grow(len(v) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+var envFileNameUnsafe = regexp.MustCompile(`[^a-z0-9_-]+`)
+
+// envExportFileName turns a Service name into a safe download name
+// (letters, digits, - and _ only), e.g. "My Service!" -> "my-service.env".
+func envExportFileName(name, fallback string) string {
+	slug := strings.Trim(envFileNameUnsafe.ReplaceAllString(strings.ToLower(name), "-"), "-_")
+	if slug == "" {
+		slug = envFileNameUnsafe.ReplaceAllString(strings.ToLower(fallback), "-")
+	}
+	if slug == "" {
+		slug = "service"
+	}
+	if len(slug) > 60 {
+		slug = slug[:60]
+	}
+	return slug + ".env"
+}
+
+// handleExportServiceEnv downloads THIS Service's whole Environment as a
+// .env file (the same format Import reads). It is the one place every
+// value of a Service leaves the server decrypted, so it is gated like
+// delete-all: POST only (never a link or a logged URL), the login gate's
+// password re-check (s.reauth, same rate limiter as login; fails closed
+// if none is wired) and Cache-Control: no-store. Only this Service's own
+// variables are exported -- never Global's or another Service's. The
+// log line carries a count only, never a key or a value.
+func (s *Server) handleExportServiceEnv(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireEnvService(w, r, id) {
+		return
+	}
+	if s.reauth == nil {
+		writeErr(w, http.StatusNotImplemented, errors.New("exporting an Environment set is not enabled on this server"))
+		return
+	}
+	var req envExportRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request body"))
+		return
+	}
+	ok, wait := s.reauth(r, req.Password)
+	if wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeErr(w, http.StatusTooManyRequests, errors.New("too many failed attempts -- try again later"))
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusForbidden, errors.New("verification failed -- nothing was exported"))
+		return
+	}
+	svc, err := s.services.GetService(r.Context(), id)
+	if err != nil || svc == nil {
+		writeErr(w, http.StatusNotFound, errors.New("service not found"))
+		return
+	}
+	list, err := s.services.ListServiceEnv(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("failed to list service environment"))
+		return
+	}
+	var b strings.Builder
+	b.WriteString("# MicroFlow Service Environment export\n")
+	b.WriteString("# Contains secrets in plain text -- keep this file private.\n")
+	b.WriteString("# Re-import with Environment > Import.\n")
+	n := 0
+	for _, e := range list {
+		val, found, err := s.envVault.GetService(r.Context(), id, e.Key)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, errors.New("failed to read service environment value"))
+			return
+		}
+		if !found {
+			continue // deleted between the list and the read
+		}
+		b.WriteString(e.Key)
+		b.WriteByte('=')
+		b.WriteString(formatDotEnvValue(val))
+		b.WriteByte('\n')
+		n++
+	}
+	if n == 0 {
+		writeErr(w, http.StatusNotFound, errors.New("this Service has no environment variables to export"))
+		return
+	}
+	log.Printf("service environment exported: service=%s variables=%d", id, n) // count only, never keys/values
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+envExportFileName(svc.Name, id)+`"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, b.String())
+}
+
 const (
 	maxEnvImportBytes   = 256 * 1024
 	maxEnvImportEntries = 500
@@ -572,6 +699,8 @@ func parseDotEnvValue(v string) (string, bool) {
 					b.WriteByte('\n')
 				case 't':
 					b.WriteByte('\t')
+				case 'r':
+					b.WriteByte('\r')
 				case '"', '\\':
 					b.WriteByte(v[i])
 				default:
