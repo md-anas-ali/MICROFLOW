@@ -79,6 +79,7 @@ var typeMap = map[string]model.NodeType{
 	"n8n-nodes-base.googleSheets":    model.TypeGoogleSheets,
 	"n8n-nodes-base.youTube":         model.TypeYouTube,
 	"n8n-nodes-base.gmail":           model.TypeGmail,
+	"microflow.socialPublish":        model.TypeSocialPublish,
 	"n8n-nodes-base.stickyNote":      model.TypeStickyNote,
 }
 
