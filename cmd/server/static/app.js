@@ -1332,6 +1332,7 @@
     ["googleSheets", "Google Sheets"],
     ["youTube", "YouTube"],
     ["gmail", "Gmail"],
+    ["socialPublish", "Social Publish (FB/IG/TikTok/Dailymotion)"],
     ["stickyNote", "Sticky Note"],
   ];
 
