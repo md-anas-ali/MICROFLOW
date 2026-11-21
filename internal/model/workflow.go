@@ -30,8 +30,9 @@ const (
 	TypeGoogleSheets    NodeType = "googleSheets"
 	TypeYouTube         NodeType = "youTube"
 	TypeGmail           NodeType = "gmail"
-	TypeStickyNote      NodeType = "stickyNote" // parsed but never executed
-	TypeUnknown         NodeType = "unknown"    // parsed but flagged incompatible
+	TypeSocialPublish   NodeType = "socialPublish" // Facebook/Instagram Reels, TikTok, Dailymotion (+ manual packs)
+	TypeStickyNote      NodeType = "stickyNote"    // parsed but never executed
+	TypeUnknown         NodeType = "unknown"       // parsed but flagged incompatible
 )
 
 // Node is one step in a workflow.
