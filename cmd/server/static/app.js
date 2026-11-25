@@ -1071,13 +1071,22 @@
         '<div class="google-conn-msg">Facebook connection expired. Please reconnect.</div>';
       actions = connectBtn("Reconnect Facebook", true);
     } else if (st.connected) {
-      const pages = (st.pages || []).map((p) =>
+      const mine = data.assignedPageId || "";
+      const pageList = st.pages || [];
+      const pages = pageList.map((p) =>
         "<li><b>" + escapeHtml(p.name) + "</b> <code>" + escapeHtml(p.id) + "</code>" +
         (p.instagram ? " &middot; Instagram @" + escapeHtml(p.instagram) : "") + "</li>").join("");
+      const mineP = pageList.find((p) => p.id === mine);
+      const assign =
+        '<div style="margin-top:12px"><label style="font-weight:600;font-size:12px">Page for this Service (' + escapeHtml(currentServiceName()) + ")</label>" +
+        '<div style="margin-top:4px;font-size:13px">' + (mineP ? "<b>" + escapeHtml(mineP.name) + "</b> <code>" + escapeHtml(mineP.id) + "</code>" +
+          (mineP.instagram ? " &middot; Instagram @" + escapeHtml(mineP.instagram) : "") : "<i>none (more Services than Pages)</i>") + "</div>" +
+        '<div class="cred-status-time" style="margin-top:4px">Automatic: Services oldest-first get Pages A\u2013Z. It can shift if Services or Pages are added/removed. ' +
+        "A pageId set on a node pins that node to a specific Page.</div></div>";
       status = '<span class="badge badge-active">connected</span>' +
         '<div class="google-conn-email">Connected as: ' + escapeHtml(st.name || "") + "</div>" +
         '<div class="cred-status-time" style="margin-top:6px">Pages you can post to (use the ID in the Environment):</div>' +
-        '<ul style="margin:6px 0 0 16px;padding:0;font-size:12px">' + pages + "</ul>";
+        '<ul style="margin:6px 0 0 16px;padding:0;font-size:12px">' + pages + "</ul>" + assign;
       actions = connectBtn("Reconnect", false) + ' <button class="btn btn-danger btn-sm" id="fbDisconnectBtn">Disconnect</button>';
     } else if (data.configured) {
       status = '<span class="badge badge-inactive">not connected</span>';
