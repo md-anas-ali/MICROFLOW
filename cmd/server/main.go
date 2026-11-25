@@ -259,7 +259,7 @@ func main() {
 	fbAccount := vault.NewFacebookAccount(accountVault)
 	// fbAppFor builds the Meta app (FB_APP_ID/FB_APP_SECRET/HOST_URL) from the
 	// merged Environment of a Service: Service > Global > host, per key.
-	fbAppFor := func(rctx context.Context, serviceID string) (*vault.FacebookApp, []string) {
+	fbAppFor := func(rctx context.Context, serviceID, baseURL string) (*vault.FacebookApp, []string) {
 		serviceEnv, globalEnv, err := envVault.ResolveAll(rctx, serviceID)
 		if err != nil {
 			serviceEnv, globalEnv = nil, nil
@@ -273,11 +273,11 @@ func main() {
 			}
 			return os.Getenv(k)
 		}
-		return vault.FacebookOAuthAppFromEnv(get)
+		return vault.FacebookOAuthAppFromEnv(get, baseURL)
 	}
 	// Lets a run pick up a Page added after connecting (uses the default Service's Environment).
 	fbAccount.SetRefresher(func(rctx context.Context) *vault.FacebookApp {
-		app, _ := fbAppFor(rctx, tenant.DefaultID)
+		app, _ := fbAppFor(rctx, tenant.DefaultID, "https://unused.invalid") // redirect is irrelevant for refreshes
 		return app
 	})
 
@@ -731,8 +731,8 @@ func main() {
 		return nil, fmt.Errorf("google oauth is not configured -- missing %s (set in Service Environment, Global Environment, or host environment)", strings.Join(missing, ", "))
 	}, googleAccounts)
 
-	apiServer.EnableFacebookOAuthResolver(func(rctx context.Context, serviceID string) (*vault.FacebookApp, error) {
-		app, missing := fbAppFor(rctx, serviceID)
+	apiServer.EnableFacebookOAuthResolver(func(rctx context.Context, serviceID, baseURL string) (*vault.FacebookApp, error) {
+		app, missing := fbAppFor(rctx, serviceID, baseURL)
 		if app == nil {
 			return nil, fmt.Errorf("Facebook login is not set up -- missing %s (set in Global Environment)", strings.Join(missing, ", "))
 		}
