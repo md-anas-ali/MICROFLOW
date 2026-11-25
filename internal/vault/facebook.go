@@ -30,6 +30,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -339,6 +340,13 @@ type FacebookAccount struct {
 	// refresher is used to pick up a Page added after connecting (needs the
 	// user token to still be valid). May be nil.
 	refresher func(ctx context.Context) *FacebookApp
+	// listServices returns every Service id, oldest first (see ensureAuto).
+	listServices func(ctx context.Context) ([]string, error)
+}
+
+// SetServiceLister enables automatic one-Page-per-Service assignment.
+func (f *FacebookAccount) SetServiceLister(fn func(ctx context.Context) ([]string, error)) {
+	f.listServices = fn
 }
 
 func NewFacebookAccount(av *AccountVault) *FacebookAccount { return &FacebookAccount{accounts: av} }
@@ -399,6 +407,51 @@ func (f *FacebookAccount) PageAccess(ctx context.Context, pageID string) (token,
 		}
 	}
 	return "", "", fmt.Errorf("Page %s is not available to the connected Facebook account (%s) -- check the ID, or reconnect Facebook and tick this Page", pageID, secrets["name"])
+}
+
+// ---------------------------------------------------------------- one Page per Service
+
+// Assignments computes, fresh every time, which Page each Service uses:
+// Services oldest-first, Pages A-Z by name (case-insensitive, ties by id);
+// Service #1 gets Page #1, Service #2 gets Page #2, and so on. With more
+// Services than Pages the newest Services get none; extra Pages are unused.
+//
+// NOTE: because it is purely positional, adding or removing a Service or a
+// Page can move Services to different Pages (e.g. a new Page named "Aardvark"
+// shifts everyone down one). Nothing is stored; use an explicit pageId on a
+// node to pin a Service to a specific Page.
+func (f *FacebookAccount) Assignments(ctx context.Context) map[string]string {
+	out := map[string]string{}
+	if f.listServices == nil {
+		return out
+	}
+	secrets, err := f.accounts.Resolve(ctx, FacebookAccountKey)
+	if err != nil {
+		return out
+	}
+	pages := pagesFrom(secrets)
+	svcs, err := f.listServices(ctx)
+	if err != nil {
+		return out
+	}
+	sort.SliceStable(pages, func(i, j int) bool {
+		a, b := strings.ToLower(pages[i].Name), strings.ToLower(pages[j].Name)
+		if a != b {
+			return a < b
+		}
+		return pages[i].ID < pages[j].ID
+	})
+	for i, svc := range svcs {
+		if i < len(pages) {
+			out[svc] = pages[i].ID
+		}
+	}
+	return out
+}
+
+// ServicePage returns the Page for a Service ("" = none).
+func (f *FacebookAccount) ServicePage(ctx context.Context, msvcID string) string {
+	return f.Assignments(ctx)[msvcID]
 }
 
 // FacebookStatus is what the Credentials page shows. Never any token.
