@@ -28,6 +28,9 @@ type Deps struct {
 	// OAuth isn't configured on this server, so those nodes only work via
 	// an explicit per-node CredentialResolver override.
 	GoogleAccounts GoogleAccountResolver
+	// Facebook is the global "Connect Facebook" login (nil = not wired; the
+	// node then needs an explicit accessToken). See social_publish.go.
+	Facebook FacebookPageResolver
 	// LocalModel is the optional local Qwen3 1.7B runtime (nil = off). See
 	// localmodel_hook.go.
 	LocalModel LocalModel

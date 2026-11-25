@@ -36,6 +36,6 @@ func DefaultRegistry(deps Deps) map[model.NodeType]engine.NodeExecutor {
 		model.TypeYouTube:      &YouTubeExecutor{Creds: deps.CredentialResolver, Accounts: deps.GoogleAccounts, Service: "youtube"},
 		model.TypeGmail:        &GmailExecutor{Creds: deps.CredentialResolver, Accounts: deps.GoogleAccounts, Service: "gmail"},
 
-		model.TypeSocialPublish: &SocialPublishExecutor{},
+		model.TypeSocialPublish: &SocialPublishExecutor{Facebook: deps.Facebook},
 	}
 }
