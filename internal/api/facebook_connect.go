@@ -8,13 +8,35 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"microflow/internal/vault"
 )
 
 // FacebookOAuthResolver builds the Meta app from the merged Environment of one
 // Service on every request (never cached), like GoogleOAuthResolver.
-type FacebookOAuthResolver func(ctx context.Context, serviceID string) (*vault.FacebookApp, error)
+// baseURL is the public address the browser used (derived from the request), used
+// as the redirect when HOST_URL / FB_OAUTH_REDIRECT_URL are not set.
+type FacebookOAuthResolver func(ctx context.Context, serviceID, baseURL string) (*vault.FacebookApp, error)
+
+// requestBaseURL is the scheme+host the browser used to reach this server,
+// honoring the reverse-proxy headers hosts like Render/Heroku add. A wrong or
+// spoofed value cannot be abused: the redirect must match one registered in
+// the Meta app, and the login state is HMAC-signed.
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if v := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); v == "http" || v == "https" {
+		scheme = v
+	}
+	host := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0])
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
+}
 
 // EnableFacebookOAuthResolver registers the Facebook connect routes.
 func (s *Server) EnableFacebookOAuthResolver(resolve FacebookOAuthResolver, account *vault.FacebookAccount) {
@@ -33,7 +55,7 @@ func (s *Server) handleFacebookConnection(w http.ResponseWriter, r *http.Request
 	if !s.requireService(w, r, msvc) {
 		return
 	}
-	app, appErr := s.fbOAuthResolver(r.Context(), msvc)
+	app, appErr := s.fbOAuthResolver(r.Context(), msvc, requestBaseURL(r))
 	st, err := s.fbAccount.Status(r.Context(), app)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to check Facebook connection"))
@@ -51,7 +73,7 @@ func (s *Server) handleFacebookConnectStart(w http.ResponseWriter, r *http.Reque
 	if !s.requireService(w, r, msvc) {
 		return
 	}
-	app, err := s.fbOAuthResolver(r.Context(), msvc)
+	app, err := s.fbOAuthResolver(r.Context(), msvc, requestBaseURL(r))
 	if err != nil {
 		http.Redirect(w, r, "/#/services/"+url.PathEscape(msvc)+"/credentials?fbError="+urlMsg(err.Error()), http.StatusFound)
 		return
@@ -85,7 +107,7 @@ func (s *Server) handleFacebookOAuthCallback(w http.ResponseWriter, r *http.Requ
 		fail("Invalid Facebook callback")
 		return
 	}
-	app, err := s.fbOAuthResolver(r.Context(), stateMsvc)
+	app, err := s.fbOAuthResolver(r.Context(), stateMsvc, requestBaseURL(r))
 	if err != nil {
 		fail(err.Error())
 		return
