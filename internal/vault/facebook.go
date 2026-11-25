@@ -317,6 +317,26 @@ func (a *FacebookApp) Exchange(ctx context.Context, code, state string) (msvcID 
 	}, nil
 }
 
+// renewUserToken swaps a still-valid long-lived user token for a fresh one
+// (new ~60 day clock). Facebook only honors this for a token that is still valid.
+func (a *FacebookApp) renewUserToken(ctx context.Context, token string) (string, string, error) {
+	var r fbTokenResp
+	if err := a.graph(ctx, "POST", "/oauth/access_token", "", url.Values{
+		"grant_type": {"fb_exchange_token"}, "client_id": {a.AppID}, "client_secret": {a.AppSecret},
+		"fb_exchange_token": {token},
+	}, &r); err != nil {
+		return "", "", err
+	}
+	if r.AccessToken == "" {
+		return "", "", errors.New("no token returned")
+	}
+	exp := ""
+	if r.ExpiresIn > 0 {
+		exp = strconv.FormatInt(time.Now().Add(time.Duration(r.ExpiresIn)*time.Second).Unix(), 10)
+	}
+	return r.AccessToken, exp, nil
+}
+
 // CheckToken asks Facebook (debug_token) whether a token is still valid.
 func (a *FacebookApp) CheckToken(ctx context.Context, token string) (bool, error) {
 	var r struct {
@@ -407,6 +427,37 @@ func (f *FacebookAccount) PageAccess(ctx context.Context, pageID string) (token,
 		}
 	}
 	return "", "", fmt.Errorf("Page %s is not available to the connected Facebook account (%s) -- check the ID, or reconnect Facebook and tick this Page", pageID, secrets["name"])
+}
+
+// Refresh keeps the connection alive without anyone clicking Reconnect: it
+// renews the long-lived user token (restarting its ~60 day clock) and re-reads
+// the Page list, so new Pages appear and deleted Pages disappear. Meant to run
+// about once a day (see main.go). It changes nothing if Facebook refuses
+// (e.g. the user changed their password) -- posting keeps using the stored
+// Page tokens, and the Credentials page shows Reconnect when they die.
+func (f *FacebookAccount) Refresh(ctx context.Context, app *FacebookApp) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	secrets, err := f.accounts.Resolve(ctx, FacebookAccountKey)
+	if err != nil || secrets["userToken"] == "" || app == nil {
+		return nil // not connected: nothing to do
+	}
+	user := secrets["userToken"]
+	if nt, exp, rerr := app.renewUserToken(ctx, user); rerr == nil {
+		user = nt
+		secrets["userToken"], secrets["userExpiresAt"] = nt, exp
+	} else if errors.Is(rerr, ErrFacebookReauthRequired) {
+		return fmt.Errorf("facebook refresh: %w", rerr)
+	}
+	pages, err := app.listPages(ctx, user)
+	if err != nil {
+		return fmt.Errorf("facebook refresh: %w", err)
+	}
+	if len(pages) > 0 { // never wipe the list on an empty (possibly glitchy) answer
+		pj, _ := json.Marshal(pages)
+		secrets["pages"] = string(pj)
+	}
+	return f.accounts.Put(ctx, FacebookAccountKey, secrets)
 }
 
 // ---------------------------------------------------------------- one Page per Service
