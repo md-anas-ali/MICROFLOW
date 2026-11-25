@@ -61,7 +61,11 @@ func (s *Server) handleFacebookConnection(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusInternalServerError, errors.New("failed to check Facebook connection"))
 		return
 	}
-	out := map[string]any{"status": st, "configured": appErr == nil}
+	out := map[string]any{
+		"status": st, "configured": appErr == nil,
+		"assignedPageId": s.fbAccount.ServicePage(r.Context(), msvc), // this Service's Page
+		"assignments":    s.fbAccount.Assignments(r.Context()),       // every Service -> Page
+	}
 	if appErr != nil {
 		out["configHint"] = appErr.Error()
 	}
