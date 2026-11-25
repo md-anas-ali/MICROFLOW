@@ -100,6 +100,11 @@ type Server struct {
 	// fallback used by EnableGoogleOAuth.
 	googleOAuthResolver GoogleOAuthResolver
 
+	// fbOAuthResolver/fbAccount back the global "Connect Facebook" login
+	// (facebook_connect.go). Nil unless EnableFacebookOAuthResolver is called.
+	fbOAuthResolver FacebookOAuthResolver
+	fbAccount       *vault.FacebookAccount
+
 	// manager and execLoader back the async execute/executions/events
 	// endpoints (handleExecuteAsync, handleGetExecution,
 	// handleCancelExecution, handleExecutionEvents). Both nil-safe by
