@@ -1008,6 +1008,8 @@
       '<div class="sub">Connect Gmail, YouTube and Google Sheets for <b>' + escapeHtml(currentServiceName()) + "</b>.</div></div></div>" +
       '<div id="googleConnCards" class="google-conn-cards">' + loadingRow("Checking connections\u2026") + "</div>" +
       '<div id="googleConnNotConfigured" class="field-error" style="display:none;"></div>' +
+      '<h2 class="cred-h2" style="margin:22px 0 8px;font-size:15px;">Facebook &amp; Instagram (one login for all Pages)</h2>' +
+      '<div id="fbConnCard" class="google-conn-cards">' + loadingRow("Checking Facebook\u2026") + "</div>" +
       (currentService === "default"
         ? '<details class="cred-advanced"><summary>Advanced: manual credential (Default Service only)</summary>'
         : '<details class="cred-advanced" style="display:none"><summary></summary>') +
@@ -1026,10 +1028,77 @@
       '<div id="centralCredError" class="field-error"></div>' +
       "</div></details>";
 
+    handleFacebookCallbackQueryParams();
     handleGoogleCallbackQueryParams();
     wireCentralCredentialsPage();
     refreshCentralCredentialStatus();
     refreshGoogleConnections();
+    refreshFacebookConnection();
+  }
+
+  // ---------------- Facebook / Instagram: one global login ----------------
+  // Log in once; put only the Page ID(s) in the Environment (e.g.
+  // FB_PAGE_ID=111,222) and use {{ $env.FB_PAGE_ID }} as the node's pageId.
+  // Page tokens and the linked Instagram account are fetched automatically
+  // (GET /api/services/{id}/facebook/connection|connect|disconnect).
+  function handleFacebookCallbackQueryParams() {
+    const hash = location.hash || "";
+    const qIdx = hash.indexOf("?");
+    if (qIdx === -1) return;
+    const params = new URLSearchParams(hash.slice(qIdx + 1));
+    if (params.get("fbConnected")) toast("Facebook connected", "success");
+    else if (params.get("fbError")) toast(params.get("fbError"), "error");
+    else return;
+    history.replaceState(null, "", hash.slice(0, qIdx));
+  }
+
+  async function refreshFacebookConnection() {
+    const el = document.getElementById("fbConnCard");
+    if (!el) return;
+    let data;
+    try {
+      data = await apiJSON(svcPath("/facebook/connection"));
+    } catch (e) {
+      el.innerHTML = '<div class="field-error">Could not check Facebook: ' + escapeHtml(e.message) + "</div>";
+      return;
+    }
+    const st = data.status || {};
+    const connectBtn = (label, primary) =>
+      '<a class="btn ' + (primary ? "btn-primary " : "") + 'btn-sm" href="' + svcPath("/facebook/connect") + '">' + label + "</a>";
+    let status, actions;
+    if (st.connected && st.needsReconnect) {
+      status = '<span class="badge badge-inactive">connection expired</span>' +
+        '<div class="google-conn-msg">Facebook connection expired. Please reconnect.</div>';
+      actions = connectBtn("Reconnect Facebook", true);
+    } else if (st.connected) {
+      const pages = (st.pages || []).map((p) =>
+        "<li><b>" + escapeHtml(p.name) + "</b> <code>" + escapeHtml(p.id) + "</code>" +
+        (p.instagram ? " &middot; Instagram @" + escapeHtml(p.instagram) : "") + "</li>").join("");
+      status = '<span class="badge badge-active">connected</span>' +
+        '<div class="google-conn-email">Connected as: ' + escapeHtml(st.name || "") + "</div>" +
+        '<div class="cred-status-time" style="margin-top:6px">Pages you can post to (use the ID in the Environment):</div>' +
+        '<ul style="margin:6px 0 0 16px;padding:0;font-size:12px">' + pages + "</ul>";
+      actions = connectBtn("Reconnect", false) + ' <button class="btn btn-danger btn-sm" id="fbDisconnectBtn">Disconnect</button>';
+    } else if (data.configured) {
+      status = '<span class="badge badge-inactive">not connected</span>';
+      actions = connectBtn("Connect Facebook", true);
+    } else {
+      status = '<span class="badge badge-inactive">not set up</span>' +
+        '<div class="field-error" style="margin-top:8px">' + escapeHtml(data.configHint || "") + "</div>";
+      actions = "";
+    }
+    el.innerHTML = '<div class="google-conn-card"><h3>Facebook &amp; Instagram</h3>' +
+      '<div class="google-conn-status">' + status + '</div><div class="google-conn-actions">' + actions + "</div></div>";
+    const d = document.getElementById("fbDisconnectBtn");
+    if (d) d.addEventListener("click", async () => {
+      if (!confirm("Disconnect Facebook? Workflows posting to Facebook/Instagram will stop until reconnected.")) return;
+      d.disabled = true;
+      try {
+        await apiJSON(svcPath("/facebook/disconnect"), { method: "POST" });
+        toast("Facebook disconnected", "success");
+        refreshFacebookConnection();
+      } catch (e) { toast("Disconnect failed: " + e.message, "error"); d.disabled = false; }
+    });
   }
 
   // Google's OAuth redirect lands back here as
