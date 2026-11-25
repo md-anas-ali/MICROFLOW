@@ -49,8 +49,33 @@ var (
 
 const socialMaxBody = 2 << 20 // cap on any API response we read
 
+// FacebookPageResolver supplies Page tokens from the global "Connect Facebook"
+// login (implemented by *vault.FacebookAccount). With it, a facebookReels /
+// instagramReels node needs only pageId (comma-separated for several Pages):
+// accessToken and igUserId are filled in automatically. An explicit
+// accessToken on the node still wins, so old workflows keep working.
+type FacebookPageResolver interface {
+	Connected(ctx context.Context) bool
+	PageAccess(ctx context.Context, pageID string) (token, igUserID string, err error)
+}
+
 type SocialPublishExecutor struct {
-	Client *http.Client // nil -> a no-overall-timeout client (uploads are long); ctx bounds each call
+	Client   *http.Client         // nil -> a no-overall-timeout client (uploads are long); ctx bounds each call
+	Facebook FacebookPageResolver // nil -> Facebook/Instagram need an explicit accessToken
+}
+
+// splitIDs splits "111, 222\n333" into ["111","222","333"].
+func splitIDs(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' })
+}
+
+// fbLoginMsg turns Facebook's "token invalid" (code 190) into a plain instruction.
+func fbLoginMsg(err error) error {
+	var a *apiErr
+	if errors.As(err, &a) && strings.Contains(a.Body, `"code":190`) {
+		return engine.Permanent(fmt.Errorf("Facebook connection expired or was revoked -- open Credentials and click Reconnect Facebook (%w)", err))
+	}
+	return err
 }
 
 func (e *SocialPublishExecutor) client() *http.Client {
@@ -85,20 +110,21 @@ func (e *SocialPublishExecutor) Execute(ctx context.Context, rc *engine.RunConte
 		// (not failed), so the workflow can be wired for all platforms up front and
 		// each one switches on as soon as its env variables are filled in.
 		if boolStr(p("skipIfUnconfigured", "false")) == "true" {
-			if missing := unconfigured(platform, p); missing != "" {
+			if missing := unconfigured(platform, p, e.Facebook != nil && e.Facebook.Connected(ctx)); missing != "" {
 				out = append(out, model.Item{JSON: map[string]any{"platform": platform, "skipped": true, "reason": "not configured: " + missing}, Binary: it.Binary})
 				continue
 			}
 		}
 		var (
-			res map[string]any
-			err error
+			results []map[string]any // one per Page for Facebook/Instagram, else one
+			res     map[string]any
+			err     error
 		)
 		switch platform {
 		case "facebookReels":
-			res, err = e.facebookReels(ctx, p, ref)
+			results, err = e.facebookPages(ctx, p, ref)
 		case "instagramReels":
-			res, err = e.instagramReels(ctx, p, ref)
+			results, err = e.instagramPages(ctx, p, ref)
 		case "tiktok":
 			res, err = e.tiktok(ctx, p, ref)
 		case "dailymotion":
@@ -111,27 +137,37 @@ func (e *SocialPublishExecutor) Execute(ctx context.Context, rc *engine.RunConte
 		if err != nil {
 			return nil, fmt.Errorf("socialPublish %q (%s): %w", node.Name, platform, err)
 		}
-		res["platform"] = platform
-		out = append(out, model.Item{JSON: res, Binary: it.Binary})
+		if results == nil {
+			results = []map[string]any{res}
+		}
+		for _, r := range results {
+			r["platform"] = platform
+			out = append(out, model.Item{JSON: r, Binary: it.Binary})
+		}
 	}
 	return model.NodeOutput{out}, nil
 }
 
 // unconfigured returns the name of the first missing required setting ("" = all set).
-func unconfigured(platform string, p func(string, string) string) string {
+// fbConnected = a global Facebook login exists, so a token/IG id isn't needed
+// on the node as long as pageId is set.
+func unconfigured(platform string, p func(string, string) string, fbConnected bool) string {
 	switch platform {
 	case "facebookReels":
-		for _, k := range []string{"pageId", "accessToken"} {
-			if p(k, "") == "" {
-				return k
-			}
+		if p("pageId", "") == "" {
+			return "pageId"
+		}
+		if p("accessToken", "") == "" && !fbConnected {
+			return "accessToken (or Connect Facebook)"
 		}
 	case "instagramReels":
-		for _, k := range []string{"igUserId", "accessToken"} {
-			if p(k, "") == "" {
-				return k
-			}
+		if p("accessToken", "") != "" && p("igUserId", "") != "" {
+			return ""
 		}
+		if p("pageId", "") != "" && fbConnected {
+			return ""
+		}
+		return "igUserId + accessToken (or pageId + Connect Facebook)"
 	case "tiktok", "dailymotion":
 		if p("accessToken", "") == "" && p("refreshToken", "") == "" {
 			return "accessToken or refreshToken"
@@ -249,8 +285,36 @@ func fileSize(path string) (int64, error) {
 
 // ---------------------------------------------------------------- Facebook Reels (Page)
 
-func (e *SocialPublishExecutor) facebookReels(ctx context.Context, p func(string, string) string, ref model.BinaryRef) (map[string]any, error) {
-	pageID, token := p("pageId", ""), p("accessToken", "")
+// facebookPages posts to every Page in pageId (comma-separated allowed). The
+// Page token comes from the node's accessToken if set, else from the global
+// Facebook login. Pages are posted one after another; the first failure stops
+// the node (Pages already posted are not rolled back).
+func (e *SocialPublishExecutor) facebookPages(ctx context.Context, p func(string, string) string, ref model.BinaryRef) ([]map[string]any, error) {
+	ids := splitIDs(p("pageId", ""))
+	if len(ids) == 0 {
+		return nil, engine.Permanent(errors.New(`required setting "pageId" is empty`))
+	}
+	var all []map[string]any
+	for _, id := range ids {
+		token := p("accessToken", "")
+		if token == "" && e.Facebook != nil {
+			t, _, err := e.Facebook.PageAccess(ctx, id)
+			if err != nil {
+				return nil, engine.Permanent(err)
+			}
+			token = t
+		}
+		res, err := e.facebookReels(ctx, id, token, p, ref)
+		if err != nil {
+			return nil, fmt.Errorf("page %s: %w", id, fbLoginMsg(err))
+		}
+		res["pageId"] = id
+		all = append(all, res)
+	}
+	return all, nil
+}
+
+func (e *SocialPublishExecutor) facebookReels(ctx context.Context, pageID, token string, p func(string, string) string, ref model.BinaryRef) (map[string]any, error) {
 	if err := need(map[string]string{"pageId": pageID, "accessToken": token}); err != nil {
 		return nil, err
 	}
@@ -305,8 +369,40 @@ func (e *SocialPublishExecutor) facebookReels(ctx context.Context, p func(string
 
 // ---------------------------------------------------------------- Instagram Reels
 
-func (e *SocialPublishExecutor) instagramReels(ctx context.Context, p func(string, string) string, ref model.BinaryRef) (map[string]any, error) {
-	igID, token := p("igUserId", ""), p("accessToken", "")
+// instagramPages: explicit igUserId+accessToken behave exactly as before.
+// Otherwise, for each Page in pageId, the Instagram business account linked to
+// that Page and the Page token come from the global Facebook login.
+func (e *SocialPublishExecutor) instagramPages(ctx context.Context, p func(string, string) string, ref model.BinaryRef) ([]map[string]any, error) {
+	if igID, token := p("igUserId", ""), p("accessToken", ""); igID != "" || token != "" || p("pageId", "") == "" {
+		res, err := e.instagramReels(ctx, igID, token, p, ref)
+		if err != nil {
+			return nil, fbLoginMsg(err)
+		}
+		return []map[string]any{res}, nil
+	}
+	if e.Facebook == nil {
+		return nil, engine.Permanent(errors.New("Instagram needs igUserId + accessToken (Facebook login is not available on this server)"))
+	}
+	var all []map[string]any
+	for _, id := range splitIDs(p("pageId", "")) {
+		token, igID, err := e.Facebook.PageAccess(ctx, id)
+		if err != nil {
+			return nil, engine.Permanent(err)
+		}
+		if igID == "" {
+			return nil, engine.Permanent(fmt.Errorf("page %s has no linked Instagram business/creator account (link it in Facebook Page settings, then reconnect Facebook)", id))
+		}
+		res, err := e.instagramReels(ctx, igID, token, p, ref)
+		if err != nil {
+			return nil, fmt.Errorf("page %s: %w", id, fbLoginMsg(err))
+		}
+		res["pageId"], res["igUserId"] = id, igID
+		all = append(all, res)
+	}
+	return all, nil
+}
+
+func (e *SocialPublishExecutor) instagramReels(ctx context.Context, igID, token string, p func(string, string) string, ref model.BinaryRef) (map[string]any, error) {
 	if err := need(map[string]string{"igUserId": igID, "accessToken": token}); err != nil {
 		return nil, err
 	}
