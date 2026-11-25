@@ -101,6 +101,20 @@ func (e *SocialPublishExecutor) Execute(ctx context.Context, rc *engine.RunConte
 			}
 			return strings.TrimSpace(def)
 		}
+		// Automatic Page: when the node has no pageId, use the Page auto-assigned
+		// to this workflow's Service (same one the Credentials page shows).
+		basePage := p
+		p = func(key, def string) string {
+			v := basePage(key, def)
+			if key == "pageId" && v == "" && e.Facebook != nil && rc != nil && rc.Workflow != nil {
+				if sp, ok := e.Facebook.(interface {
+					ServicePage(ctx context.Context, svcID string) string
+				}); ok {
+					return sp.ServicePage(ctx, rc.Workflow.ServiceID)
+				}
+			}
+			return v
+		}
 		platform := p("platform", "")
 		ref, ok := it.Binary["data"]
 		if !ok || ref.FileName == "" {
