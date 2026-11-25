@@ -86,12 +86,19 @@ func NewFacebookApp(id, secret, redirect, scopes string) *FacebookApp {
 
 // FacebookOAuthAppFromEnv builds the app from FB_APP_ID / FB_APP_SECRET and
 // HOST_URL (or FB_OAUTH_REDIRECT_URL). ok=false when something is missing.
-func FacebookOAuthAppFromEnv(getenv func(string) string) (app *FacebookApp, missing []string) {
+//
+// Redirect URL, in order: HOST_URL, FB_OAUTH_REDIRECT_URL, else fallbackBase
+// (the address the browser used to reach MicroFlow, derived per request) +
+// the callback path -- so normally nothing needs to be configured for it.
+func FacebookOAuthAppFromEnv(getenv func(string) string, fallbackBase string) (app *FacebookApp, missing []string) {
 	id := strings.TrimSpace(getenv("FB_APP_ID"))
 	secret := strings.TrimSpace(getenv("FB_APP_SECRET"))
 	redirect := strings.TrimSpace(getenv("FB_OAUTH_REDIRECT_URL"))
 	if host := NormalizeHostURL(getenv(HostURLEnvKey)); host != "" {
 		redirect = host + FacebookOAuthCallbackPath
+	}
+	if redirect == "" && NormalizeHostURL(fallbackBase) != "" {
+		redirect = NormalizeHostURL(fallbackBase) + FacebookOAuthCallbackPath
 	}
 	if id == "" {
 		missing = append(missing, "FB_APP_ID")
@@ -100,7 +107,7 @@ func FacebookOAuthAppFromEnv(getenv func(string) string) (app *FacebookApp, miss
 		missing = append(missing, "FB_APP_SECRET")
 	}
 	if redirect == "" {
-		missing = append(missing, HostURLEnvKey+" (or FB_OAUTH_REDIRECT_URL)")
+		missing = append(missing, "the public address (set HOST_URL)")
 	}
 	if len(missing) > 0 {
 		return nil, missing
