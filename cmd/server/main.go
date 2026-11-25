@@ -275,6 +275,33 @@ func main() {
 		}
 		return vault.FacebookOAuthAppFromEnv(get, baseURL)
 	}
+	// Automatic one-Page-per-Service assignment needs the Service list (oldest first).
+	fbAccount.SetServiceLister(func(lctx context.Context) ([]string, error) {
+		list, err := st.ListServices(lctx)
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]string, 0, len(list))
+		for _, sv := range list {
+			ids = append(ids, sv.ID)
+		}
+		return ids, nil
+	})
+	// Once a day: renew the Facebook login's ~60 day clock and re-read the Page
+	// list, so no one has to click Reconnect and new/deleted Pages are noticed.
+	go func() {
+		time.Sleep(2 * time.Minute)
+		for {
+			rctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			if app, _ := fbAppFor(rctx, tenant.DefaultID, "https://unused.invalid"); app != nil {
+				if err := fbAccount.Refresh(rctx, app); err != nil {
+					log.Printf("facebook daily refresh: %v", err)
+				}
+			}
+			cancel()
+			time.Sleep(24 * time.Hour)
+		}
+	}()
 	// Lets a run pick up a Page added after connecting (uses the default Service's Environment).
 	fbAccount.SetRefresher(func(rctx context.Context) *vault.FacebookApp {
 		app, _ := fbAppFor(rctx, tenant.DefaultID, "https://unused.invalid") // redirect is irrelevant for refreshes
