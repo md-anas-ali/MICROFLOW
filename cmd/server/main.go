@@ -46,6 +46,7 @@ import (
 	"microflow/internal/scheduler"
 	"microflow/internal/standby"
 	"microflow/internal/store"
+	"microflow/internal/tenant"
 	"microflow/internal/vault"
 	"microflow/internal/webhook"
 )
@@ -253,6 +254,33 @@ func main() {
 	// vault.GoogleServiceAccounts's doc comment.
 	googleAccounts := vault.NewGoogleServiceAccounts(accountVault)
 
+	// fbAccount is the one global "Connect Facebook" login; socialPublish
+	// nodes read Page tokens from it (only pageId is needed in the Environment).
+	fbAccount := vault.NewFacebookAccount(accountVault)
+	// fbAppFor builds the Meta app (FB_APP_ID/FB_APP_SECRET/HOST_URL) from the
+	// merged Environment of a Service: Service > Global > host, per key.
+	fbAppFor := func(rctx context.Context, serviceID string) (*vault.FacebookApp, []string) {
+		serviceEnv, globalEnv, err := envVault.ResolveAll(rctx, serviceID)
+		if err != nil {
+			serviceEnv, globalEnv = nil, nil
+		}
+		get := func(k string) string {
+			if v := strings.TrimSpace(serviceEnv[k]); v != "" {
+				return v
+			}
+			if v := strings.TrimSpace(globalEnv[k]); v != "" {
+				return v
+			}
+			return os.Getenv(k)
+		}
+		return vault.FacebookOAuthAppFromEnv(get)
+	}
+	// Lets a run pick up a Page added after connecting (uses the default Service's Environment).
+	fbAccount.SetRefresher(func(rctx context.Context) *vault.FacebookApp {
+		app, _ := fbAppFor(rctx, tenant.DefaultID)
+		return app
+	})
+
 	scratchRoot := resolveScratchRoot(envOr("MICROFLOW_SCRATCH_DIR", "/tmp/microflow"))
 
 	allowedBinaries := map[string]string{
@@ -316,6 +344,7 @@ func main() {
 		// chosen independently. See internal/nodes/google.go.
 		CredentialResolver: perNodeCreds,
 		GoogleAccounts:     googleAccounts,
+		Facebook:           fbAccount,
 	})
 	eng := engine.New(registry)
 
@@ -701,6 +730,14 @@ func main() {
 		}
 		return nil, fmt.Errorf("google oauth is not configured -- missing %s (set in Service Environment, Global Environment, or host environment)", strings.Join(missing, ", "))
 	}, googleAccounts)
+
+	apiServer.EnableFacebookOAuthResolver(func(rctx context.Context, serviceID string) (*vault.FacebookApp, error) {
+		app, missing := fbAppFor(rctx, serviceID)
+		if app == nil {
+			return nil, fmt.Errorf("Facebook login is not set up -- missing %s (set in Global Environment)", strings.Join(missing, ", "))
+		}
+		return app, nil
+	}, fbAccount)
 
 	whServer := webhook.NewServer()
 	webhookToken := envOr("MICROFLOW_WEBHOOK_TOKEN", "")
