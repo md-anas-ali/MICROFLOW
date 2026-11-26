@@ -78,6 +78,29 @@ func fbLoginMsg(err error) error {
 	return err
 }
 
+// fbPageHealer is implemented by *vault.FacebookAccount. It lets a run recover
+// from a stale Page token and find an Instagram account /me/accounts omitted.
+type fbPageHealer interface {
+	RefreshPage(ctx context.Context, pageID string) (token, igUserID string, err error)
+	LookupInstagram(ctx context.Context, pageID string) (string, error)
+}
+
+// isFBAppUserErr matches Facebook's OAuthException code 200
+// "Cannot call API for app X on behalf of user Y": the stored Page token
+// belongs to a user the app is not allowed to act for.
+func isFBAppUserErr(err error) bool {
+	var a *apiErr
+	return errors.As(err, &a) && strings.Contains(a.Body, "Cannot call API for app")
+}
+
+// fbAppUserMsg explains the error in plain words (the real cause is on Meta's side).
+func fbAppUserMsg(err error) error {
+	return engine.Permanent(fmt.Errorf("Facebook refused the connected login (the app is not allowed to act for that Facebook user). "+
+		"Fix on developers.facebook.com: (1) put the app in Live mode, OR add that Facebook user under App roles as Admin/Developer/Tester; "+
+		"(2) make sure that user still has full control of the Page (Page settings -> Page access, or Business Portfolio -> Pages -> that user -> Facebook access = Full control); "+
+		"(3) then open Credentials -> Disconnect -> Connect Facebook and tick this Page (%w)", err))
+}
+
 func (e *SocialPublishExecutor) client() *http.Client {
 	if e.Client != nil {
 		return e.Client
@@ -319,7 +342,18 @@ func (e *SocialPublishExecutor) facebookPages(ctx context.Context, p func(string
 			token = t
 		}
 		res, err := e.facebookReels(ctx, id, token, p, ref)
+		// Stale Page token / app-user mismatch: re-read the Page tokens once and retry.
+		if err != nil && isFBAppUserErr(err) && p("accessToken", "") == "" {
+			if h, ok := e.Facebook.(fbPageHealer); ok {
+				if nt, _, rerr := h.RefreshPage(ctx, id); rerr == nil && nt != "" && nt != token {
+					res, err = e.facebookReels(ctx, id, nt, p, ref)
+				}
+			}
+		}
 		if err != nil {
+			if isFBAppUserErr(err) {
+				err = fbAppUserMsg(err)
+			}
 			return nil, fmt.Errorf("page %s: %w", id, fbLoginMsg(err))
 		}
 		res["pageId"] = id
@@ -404,10 +438,28 @@ func (e *SocialPublishExecutor) instagramPages(ctx context.Context, p func(strin
 			return nil, engine.Permanent(err)
 		}
 		if igID == "" {
+			// /me/accounts omits the link for some Pages: ask Facebook about this Page directly.
+			if h, ok := e.Facebook.(fbPageHealer); ok {
+				if found, lerr := h.LookupInstagram(ctx, id); lerr == nil {
+					igID = found
+				}
+			}
+		}
+		if igID == "" {
 			return nil, engine.Permanent(fmt.Errorf("page %s has no linked Instagram business/creator account (link it in Facebook Page settings, then reconnect Facebook)", id))
 		}
 		res, err := e.instagramReels(ctx, igID, token, p, ref)
+		if err != nil && isFBAppUserErr(err) {
+			if h, ok := e.Facebook.(fbPageHealer); ok {
+				if nt, _, rerr := h.RefreshPage(ctx, id); rerr == nil && nt != "" && nt != token {
+					res, err = e.instagramReels(ctx, igID, nt, p, ref)
+				}
+			}
+		}
 		if err != nil {
+			if isFBAppUserErr(err) {
+				err = fbAppUserMsg(err)
+			}
 			return nil, fmt.Errorf("page %s: %w", id, fbLoginMsg(err))
 		}
 		res["pageId"], res["igUserId"] = id, igID
