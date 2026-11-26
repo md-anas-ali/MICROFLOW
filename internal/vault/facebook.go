@@ -214,7 +214,7 @@ func (a *FacebookApp) graph(ctx context.Context, method, path string, bearer str
 		if e.Error.Code == 190 {
 			return fmt.Errorf("%w: %s", ErrFacebookReauthRequired, e.Error.Message)
 		}
-		return fmt.Errorf("facebook HTTP %d: %s", resp.StatusCode, e.Error.Message)
+		return fmt.Errorf("facebook HTTP %d (code %d): %s", resp.StatusCode, e.Error.Code, e.Error.Message)
 	}
 	if out != nil {
 		if err := json.Unmarshal(b, out); err != nil {
@@ -230,7 +230,7 @@ func (a *FacebookApp) listPages(ctx context.Context, userToken string) ([]Facebo
 	var pages []FacebookPage
 	after := ""
 	for i := 0; i < 20; i++ { // hard cap: 20 pages of 100
-		q := url.Values{"fields": {"id,name,access_token,instagram_business_account{id,username}"}, "limit": {"100"}}
+		q := url.Values{"fields": {"id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}"}, "limit": {"100"}}
 		if after != "" {
 			q.Set("after", after)
 		}
@@ -242,6 +242,12 @@ func (a *FacebookApp) listPages(ctx context.Context, userToken string) ([]Facebo
 					ID       string `json:"id"`
 					Username string `json:"username"`
 				} `json:"instagram_business_account"`
+				// Pages managed through a Business Portfolio sometimes expose the
+				// Instagram account only under this older field.
+				IGConnected *struct {
+					ID       string `json:"id"`
+					Username string `json:"username"`
+				} `json:"connected_instagram_account"`
 			} `json:"data"`
 			Paging struct {
 				Cursors struct {
@@ -260,6 +266,8 @@ func (a *FacebookApp) listPages(ctx context.Context, userToken string) ([]Facebo
 			p := FacebookPage{ID: d.ID, Name: d.Name, Token: d.AccessToken}
 			if d.IG != nil {
 				p.IGID, p.IGUser = d.IG.ID, d.IG.Username
+			} else if d.IGConnected != nil {
+				p.IGID, p.IGUser = d.IGConnected.ID, d.IGConnected.Username
 			}
 			pages = append(pages, p)
 		}
@@ -427,6 +435,113 @@ func (f *FacebookAccount) PageAccess(ctx context.Context, pageID string) (token,
 		}
 	}
 	return "", "", fmt.Errorf("Page %s is not available to the connected Facebook account (%s) -- check the ID, or reconnect Facebook and tick this Page", pageID, secrets["name"])
+}
+
+// RefreshPage force-reloads the Page list with the stored user token (renewing
+// that token first when Facebook allows it) and returns the fresh Page token
+// and Instagram id for pageID. socialPublish calls it once when Facebook
+// rejects the stored Page token ("Cannot call API for app ... on behalf of
+// user ..."), so a stale Page token heals itself without a manual Reconnect.
+func (f *FacebookAccount) RefreshPage(ctx context.Context, pageID string) (token, igUserID string, err error) {
+	pageID = strings.TrimSpace(pageID)
+	secrets, err := f.accounts.Resolve(ctx, FacebookAccountKey)
+	if err != nil {
+		return "", "", errors.New("Facebook is not connected")
+	}
+	if f.refresher == nil || secrets["userToken"] == "" {
+		return "", "", errors.New("no stored Facebook user login to refresh from")
+	}
+	app := f.refresher(ctx)
+	if app == nil {
+		return "", "", errors.New("FB_APP_ID / FB_APP_SECRET are not configured, cannot refresh the Page token")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	user := secrets["userToken"]
+	if nt, exp, rerr := app.renewUserToken(ctx, user); rerr == nil {
+		user = nt
+		secrets["userToken"], secrets["userExpiresAt"] = nt, exp
+	}
+	pages, err := app.listPages(ctx, user)
+	if err != nil {
+		return "", "", err
+	}
+	if len(pages) == 0 {
+		return "", "", errors.New("Facebook returned no Pages for the stored login")
+	}
+	pj, _ := json.Marshal(pages)
+	secrets["pages"] = string(pj)
+	_ = f.accounts.Put(ctx, FacebookAccountKey, secrets)
+	for _, p := range pages {
+		if p.ID == pageID {
+			return p.Token, p.IGID, nil
+		}
+	}
+	return "", "", fmt.Errorf("Page %s is no longer available to the connected Facebook account", pageID)
+}
+
+// LookupInstagram asks Facebook directly (using the Page token) which Instagram
+// account is linked to pageID. /me/accounts leaves it out for some Pages
+// (typically ones managed through a Business Portfolio), although the link
+// exists. A found id is saved so the lookup happens once. "" = really none.
+func (f *FacebookAccount) LookupInstagram(ctx context.Context, pageID string) (string, error) {
+	pageID = strings.TrimSpace(pageID)
+	secrets, err := f.accounts.Resolve(ctx, FacebookAccountKey)
+	if err != nil {
+		return "", errors.New("Facebook is not connected")
+	}
+	pages := pagesFrom(secrets)
+	idx := -1
+	for i, p := range pages {
+		if p.ID == pageID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || f.refresher == nil {
+		return "", nil
+	}
+	app := f.refresher(ctx)
+	if app == nil {
+		return "", nil
+	}
+	var r struct {
+		IBA *struct {
+			ID       string `json:"id"`
+			Username string `json:"username"`
+		} `json:"instagram_business_account"`
+		CIA *struct {
+			ID       string `json:"id"`
+			Username string `json:"username"`
+		} `json:"connected_instagram_account"`
+	}
+	q := url.Values{"fields": {"instagram_business_account{id,username},connected_instagram_account{id,username}"}}
+	if err := app.graph(ctx, "GET", "/"+url.PathEscape(pageID), pages[idx].Token, q, &r); err != nil {
+		return "", err
+	}
+	id, user := "", ""
+	if r.IBA != nil {
+		id, user = r.IBA.ID, r.IBA.Username
+	} else if r.CIA != nil {
+		id, user = r.CIA.ID, r.CIA.Username
+	}
+	if id == "" {
+		return "", nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, rerr := f.accounts.Resolve(ctx, FacebookAccountKey); rerr == nil {
+		cp := pagesFrom(cur)
+		for i := range cp {
+			if cp[i].ID == pageID {
+				cp[i].IGID, cp[i].IGUser = id, user
+			}
+		}
+		pj, _ := json.Marshal(cp)
+		cur["pages"] = string(pj)
+		_ = f.accounts.Put(ctx, FacebookAccountKey, cur)
+	}
+	return id, nil
 }
 
 // Refresh keeps the connection alive without anyone clicking Reconnect: it
