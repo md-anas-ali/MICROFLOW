@@ -50,6 +50,10 @@ type StepResult struct {
 	ExecutionID  string `json:"executionId,omitempty"`
 	Status       string `json:"status"` // success | error | skipped
 	Error        string `json:"error,omitempty"`
+	// Attempts counts how many times this workflow has been run in this
+	// sweep (1 = first pass only). The end-of-sweep retry rounds re-run
+	// only the steps that ended in "error" and bump this counter.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // Status is the sweep state the dashboard polls.
@@ -316,41 +320,7 @@ outer:
 			if done[key] {
 				continue // already recorded in a prior (pre-restart) pass
 			}
-			start := runner.FirstTriggerNode(wf)
-			step := StepResult{ServiceID: svcID, ServiceName: svc, WorkflowID: wf.ID, WorkflowName: wf.Name}
-			if start == "" {
-				step.Status = "skipped"
-				step.Error = "no trigger node found"
-				results = append(results, step)
-				persist("running", jobErr)
-				continue
-			}
-			seed := model.NodeOutput{{{JSON: map[string]any{}}}}
-			ex, runErr := m.runWaitingForActive(ctx, wf.ID, start, seed)
-			if ex != nil {
-				step.ExecutionID = ex.ID
-			}
-			switch {
-			case runErr != nil && (errors.Is(runErr, scheduler.ErrDuplicate) || errors.Is(runErr, runner.ErrAlreadyQueued)):
-				// The workflow is already queued or running -- typically
-				// resumed by crash recovery after a restart, or started by
-				// a manual Run/webhook. That run is already doing this
-				// Service's work, and starting it again would only create a
-				// duplicate execution. This is not a failure of the Service,
-				// so record it as skipped instead of marking the whole
-				// sweep as "error". The scheduler's single FIFO queue still
-				// keeps the next Service waiting behind the run in flight.
-				step.Status = "skipped"
-				step.Error = "already queued or running (e.g. resumed after a restart) -- not started again to avoid a duplicate run"
-			case runErr != nil:
-				step.Status, step.Error = "error", runErr.Error()
-			case ex != nil && ex.Status == model.StatusError:
-				step.Status, step.Error = "error", ex.Error
-			case ex != nil && ex.Status == model.StatusCancelled:
-				step.Status, step.Error = "error", "execution cancelled"
-			default:
-				step.Status = "success"
-			}
+			step := m.executeStep(ctx, svcID, svc, wf)
 			results = append(results, step)
 			if step.Status == "error" {
 				finalStatus, jobErr = "error", step.Error
@@ -365,6 +335,14 @@ outer:
 		// cleanupScratch + immediate DeleteExecution) -- nothing
 		// additional to clean up per-Service (rule 9 is already covered
 		// by the existing mechanism, reused here rather than duplicated).
+	}
+
+	// Retry phase: once the whole pass is done, re-run ONLY the workflows
+	// that ended in "error" (successful ones are never run again). Skipped
+	// when "stop if a Service fails" is on, or when the sweep was cancelled.
+	if ctx.Err() == nil && !stopOnFailure {
+		results = m.retryFailed(ctx, results, persist)
+		finalStatus, jobErr = summarize(results)
 	}
 
 	if ctx.Err() != nil {
@@ -427,4 +405,139 @@ func (m *Manager) runWaitingForActive(ctx context.Context, workflowID, start str
 		case <-time.After(dupPollInterval):
 		}
 	}
+}
+
+// executeStep runs one workflow through the shared Runner and converts the
+// outcome into a StepResult. Used by both the first pass and the retry rounds.
+func (m *Manager) executeStep(ctx context.Context, svcID, svc string, wf *model.Workflow) StepResult {
+	step := StepResult{ServiceID: svcID, ServiceName: svc, WorkflowID: wf.ID, WorkflowName: wf.Name, Attempts: 1}
+	start := runner.FirstTriggerNode(wf)
+	if start == "" {
+		step.Status = "skipped"
+		step.Error = "no trigger node found"
+		return step
+	}
+	seed := model.NodeOutput{{{JSON: map[string]any{}}}}
+	ex, runErr := m.runWaitingForActive(ctx, wf.ID, start, seed)
+	if ex != nil {
+		step.ExecutionID = ex.ID
+	}
+	switch {
+	case runErr != nil && (errors.Is(runErr, scheduler.ErrDuplicate) || errors.Is(runErr, runner.ErrAlreadyQueued)):
+		// Already queued/running elsewhere (e.g. resumed after a restart):
+		// not a failure of the Service and must not be started twice.
+		step.Status = "skipped"
+		step.Error = "already queued or running (e.g. resumed after a restart) -- not started again to avoid a duplicate run"
+	case runErr != nil:
+		step.Status, step.Error = "error", runErr.Error()
+	case ex != nil && ex.Status == model.StatusError:
+		step.Status, step.Error = "error", ex.Error
+	case ex != nil && ex.Status == model.StatusCancelled:
+		step.Status, step.Error = "error", "execution cancelled"
+	default:
+		step.Status = "success"
+	}
+	return step
+}
+
+func attemptsOf(r StepResult) int {
+	if r.Attempts < 1 {
+		return 1 // results recorded before this field existed
+	}
+	return r.Attempts
+}
+
+// summarize derives the final sweep status from the (possibly retried)
+// results: "error" only if some step is still failing after all retries.
+func summarize(results []StepResult) (status, jobErr string) {
+	status = "success"
+	for _, r := range results {
+		if r.Status == "error" {
+			status, jobErr = "error", r.Error
+		}
+	}
+	return status, jobErr
+}
+
+// retryFailed re-runs every failed workflow, one at a time, in rounds, until
+// they succeed or hit the retry limit. A step's result is replaced in place,
+// so the dashboard keeps one row per Service. Attempts are persisted, so a
+// restart mid-retry continues with the remaining attempts instead of looping.
+func (m *Manager) retryFailed(ctx context.Context, results []StepResult, persist func(status, jobErr string)) []StepResult {
+	maxRetries := retryRounds()
+	if maxRetries <= 0 {
+		return results
+	}
+	for {
+		var idxs []int
+		for i, r := range results {
+			if r.Status == "error" && r.WorkflowID != "" && attemptsOf(r) < 1+maxRetries {
+				idxs = append(idxs, i)
+			}
+		}
+		if len(idxs) == 0 || ctx.Err() != nil {
+			return results
+		}
+		log.Printf("runall: retrying %d failed workflow(s)", len(idxs))
+		select {
+		case <-ctx.Done():
+			return results
+		case <-time.After(retryDelay()):
+		}
+		for _, i := range idxs {
+			if ctx.Err() != nil {
+				return results
+			}
+			old := results[i]
+			wf := m.findWorkflow(ctx, old.ServiceID, old.WorkflowID)
+			if wf == nil {
+				// Workflow was deleted meanwhile: nothing to retry.
+				results[i].Attempts = 1 + maxRetries
+				persist("running", "")
+				continue
+			}
+			step := m.executeStep(ctx, old.ServiceID, old.ServiceName, wf)
+			step.Attempts = attemptsOf(old) + 1
+			if step.Status == "error" {
+				step.Error = fmt.Sprintf("%s [failed after %d attempts]", step.Error, step.Attempts)
+			}
+			results[i] = step
+			persist("running", "")
+		}
+	}
+}
+
+func (m *Manager) findWorkflow(ctx context.Context, serviceID, workflowID string) *model.Workflow {
+	wfs, err := m.store.ListWorkflowsByService(ctx, serviceID)
+	if err != nil {
+		return nil
+	}
+	for _, wf := range wfs {
+		if wf.ID == workflowID {
+			return wf
+		}
+	}
+	return nil
+}
+
+// retryRounds is how many extra times a failed workflow is re-run after the
+// main pass (default 2). Override with MICROFLOW_RUNALL_RETRY_ROUNDS (0 = off).
+func retryRounds() int {
+	if v := os.Getenv("MICROFLOW_RUNALL_RETRY_ROUNDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 2
+}
+
+// retryDelay is the pause before each retry round (default 10s).
+// Override with MICROFLOW_RUNALL_RETRY_DELAY_SECONDS.
+func retryDelay() time.Duration {
+	if v := os.Getenv("MICROFLOW_RUNALL_RETRY_DELAY_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 10 * time.Second
 }
